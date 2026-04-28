@@ -1,0 +1,22 @@
+{
+  "plugins": [
+    {
+      "name": "ai_plugin",
+      "embed_path": "plug/ai_plugin.wasm",
+      "mem_kb": 512,
+      "timeout_ms": 3000,
+      "network": false,
+      "write": false,
+      "allow_host_info": true
+    },
+    {
+      "name": "api_plugin",
+      "embed_path": "plug/api_plugin.wasm",
+      "mem_kb": 1024,
+      "timeout_ms": 10000,
+      "network": true,
+      "write": true,
+      "allow_host_info": true
+    }
+  ]
+}

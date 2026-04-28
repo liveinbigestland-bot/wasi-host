@@ -1,0 +1,23 @@
+# Zig build output
+zig-out/
+.zig-cache/
+zig-cache/
+*.o
+*.obj
+zig-bin
+zig-*
+
+# Downloaded toolchains
+zig-linux-*/
+zig-linux-*.tar.xz
+
+# Runtime artifacts
+api_response.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings (user-specific)
+.claude/
+
