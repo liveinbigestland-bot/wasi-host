@@ -1,4 +1,23 @@
 {
+  "p2p": {
+    "enabled": true,
+    "listen_port": 20808,
+    "bootstrap": [
+      { "host": "127.0.0.1", "port": 20808 }
+    ],
+    "key_file": "p2p_key.bin",
+    "data_dir": "p2p_data",
+    "stabilize_interval_ms": 30000,
+    "proxy": {
+      "enabled": false,
+      "max_connections": 10,
+      "max_per_user": 2,
+      "bandwidth_limit_kb": 512,
+      "per_user_bandwidth_kb": 128,
+      "connection_timeout_sec": 180,
+      "heartbeat_sec": 30
+    }
+  },
   "plugins": [
     {
       "name": "ai_plugin",

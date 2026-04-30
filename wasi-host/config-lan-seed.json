@@ -1,0 +1,15 @@
+{
+    "p2p": {
+        "enabled": true,
+        "listen_host": "192.168.2.210",
+        "listen_port": 20808,
+        "bootstrap": [],
+        "key_file": "p2p_key_seed.bin",
+        "stabilize_interval_ms": 5000,
+        "run_duration_s": 86400,
+        "proxy": {
+            "enabled": false
+        }
+    },
+    "plugins": []
+}

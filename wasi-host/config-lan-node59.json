@@ -1,0 +1,22 @@
+{
+    "p2p": {
+        "enabled": true,
+        "listen_host": "192.168.2.59",
+        "listen_port": 20808,
+        "bootstrap": [{"host": "185.31.41.85", "port": 20808}],
+        "key_file": "p2p_key_59.bin",
+        "stabilize_interval_ms": 5000,
+        "run_duration_s": 600,
+        "proxy": {
+            "enabled": true,
+            "mode": "client",
+            "transport": "websocket",
+            "remote_host": "metaai.alwaysdata.net",
+            "remote_port": 8356,
+            "remote_path": "/chord",
+            "route_host": "185.31.41.85",
+            "route_port": 20808
+        }
+    },
+    "plugins": []
+}

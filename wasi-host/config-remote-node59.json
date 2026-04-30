@@ -1,0 +1,22 @@
+{
+    "p2p": {
+        "enabled": true,
+        "listen_host": "192.168.2.59",
+        "listen_port": 20808,
+        "bootstrap": [{"host": "192.140.185.171", "port": 20808}],
+        "key_file": "p2p_key_59.bin",
+        "stabilize_interval_ms": 5000,
+        "run_duration_s": 86400,
+        "proxy": {
+            "enabled": true,
+            "mode": "client",
+            "transport": "websocket",
+            "remote_host": "192.140.185.171",
+            "remote_port": 8356,
+            "remote_path": "/chord",
+            "route_host": "",
+            "route_port": 0
+        }
+    },
+    "plugins": []
+}
