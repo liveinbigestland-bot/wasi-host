@@ -1,7 +1,7 @@
-/// Bootstrap 模块：多地址连接策略、指数退避、failover
+/// Bootstrap 模块：多地址连接策略、快速探测、指数退避、failover
 ///
 /// 职责：负责 Chord 节点加入环时的引导连接策略
-/// 封装了多地址重试和指数退避的逻辑。
+/// 封装了多地址快速探测 + 指数退避重试的逻辑。
 ///
 /// 典型用法：
 /// ```zig
@@ -35,12 +35,17 @@ pub const Error = error{
 
 /// Bootstrap 策略配置
 pub const Config = struct {
-    /// 单次尝试超时（毫秒），默认 3000
+    /// 单次尝试超时（毫秒），默认 3000（重试轮次使用）
     timeout_ms: u64 = 3000,
     /// 对地址列表整体重试次数（首次尝试不计入），默认 2
     max_retries: u32 = 2,
     /// 指数退避基础超时（毫秒），设为 0 则每次重试使用固定 timeout_ms
     backoff_base_ms: u64 = 1000,
+    /// 快速探测超时（毫秒）。
+    /// > 0 时第一轮使用此短超时快速扫描所有地址（模拟并发效果），
+    /// 全部未响应后进入常规超时 + 退避模式。
+    /// 设为 0 则禁用快速探测，直接使用 timeout_ms。
+    probe_timeout_ms: u64 = 800,
 };
 
 /// Bootstrap 查询结果
@@ -80,17 +85,19 @@ pub const Client = struct {
 
     /// 遍历 bootstrap 地址列表，找到 successor
     ///
-    /// 策略：
-    /// 1. 顺序尝试每个 bootstrap 地址
-    /// 2. 全部失败后按指数退避重试（最多 max_retries 次）
-    /// 3. 任意地址成功则立即返回
+    /// 策略（两阶段）：
+    /// 1. **快速探测**：如果 probe_timeout_ms > 0，第一轮用短超时快速扫所有地址，
+    ///    模拟并发效果——只要有一个节点存活就能快速返回。
+    /// 2. **退避重试**：全部未响应后，按指数退避增加超时重试（最多 max_retries 次）。
+    ///    任意地址成功则立即返回。
     pub fn findSuccessor(self: Client, own_id: NodeId, addrs: []const types.NodeAddr, config: Config) !Result {
         if (addrs.len == 0) return Error.NoAddresses;
 
         var last_err: ?anyerror = null;
-        var timeout = config.timeout_ms;
         var attempt: u32 = 0;
         const max_attempts = config.max_retries + 1;
+        // 第一轮使用探测超时（如有），后续使用退避超时
+        var timeout: u64 = if (config.probe_timeout_ms > 0) config.probe_timeout_ms else config.timeout_ms;
 
         while (attempt < max_attempts) : (attempt += 1) {
             for (addrs) |addr| {
@@ -100,9 +107,11 @@ pub const Client = struct {
                     last_err = err;
                 }
             }
-            // 指数退避：每次完整遍历后增加超时
+            // 第一轮以后：指数退避增加超时
             if (config.backoff_base_ms > 0) {
                 timeout = @min(config.backoff_base_ms * std.math.pow(u64, 2, attempt + 1), 30000);
+            } else {
+                timeout = config.timeout_ms;
             }
         }
 

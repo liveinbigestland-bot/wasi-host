@@ -189,52 +189,49 @@ pub const ChordNode = struct {
     }
 
     /// 加入 Chord 环：联系 Bootstrap 节点
+    /// 使用 bootstrap 模块实现多策略连接
     pub fn join(self: *ChordNode, bootstrap: types.NodeAddr) !void {
         std.debug.print("[chord] 加入网络: target node={s}:{d}\n", .{ bootstrap.host, bootstrap.port });
 
-        // 向 Bootstrap 节点查询自己的后继
-        const resp = try self.sendAndWait(Message{ .find_successor = .{ .target = self.own_id } }, .find_successor_resp, bootstrap, 3000);
+        const client = bootstrap_mod.Client{
+            .sendFn = chordNodeBootstrapSend,
+            .ctx = @ptrCast(self),
+        };
+        // 单地址也走 bootstrap 模块（获得快速探测 + 重试能力）
+        const result = try client.findSuccessor(self.own_id, &[_]types.NodeAddr{bootstrap}, .{});
 
-        switch (resp) {
-            .find_successor_resp => |body| {
-                const succ = NodeAddr{ .id = body.node_id, .host = body.node_addr, .port = body.node_port, .tcp_port = body.node_tcp_port };
-                std.debug.print("[chord] 后继节点: id={s} addr={s}:{d} tcp={d}\n", .{
-                    ring.idToHex(succ.id), succ.host, succ.port, succ.tcp_port,
-                });
-                self.routing.setSuccessor(succ);
+        const succ = result.successor;
+        std.debug.print("[chord] 后继节点: id={s} addr={s}:{d} tcp={d}\n", .{
+            ring.idToHex(succ.id), succ.host, succ.port, succ.tcp_port,
+        });
+        self.routing.setSuccessor(succ);
 
-                // ── Finger 表快速填充：利用后继节点批量填充初始 finger 条目 ──
-                if (self.routing.successor) |s| {
-                    // finger[0] 必然指向 successor
-                    self.routing.fingers[0].node = s;
-                    // 对于 i=1..15，如果 finger[i].start 落在 (own_id, successor.id] 区间，直接填充
-                    var i: u8 = 1;
-                    while (i < 16 and i < ring.M) : (i += 1) {
-                        const start = ring.fingerStart(self.own_id, i);
-                        if (ring.betweenLeftInclusive(start, self.own_id, s.id)) {
-                            self.routing.fingers[i].node = s;
-                        } else {
-                            // 超出 successor 区间：向 successor 发送 find_successor 查询
-                            const f_resp = self.sendAndWait(Message{ .find_successor = .{ .target = start } }, .find_successor_resp, s, 3000) catch |err| {
-                                std.debug.print("[chord] join: finger[{d}] 查询失败: {}\n", .{ i, err });
-                                continue;
-                            };
-                            switch (f_resp) {
-                                .find_successor_resp => |fb| {
-                                    const f_node = NodeAddr{ .id = fb.node_id, .host = fb.node_addr, .port = fb.node_port, .tcp_port = fb.node_tcp_port };
-                                    self.routing.fingers[i].node = f_node;
-                                },
-                                else => {},
-                            }
-                        }
+        // ── Finger 表快速填充：利用后继节点批量填充初始 finger 条目 ──
+        if (self.routing.successor) |s| {
+            // finger[0] 必然指向 successor
+            self.routing.fingers[0].node = s;
+            // 对于 i=1..15，如果 finger[i].start 落在 (own_id, successor.id] 区间，直接填充
+            var i: u8 = 1;
+            while (i < 16 and i < ring.M) : (i += 1) {
+                const start = ring.fingerStart(self.own_id, i);
+                if (ring.betweenLeftInclusive(start, self.own_id, s.id)) {
+                    self.routing.fingers[i].node = s;
+                } else {
+                    // 超出 successor 区间：向 successor 发送 find_successor 查询
+                    const f_resp = self.sendAndWait(Message{ .find_successor = .{ .target = start } }, .find_successor_resp, s, 3000) catch |err| {
+                        std.debug.print("[chord] join: finger[{d}] 查询失败: {}\n", .{ i, err });
+                        continue;
+                    };
+                    switch (f_resp) {
+                        .find_successor_resp => |fb| {
+                            const f_node = NodeAddr{ .id = fb.node_id, .host = fb.node_addr, .port = fb.node_port, .tcp_port = fb.node_tcp_port };
+                            self.routing.fingers[i].node = f_node;
+                        },
+                        else => {},
                     }
-                    std.debug.print("[chord] join: 快速填充了 {d} 个 finger 条目\n", .{i});
                 }
-            },
-            else => {
-                std.debug.print("[chord] join: 意外的响应类型\n", .{});
-                return error.JoinFailed;
-            },
+            }
+            std.debug.print("[chord] join: 快速填充了 {d} 个 finger 条目\n", .{i});
         }
     }
 
