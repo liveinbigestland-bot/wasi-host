@@ -15,6 +15,7 @@ const api_mod = @import("api.zig");
 const reporter_mod = @import("reporter.zig");
 const logmgr_mod = @import("logmgr.zig");
 const controller_mod = @import("controller.zig");
+const web_mod = @import("web.zig");
 
 /// 编译时版本（由 build.zig 注入）
 const build_options = @import("build_options");
@@ -99,6 +100,18 @@ pub fn main() !void {
         };
     }
 
+    // ── Web API 服务器（主节点模式下启用） ──
+    var web_server = web_mod.WebServer.init(alloc, web_mod.Backend{
+        .controller = &controller,
+        .config = &config,
+        .version = VERSION,
+    });
+    if (config.web_api_enable) {
+        web_server.start() catch |err| {
+            std.debug.print("[main] Web API 服务器启动失败: {}\n", .{err});
+        };
+    }
+
     const api_backend = api_mod.Backend{
         .supervisor = &supervisor,
         .monitor = &monitor,
@@ -120,6 +133,7 @@ pub fn main() !void {
         };
     }
     defer api_server.stop();
+    defer web_server.stop();
 
     // ── 启动 wasi-host ──
     if (config.supervise) {
@@ -199,6 +213,10 @@ pub fn main() !void {
         // 7. API 连接处理
         // [DBG] step=7
         api_server.acceptAndHandle();
+
+        // 7b. Web API 连接处理（仅主节点）
+        // [DBG] step=7b
+        web_server.acceptAndHandle();
 
         // 8. 睡眠一小段时间，避免忙等
         // [DBG] step=8

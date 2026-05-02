@@ -43,6 +43,10 @@ pub const DaemonConfig = struct {
     controller_listen_port: u16 = 20909,
     controller_host: []const u8 = "",
     controller_max_peers: u32 = 50,
+
+    // Web 管理 API（仅主节点，提供 REST API + 仪表盘）
+    web_api_enable: bool = false,
+    web_api_port: u16 = 20888,
 };
 
 /// 从 JSON 字符串解析守护进程配置

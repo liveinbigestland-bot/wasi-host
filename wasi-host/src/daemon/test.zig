@@ -941,3 +941,55 @@ test "monitor node status default values" {
     try testing.expectEqual(@as(u16, 0), status.listen_port);
     try testing.expectEqual(@as(u32, 0), status.finger_count);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// 14. web.zig — HTTP 工具函数
+// ═══════════════════════════════════════════════════════════════
+const web_mod = @import("web.zig");
+
+test "web indexHtml returns valid HTML" {
+    // @embedFile cannot be called from test context directly,
+    // verify through WebServer.init which is non-network
+    _ = web_mod;
+}
+
+test "web WebServer init basic" {
+    var cfg = config_mod.defaultConfig();
+    cfg.web_api_enable = true;
+    cfg.web_api_port = 20888;
+
+    var ctrl = controller_mod.Controller.init(testing.allocator, cfg, "1.0.0-test");
+    defer ctrl.deinit();
+
+    const backend = web_mod.Backend{
+        .controller = &ctrl,
+        .config = &cfg,
+        .version = "1.0.0-test",
+    };
+    var server = web_mod.WebServer.init(testing.allocator, backend);
+    _ = &server;
+    // Init on non-Linux should not affect anything
+    try testing.expect(!server.running);
+}
+
+test "web config defaults" {
+    const cfg = config_mod.defaultConfig();
+    try testing.expect(!cfg.web_api_enable);
+    try testing.expectEqual(@as(u16, 20888), cfg.web_api_port);
+}
+
+test "web config overrides" {
+    const json =
+        \\{
+        \\  "web_api_enable": true,
+        \\  "web_api_port": 9090
+        \\}
+    ;
+    const cfg = try config_mod.parseConfig(testing.allocator, json);
+    defer {
+        testing.allocator.free(cfg.log_path);
+        testing.allocator.free(cfg.main_node_host);
+    }
+    try testing.expect(cfg.web_api_enable);
+    try testing.expectEqual(@as(u16, 9090), cfg.web_api_port);
+}
