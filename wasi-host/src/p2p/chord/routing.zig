@@ -25,6 +25,8 @@ pub const Routing = struct {
     own_tcp_port: u16 = 0,
     /// 后继节点（Must never be null after join）
     successor: ?NodeAddr = null,
+    /// 备份后继节点（主后继 failure 时 O(1) 切换）
+    backup_successors: [2]?NodeAddr = .{null, null},
     /// 前驱节点
     predecessor: ?NodeAddr = null,
     /// Finger 表（环形索引：i = 1..M）
@@ -103,6 +105,115 @@ pub const Routing = struct {
                 self.predecessor = candidate;
             }
         }
+    }
+
+    /// 设置主后继。如果 successor 已存在且 id 不同，将旧主后继压入备份列表。
+    /// 如果 id 相同但地址变了，仅更新地址。
+    pub fn setSuccessor(self: *Routing, addr: NodeAddr) void {
+        if (self.successor) |old_succ| {
+            if (old_succ.id == addr.id) {
+                // ID 相同：仅更新地址字段
+                self.successor = addr;
+                return;
+            }
+            // 将旧后继加入备份（如果不在备份中且不是自身）
+            if (old_succ.id != self.own_id) {
+                self.addBackupSuccessor(old_succ);
+            }
+        }
+        // 从备份中移除新后继（避免重复）
+        self.removeFromBackups(addr.id);
+        self.successor = addr;
+    }
+
+    /// 从整个后继列表（主 + 备份）中移除指定 ID 的节点，左移备份填补空缺。
+    /// 返回新的主后继（可能是之前的备份）。
+    pub fn removeSuccessor(self: *Routing, dead_id: NodeId) ?NodeAddr {
+        // 如果主后继匹配
+        if (self.successor) |succ| {
+            if (succ.id == dead_id) {
+                // 从备份中提升第一个
+                const promoted = self.backup_successors[0];
+                if (promoted) |p| {
+                    self.successor = p;
+                    self.backup_successors[0] = self.backup_successors[1];
+                    self.backup_successors[1] = null;
+                } else {
+                    self.successor = null;
+                }
+                return self.successor;
+            }
+        }
+        // 从备份中移除
+        self.removeFromBackups(dead_id);
+        return self.successor;
+    }
+
+    /// 从备份列表中移除指定 ID 的节点
+    fn removeFromBackups(self: *Routing, dead_id: NodeId) void {
+        var j: usize = 0;
+        for (&self.backup_successors) |*slot| {
+            if (slot.*) |b| {
+                if (b.id != dead_id) {
+                    self.backup_successors[j] = slot.*;
+                    j += 1;
+                }
+            }
+        }
+        // 清空剩余槽位
+        while (j < 2) {
+            self.backup_successors[j] = null;
+            j += 1;
+        }
+    }
+
+    /// 尝试将节点加入备份列表（去重、顺时针排序、最大 2 个）
+    pub fn addBackupSuccessor(self: *Routing, candidate: NodeAddr) void {
+        // 不能是自身
+        if (candidate.id == self.own_id) return;
+        // 不能是主后继
+        if (self.successor) |s| if (s.id == candidate.id) return;
+        // 去重
+        for (&self.backup_successors) |*slot| {
+            if (slot.*) |b| {
+                if (b.id == candidate.id) {
+                    // ID 相同但地址可能变了
+                    slot.* = candidate;
+                    return;
+                }
+            }
+        }
+        // 找空位插入
+        for (&self.backup_successors) |*slot| {
+            if (slot.* == null) {
+                slot.* = candidate;
+                // 按顺时针顺序排序（可选优化，简单实现：对新条目直接放入第一个空位）
+                return;
+            }
+        }
+        // 已满：替换最远的那个（离 own_id 最远的备份优先级最低）
+        // 找距离 own_id 最远的备份位置
+        var farthest_idx: usize = 0;
+        var farthest_dist: NodeId = 0;
+        for (&self.backup_successors, 0..) |*slot, i| {
+            if (slot.*) |b| {
+                const dist = ring.distance(self.own_id, b.id);
+                if (dist > farthest_dist) {
+                    farthest_dist = dist;
+                    farthest_idx = i;
+                }
+            }
+        }
+        self.backup_successors[farthest_idx] = candidate;
+    }
+
+    /// 返回主后继 + 所有备份的合并数组（最多 3 个，null 表示无）
+    pub fn allReachableSuccessors(self: Routing) [3]?NodeAddr {
+        var result: [3]?NodeAddr = .{null, null, null};
+        result[0] = self.successor;
+        result[1] = self.backup_successors[0];
+        result[2] = self.backup_successors[1];
+        return result;
     }
 
     /// 维护：更新下一个 finger 表条目

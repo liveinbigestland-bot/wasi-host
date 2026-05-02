@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
 
     const plugin_step = b.step("plugins", "Compile WASM plugins (wasm32-wasi)");
 
-    inline for (.{ "ai_plugin", "api_plugin", "test_dht_plugin" }) |name| {
+    inline for (.{ "ai_plugin", "api_plugin" }) |name| {
         const plugin = b.addExecutable(.{
             .name = name,
             .root_source_file = b.path(b.fmt("plugins/{s}.zig", .{name})),

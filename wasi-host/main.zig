@@ -23,17 +23,14 @@ const posix = std.posix;
 
 const plug_ai  = @embedFile("plug/ai_plugin.wasm");
 const plug_api = @embedFile("plug/api_plugin.wasm");
-const plug_dht_test = @embedFile("plug/test_dht_plugin.wasm");
-
 const EmbeddedPlug = struct {
     path: []const u8,
     data: []const u8,
 };
 
 const embedded_list = [_]EmbeddedPlug{
-    .{ .path = "plug/ai_plugin.wasm",       .data = plug_ai },
-    .{ .path = "plug/api_plugin.wasm",      .data = plug_api },
-    .{ .path = "plug/test_dht_plugin.wasm", .data = plug_dht_test },
+    .{ .path = "plug/ai_plugin.wasm",  .data = plug_ai },
+    .{ .path = "plug/api_plugin.wasm", .data = plug_api },
 };
 
 const PlugConfig = struct {

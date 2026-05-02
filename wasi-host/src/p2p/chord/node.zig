@@ -145,10 +145,17 @@ pub const ChordNode = struct {
         self.tcp_transport = transport;
         self.tcp_port = transport.port;
         self.routing.own_tcp_port = transport.port; // 同步到路由表
-        // 同时更新 self-successor 的 tcp_port（findSuccessor 可能返回 succ）
+        // 同时更新所有 successor 条目的 tcp_port
         if (self.routing.successor) |*succ| {
             if (succ.id == self.own_id) {
                 succ.tcp_port = transport.port;
+            }
+        }
+        for (&self.routing.backup_successors) |*slot| {
+            if (slot.*) |*b| {
+                if (b.id == self.own_id) {
+                    b.tcp_port = transport.port;
+                }
             }
         }
         std.debug.print("[chord] TCP 监听 :{d} (通告 tcp_port={d})\n", .{ transport.port, self.tcp_port });
@@ -187,7 +194,35 @@ pub const ChordNode = struct {
                 std.debug.print("[chord] 后继节点: id={s} addr={s}:{d} tcp={d}\n", .{
                     ring.idToHex(succ.id), succ.host, succ.port, succ.tcp_port,
                 });
-                self.routing.successor = succ;
+                self.routing.setSuccessor(succ);
+
+                // ── Finger 表快速填充：利用后继节点批量填充初始 finger 条目 ──
+                if (self.routing.successor) |s| {
+                    // finger[0] 必然指向 successor
+                    self.routing.fingers[0].node = s;
+                    // 对于 i=1..15，如果 finger[i].start 落在 (own_id, successor.id] 区间，直接填充
+                    var i: u8 = 1;
+                    while (i < 16 and i < ring.M) : (i += 1) {
+                        const start = ring.fingerStart(self.own_id, i);
+                        if (ring.betweenLeftInclusive(start, self.own_id, s.id)) {
+                            self.routing.fingers[i].node = s;
+                        } else {
+                            // 超出 successor 区间：向 successor 发送 find_successor 查询
+                            const f_resp = self.sendAndWait(Message{ .find_successor = .{ .target = start } }, .find_successor_resp, s, 3000) catch |err| {
+                                std.debug.print("[chord] join: finger[{d}] 查询失败: {}\n", .{ i, err });
+                                continue;
+                            };
+                            switch (f_resp) {
+                                .find_successor_resp => |fb| {
+                                    const f_node = NodeAddr{ .id = fb.node_id, .host = fb.node_addr, .port = fb.node_port, .tcp_port = fb.node_tcp_port };
+                                    self.routing.fingers[i].node = f_node;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    std.debug.print("[chord] join: 快速填充了 {d} 个 finger 条目\n", .{i});
+                }
             },
             else => {
                 std.debug.print("[chord] join: 意外的响应类型\n", .{});
@@ -674,9 +709,26 @@ pub const ChordNode = struct {
     // Chord 维护协议
     // ═══════════════════════════════════════════════
 
-    /// 在 successor 失效时，从 finger 表和前驱中寻找替代节点
+    /// 在 successor 失效时，从备份列表、finger 表和前驱中寻找替代节点
     fn findAlternativeSuccessor(self: *ChordNode, dead_succ: NodeAddr) ?NodeAddr {
-        // 从 finger 表扫描（finger[0] 范围最小，最可能负责这段区间）
+        // 1. 从备份后继列表检查（O(1) 切换，无需网络开销大扫描）
+        const backups = self.routing.allReachableSuccessors();
+        for (backups) |maybe_bak| {
+            const bak = maybe_bak orelse continue;
+            if (bak.id == dead_succ.id or bak.id == self.own_id) continue;
+            const ping_bak = self.sendAndWait(Message{ .ping = {} }, .pong, bak, 3000);
+            if (ping_bak) |_| {
+                std.debug.print("[chord] findAlternative: 备份后继 {s}:{d} 存活\n", .{ ring.idToHex(bak.id), bak.port });
+                // 从列表中移除死节点，将备份提升为主续
+                _ = self.routing.removeSuccessor(dead_succ.id);
+                return bak;
+            } else |_| {
+                std.debug.print("[chord] findAlternative: 备份后继 {s}:{d} 无响应, 移除\n", .{ ring.idToHex(bak.id), bak.port });
+                _ = self.routing.removeSuccessor(bak.id);
+            }
+        }
+
+        // 2. 从 finger 表扫描（finger[0] 范围最小，最可能负责这段区间）
         for (self.routing.fingers) |finger| {
             const node = finger.node orelse continue;
             if (node.id == dead_succ.id) continue; // 跳过死节点
@@ -687,7 +739,7 @@ pub const ChordNode = struct {
                 return node;
             } else |_| continue;
         }
-        // finger 表全失败，尝试前驱
+        // 3. 尝试前驱
         if (self.routing.predecessor) |pred| {
             if (pred.id != dead_succ.id) {
                 const ping_pred = self.sendAndWait(Message{ .ping = {} }, .pong, pred, 3000);
@@ -720,7 +772,9 @@ pub const ChordNode = struct {
                     std.debug.print("[chord] tryBootstrap: 找到后继 {s}:{d} tcp={d}\n", .{
                         ring.idToHex(new_succ.id), new_succ.port, new_succ.tcp_port,
                     });
-                    self.routing.successor = new_succ;
+                    // 全量重连：清空备份后继列表
+                    self.routing.backup_successors = .{null, null};
+                    self.routing.setSuccessor(new_succ);
                     return true;
                 },
                 else => {
@@ -743,7 +797,7 @@ pub const ChordNode = struct {
             // 尝试找替代后继
             if (self.findAlternativeSuccessor(succ)) |alt| {
                 std.debug.print("[chord] stabilize: 切换到替代后继 {s}:{d}\n", .{ ring.idToHex(alt.id), alt.port });
-                self.routing.successor = alt;
+                self.routing.setSuccessor(alt);
             } else if (self.tryBootstrapFallback()) {
                 // 兜底：重新连接 Bootstrap 节点
                 std.debug.print("[chord] stabilize: 通过 Bootstrap 成功重新加入\n", .{});
@@ -759,10 +813,10 @@ pub const ChordNode = struct {
                     const pred_addr = NodeAddr{ .id = pred_id, .host = body.node_addr, .port = body.node_port };
                     // 后继指向自己时，直接采用前驱作为后继（孤立节点发现新节点加入）
                     if (succ.id == self.own_id and pred_id != self.own_id) {
-                        self.routing.successor = pred_addr;
+                        self.routing.setSuccessor(pred_addr);
                         std.debug.print("[chord] stabilize: 孤立节点检测到新节点，更新后继为 {s}\n", .{ring.idToHex(pred_id)});
                     } else if (ring.between(pred_id, self.own_id, succ.id)) {
-                        self.routing.successor = pred_addr;
+                        self.routing.setSuccessor(pred_addr);
                         std.debug.print("[chord] stabilize: 更新后继为 {s}\n", .{ring.idToHex(pred_id)});
                     }
                 }
@@ -793,6 +847,25 @@ pub const ChordNode = struct {
             return;
         };
         std.debug.print("[chord] stabilize: notify 成功发送到 {s}\n", .{ring.idToHex(current_succ.id)});
+
+        // 查询 successor 的 successor，填充备份列表
+        if (current_succ.id != self.own_id) {
+            const next_id = current_succ.id +% 1;
+            const next_resp = self.sendAndWait(Message{ .find_successor = .{ .target = next_id } }, .find_successor_resp, current_succ, 3000) catch |err| {
+                std.debug.print("[chord] stabilize: 查询后继的后继失败 {}\n", .{err});
+                return;
+            };
+            switch (next_resp) {
+                .find_successor_resp => |body| {
+                    const backup = NodeAddr{ .id = body.node_id, .host = body.node_addr, .port = body.node_port, .tcp_port = body.node_tcp_port };
+                    if (backup.id != self.own_id and backup.id != current_succ.id) {
+                        self.routing.addBackupSuccessor(backup);
+                        std.debug.print("[chord] stabilize: 添加备份后继 {s}:{d}\n", .{ ring.idToHex(backup.id), backup.port });
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     /// 修复 finger 表下一项
@@ -818,21 +891,13 @@ pub const ChordNode = struct {
         }
     }
 
-    /// 处理副本同步队列：向后继节点复制条目
+    /// 处理副本同步队列：向所有可达后继节点复制条目
     fn processReplication(self: *ChordNode) !void {
         // 每次 tick 最多处理一个条目的一步复制，避免阻塞
         const item = self.replication_mgr.next() orelse return;
 
-        // 确定复制目标：后继节点的后继
-        const targets = [_]?NodeAddr{
-            self.routing.successor,
-            if (self.routing.successor) |succ| blk: {
-                // succ.id + 1 必然落在 succ 的负责区间，findSuccessor 会返回 succ 或其后继
-                const next_id = succ.id +% 1;
-                const finger_succ = self.routing.findSuccessor(next_id);
-                break :blk if (finger_succ.id != succ.id and finger_succ.id != self.own_id) finger_succ else null;
-            } else null,
-        };
+        // 获取所有可达后继（主 + 备份，最多 3 个）
+        const targets = self.routing.allReachableSuccessors();
 
         // 尝试向每个目标复制
         for (targets) |maybe_target| {
@@ -878,6 +943,14 @@ pub const ChordNode = struct {
             std.debug.print("后继:     {s}:{d} (id={s})\n", .{ s.host, s.port, ring.idToHex(s.id) });
         } else {
             std.debug.print("后继:     (无)\n", .{});
+        }
+        // 打印备份后继列表
+        var backup_count: u8 = 0;
+        for (&self.routing.backup_successors) |*slot| {
+            if (slot.*) |b| {
+                backup_count += 1;
+                std.debug.print("  后继备{d}: {s}:{d} (id={s})\n", .{ backup_count, b.host, b.port, ring.idToHex(b.id) });
+            }
         }
         std.debug.print("Finger 表: {d} 条目\n", .{ring.M});
         var count: usize = 0;
