@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const routing = @import("routing.zig");
 const udp = @import("../transport/udp.zig");
 const tcp_mod = @import("../transport/tcp.zig");
+const bootstrap_mod = @import("../transport/bootstrap.zig");
 const proxy = @import("../proxy.zig");
 const relay = @import("../relay.zig");
 const kv_store = @import("../metadata/store.zig");
@@ -29,6 +30,12 @@ const Permission = @import("../metadata/types.zig").Permission;
 /// 时间戳（毫秒）
 fn timestamp() i64 {
     return std.time.milliTimestamp();
+}
+
+/// Bootstrap 发送回调（适配 bootstrap.Client 到 ChordNode.sendAndWait）
+fn chordNodeBootstrapSend(ctx: *anyopaque, msg: types.Message, expected_type: types.MsgType, target: types.NodeAddr, timeout_ms: u64) anyerror!types.Message {
+    const self: *ChordNode = @ptrCast(@alignCast(ctx));
+    return self.sendAndWait(msg, expected_type, target, timeout_ms);
 }
 
 /// Chord DHT 节点
@@ -752,38 +759,27 @@ pub const ChordNode = struct {
         return null;
     }
 
-    /// 兜底：联系已配置的 Bootstrap 节点重新加入环
-    /// 返回 true 表示至少一个 bootstrap 成功
+    /// 兜底：使用 Bootstrap 模块联系种子节点重新加入环
+    /// 支持多地址顺序重试 + 指数退避
     fn tryBootstrapFallback(self: *ChordNode) bool {
-        for (self.bootstrap_addrs) |boot| {
-            std.debug.print("[chord] tryBootstrap: 尝试重新加入 {s}:{d}\n", .{ boot.host, boot.port });
-            const resp = self.sendAndWait(Message{ .find_successor = .{ .target = self.own_id } }, .find_successor_resp, boot, 5000) catch |err| {
-                std.debug.print("[chord] tryBootstrap: {s}:{d} 失败: {}\n", .{ boot.host, boot.port, err });
-                continue;
-            };
-            switch (resp) {
-                .find_successor_resp => |body| {
-                    const new_succ = NodeAddr{
-                        .id = body.node_id,
-                        .host = body.node_addr,
-                        .port = body.node_port,
-                        .tcp_port = body.node_tcp_port,
-                    };
-                    std.debug.print("[chord] tryBootstrap: 找到后继 {s}:{d} tcp={d}\n", .{
-                        ring.idToHex(new_succ.id), new_succ.port, new_succ.tcp_port,
-                    });
-                    // 全量重连：清空备份后继列表
-                    self.routing.backup_successors = .{null, null};
-                    self.routing.setSuccessor(new_succ);
-                    return true;
-                },
-                else => {
-                    std.debug.print("[chord] tryBootstrap: 意外的响应类型\n", .{});
-                    continue;
-                },
-            }
-        }
-        return false;
+        if (self.bootstrap_addrs.len == 0) return false;
+
+        const client = bootstrap_mod.Client{
+            .sendFn = chordNodeBootstrapSend,
+            .ctx = @ptrCast(self),
+        };
+        const result = client.findSuccessor(self.own_id, self.bootstrap_addrs, .{}) catch |err| {
+            std.debug.print("[chord] tryBootstrap: 所有 {d} 个 Bootstrap 节点均失败: {}\n", .{ self.bootstrap_addrs.len, err });
+            return false;
+        };
+        // 全量重连：清空备份后继列表
+        self.routing.backup_successors = .{null, null};
+        self.routing.setSuccessor(result.successor);
+        std.debug.print("[chord] tryBootstrap: 通过 {s}:{d} 找到后继 {s}:{d} tcp={d}\n", .{
+            result.used_addr.host, result.used_addr.port,
+            ring.idToHex(result.successor.id), result.successor.port, result.successor.tcp_port,
+        });
+        return true;
     }
 
     /// Stabilize: 验证后继并通知
