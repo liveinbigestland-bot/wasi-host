@@ -113,6 +113,104 @@ const Connection = struct {
     node_key: []u8, // "host:port" 的 alloc 副本
 };
 
+/// 速率限制器（线程安全）
+const RateLimiter = struct {
+    alloc: std.mem.Allocator,
+    max_connections: u32,
+    max_per_user: u32,
+    bandwidth_limit_bytes: u64,
+
+    active_connections: u32,
+    /// 每个源 IP 的活跃连接数
+    user_connections: std.StringHashMap(u32),
+    bytes_this_second: u64,
+    last_reset: i64,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init(alloc: std.mem.Allocator, max_connections: u32, max_per_user: u32, bandwidth_limit_kb: u32) RateLimiter {
+        return RateLimiter{
+            .alloc = alloc,
+            .max_connections = max_connections,
+            .max_per_user = max_per_user,
+            .bandwidth_limit_bytes = @as(u64, bandwidth_limit_kb) * 1024,
+            .active_connections = 0,
+            .user_connections = std.StringHashMap(u32).init(alloc),
+            .bytes_this_second = 0,
+            .last_reset = std.time.timestamp(),
+        };
+    }
+
+    pub fn deinit(self: *RateLimiter) void {
+        self.user_connections.deinit();
+    }
+
+    /// 尝试获取连接许可。返回 null 表示允许，否则返回拒绝原因。
+    pub fn acquire(self: *RateLimiter, user_key: []const u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // 总连接数限制
+        if (self.max_connections > 0 and self.active_connections >= self.max_connections) {
+            return "超过最大连接数限制";
+        }
+
+        // 每用户连接数限制
+        if (self.max_per_user > 0) {
+            const count = self.user_connections.get(user_key) orelse 0;
+            if (count >= self.max_per_user) {
+                return "超过每用户连接数限制";
+            }
+            self.user_connections.put(user_key, count + 1) catch {};
+        }
+
+        self.active_connections += 1;
+        return null;
+    }
+
+    /// 释放连接许可
+    pub fn release(self: *RateLimiter, user_key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.active_connections > 0) {
+            self.active_connections -= 1;
+        }
+        if (self.max_per_user > 0) {
+            if (self.user_connections.get(user_key)) |count| {
+                if (count <= 1) {
+                    _ = self.user_connections.remove(user_key);
+                } else {
+                    self.user_connections.put(user_key, count - 1) catch {};
+                }
+            }
+        }
+    }
+
+    /// 跟踪带宽使用，必要时延时以 throttle
+    pub fn trackBytes(self: *RateLimiter, n: usize) void {
+        if (self.bandwidth_limit_bytes == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = std.time.timestamp();
+        // 每秒重置计数器
+        if (now != self.last_reset) {
+            self.bytes_this_second = 0;
+            self.last_reset = now;
+        }
+
+        self.bytes_this_second += @as(u64, n);
+
+        // 超过带宽限制时主动延时
+        if (self.bytes_this_second > self.bandwidth_limit_bytes) {
+            self.mutex.unlock();
+            std.time.sleep(100 * std.time.ns_per_ms); // 100ms backpressure
+            self.mutex.lock();
+        }
+    }
+};
+
 pub const RelayServer = struct {
     listen_fd: posix.socket_t,
     port: u16,
@@ -121,6 +219,7 @@ pub const RelayServer = struct {
     next_req_id: u32,
     alloc: std.mem.Allocator,
     running: bool,
+    limiter: RateLimiter,
     mutex: std.Thread.Mutex = .{},
     upstream_client: ?*RelayClient = null,
 
@@ -129,7 +228,7 @@ pub const RelayServer = struct {
         original_seq: u32,
     };
 
-    pub fn init(alloc: std.mem.Allocator, listen_host: []const u8, port: u16) !RelayServer {
+    pub fn init(alloc: std.mem.Allocator, listen_host: []const u8, port: u16, max_connections: u32, max_per_user: u32, bandwidth_limit_kb: u32) !RelayServer {
         const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer closeSocket(listen_fd);
 
@@ -148,6 +247,7 @@ pub const RelayServer = struct {
             .next_req_id = 1,
             .alloc = alloc,
             .running = false,
+            .limiter = RateLimiter.init(alloc, max_connections, max_per_user, bandwidth_limit_kb),
         };
     }
 
@@ -159,6 +259,7 @@ pub const RelayServer = struct {
     pub fn deinit(self: *RelayServer) void {
         self.routing.deinit();
         self.pending.deinit();
+        self.limiter.deinit();
     }
 
     pub fn run(self: *RelayServer) void {
@@ -204,6 +305,15 @@ pub const RelayServer = struct {
             return;
         };
         errdefer self.alloc.free(node_key);
+
+        // 速率限制检查：生成用户标识（源 IP:port）
+        var user_key_buf: [48]u8 = undefined;
+        const user_key = std.fmt.bufPrint(&user_key_buf, "{}", .{addr}) catch "unknown";
+        if (self.limiter.acquire(user_key)) |reason| {
+            std.debug.print("[relay] 拒绝连接 {s} (来自 {}): {s}\n", .{ node_key, addr, reason });
+            return;
+        }
+        errdefer self.limiter.release(user_key);
 
         // 2. 注册连接 (如果已存在, 关闭旧连接)
         const conn = self.alloc.create(Connection) catch {
@@ -269,6 +379,12 @@ pub const RelayServer = struct {
                 }
             }
         }
+        // 释放速率限制许可
+        {
+            var key_buf: [48]u8 = undefined;
+            const ip_key = std.fmt.bufPrint(&key_buf, "{}", .{addr}) catch "unknown";
+            self.limiter.release(ip_key);
+        }
         // 始终释放本线程自己的分配（由本线程 alloc.dupe/alloc.create 的）
         self.alloc.free(node_key);
         self.alloc.destroy(conn);
@@ -315,6 +431,8 @@ pub const RelayServer = struct {
                 defer self.mutex.unlock();
                 _ = self.pending.remove(req_id);
             };
+            // 跟踪转发流量
+            self.limiter.trackBytes(payload.len);
         } else if (self.upstream_client) |client| {
             // 目标不在本地路由表，通过上游 relay client 转发
             std.debug.print("[relay] 上游转发 {s}→{s}\n", .{ from_key, key });
@@ -323,6 +441,8 @@ pub const RelayServer = struct {
                 std.debug.print("[relay] 上游转发失败 {s}→{s}: {}\n", .{ from_key, key, err });
                 return;
             };
+            // 跟踪转发流量（请求 + 响应）
+            self.limiter.trackBytes(payload.len + resp_len);
             // 回送响应给原始请求者
             self.sendReply(from_key, seq, resp_buf[0..resp_len]);
         } else {

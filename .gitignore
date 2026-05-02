@@ -1,18 +1,35 @@
 # Zig build output
 zig-out/
+zig-*/
+zig-cache-tmp/
 .zig-cache/
 zig-cache/
 *.o
 *.obj
 zig-bin
-zig-*
+
+# Runtime artifacts
+api_response.txt
 
 # Downloaded toolchains
 zig-linux-*/
 zig-linux-*.tar.xz
 
-# Runtime artifacts
-api_response.txt
+# Python
+__pycache__/
+*.pyc
+
+# Debug symbols (Windows)
+*.pdb
+
+# Log files
+*.log
+
+# Key material (sensitive)
+p2p_key*.bin
+
+# Planning files (development only)
+.planning/
 
 # OS files
 .DS_Store

@@ -435,6 +435,15 @@ pub fn main() !void {
                 test_socket.close();
             }
 
+            // ── 确定用于 Chord 通告和 relay 注册的地址 ──
+            // 对于 listen_host 为特定 IP（非 0.0.0.0）的节点直接使用 listen_host，
+            // 确保多节点共享同一公网 IP 时 relay 路由键唯一。
+            // 对于 0.0.0.0（如 alwaysdata ext），回退到检测到的公网 IP。
+            const effective_host = if (std.mem.eql(u8, cfg.listen_host, "0.0.0.0"))
+                (public_host orelse cfg.listen_host)
+            else
+                cfg.listen_host;
+
             // ── 原生 TCP Relay 初始化（必须在 ChordNode 之前，因为 ChordNode 需要 relay_client 引用）──
             //   relay server: 监听 listen_port 接受其他节点的连接
             //   relay client: 连接 remote_host:remote_port
@@ -443,7 +452,7 @@ pub fn main() !void {
                 // 启动 relay server（如果配置了 listen_port）
                 if (cfg.proxy.listen_port > 0) {
                     const rs = try alloc.create(relay.RelayServer);
-                    rs.* = try relay.RelayServer.init(alloc, cfg.proxy.relay_listen_host, cfg.proxy.listen_port);
+                    rs.* = try relay.RelayServer.init(alloc, cfg.proxy.relay_listen_host, cfg.proxy.listen_port, cfg.proxy.max_connections, cfg.proxy.max_per_user, cfg.proxy.bandwidth_limit_kb);
                     maybe_relay_server = rs;
                     relay_server_thread = try std.Thread.spawn(.{}, relay.RelayServer.run, .{rs});
                     std.debug.print("[relay] 中继服务器已启动 :{d}\n", .{cfg.proxy.listen_port});
@@ -455,13 +464,13 @@ pub fn main() !void {
                         if (cfg.proxy.relay_ws) {
                             break :blk relay.RelayClient.initWithOpts(
                                 alloc, cfg.proxy.remote_host, cfg.proxy.remote_port,
-                                public_host orelse cfg.listen_host, cfg.listen_port, cfg.listen_port,
+                                effective_host, cfg.listen_port, cfg.listen_port,
                                 true, cfg.proxy.remote_path,
                             );
                         } else {
                             break :blk relay.RelayClient.init(
                                 alloc, cfg.proxy.remote_host, cfg.proxy.remote_port,
-                                public_host orelse cfg.listen_host, cfg.listen_port, cfg.listen_port,
+                                effective_host, cfg.listen_port, cfg.listen_port,
                             );
                         }
                     };
@@ -511,7 +520,7 @@ pub fn main() !void {
             var chord = try chord_node.ChordNode.init(
                 alloc,
                 node_id,
-                public_host orelse cfg.listen_host,
+                effective_host,
                 cfg.listen_port,
                 cfg.stabilize_interval_ms,
                 cfg.proxy.transport,

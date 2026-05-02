@@ -574,6 +574,27 @@ pub const ChordNode = struct {
             }
         }
 
+        // ═══ 3b. TCP 兜底（relay 通道不稳定时，目标支持 TCP 则直接连接）═══
+        if (target.tcp_port > 0) {
+            const encoded = try msg.encode(self.alloc);
+            defer self.alloc.free(encoded);
+            var buf: [65536]u8 = undefined;
+            if (TcpTransport.sendAndWait(target.host, target.tcp_port, encoded, &buf, timeout_ms)) |resp_len| {
+                const resp = try Message.decode(buf[0..resp_len], self.msg_arena.allocator());
+                const tag_matches = switch (resp) {
+                    inline else => |_, tag| tag == expected_type,
+                };
+                if (!tag_matches) {
+                    std.debug.print("[chord] TCP fallback: 期望={s}, 收到={s}\n", .{ @tagName(expected_type), @tagName(resp) });
+                    return error.ProxyWrongType;
+                }
+                std.debug.print("[chord] TCP fallback 成功 → {s}:{d}\n", .{ target.host, target.tcp_port });
+                return resp;
+            } else |err| {
+                std.debug.print("[chord] TCP fallback 失败 {s}:{d}: {}\n", .{ target.host, target.tcp_port, err });
+            }
+        }
+
         // ═══ 4. WebSocket 代理路径（旧版代理兼容）═══
         if (self.proxy_enabled) {
             const should_proxy = if (self.proxy_route_host.len > 0 and self.proxy_route_port > 0)

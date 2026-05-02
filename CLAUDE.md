@@ -42,13 +42,23 @@ zig build -Dtarget=x86_64-linux-gnu -p /d/tmp/zig-out-x64 && cp /d/tmp/zig-out-x
 
 ## 部署脚本
 
-主要通过 `deploy-remote.py` 管理: `python deploy-remote.py [deploy|test|cleanup|status]`
+主要通过 `deploy.py` 管理:
+
+```bash
+python deploy.py deploy       # 完整部署流程（清理→上传→启动→验证）
+python deploy.py test         # 验证路由状态 + 环一致性
+python deploy.py status       # 查看各节点进程状态
+python deploy.py cleanup      # 停止所有节点
+python deploy.py logs         # 查看各节点最新日志
+python deploy.py check-stale  # 检查残留旧进程
+python deploy.py inspect      # 完整巡检（进程/资源/路由/异常）
+```
 
 ## 运维子智能体
 
 Ops agent (`gsd-ops`) 位于 `$CLAUDE_HOME/agents/gsd-ops.md`，提供以下工作流:
 
-- **deploy-ring**: build → cleanup → start-seed → deploy-remote → restart-remote → verify
+- **deploy-ring**: build → cleanup → start-seed → deploy → restart-remote → verify
 - **test-ring**: 验证所有节点的后继/前驱/finger 表
 - **status-ring**: 检查各节点进程存活和最近日志
 - **cleanup-ring**: 停止所有节点（远程 + 本地）

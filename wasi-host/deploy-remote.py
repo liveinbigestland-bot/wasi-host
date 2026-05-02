@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""远程 Chord DHT 节点部署与自动化测试。
+"""【已弃用】请使用 deploy.py 替代
+
+用法:
+  python deploy.py [deploy|test|cleanup|status|logs|check-stale|inspect]
+
+远程 Chord DHT 节点部署与自动化测试。
 
 用法:
   python deploy-remote.py              # 部署并启动所有节点
