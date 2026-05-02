@@ -15,10 +15,15 @@ const chord_node = @import("src/p2p/chord/node.zig");
 const chord_types = @import("src/p2p/chord/types.zig");
 const udp = @import("src/p2p/transport/udp.zig");
 const proxy = @import("src/p2p/proxy.zig");
+const relay = @import("src/p2p/relay.zig");
+const wss = @import("src/p2p/wss.zig");
+const net_detect = @import("src/p2p/net_detect.zig");
+const p2p_bindings = @import("src/host/p2p_bindings.zig");
 const posix = std.posix;
 
 const plug_ai  = @embedFile("plug/ai_plugin.wasm");
 const plug_api = @embedFile("plug/api_plugin.wasm");
+const plug_dht_test = @embedFile("plug/test_dht_plugin.wasm");
 
 const EmbeddedPlug = struct {
     path: []const u8,
@@ -26,8 +31,9 @@ const EmbeddedPlug = struct {
 };
 
 const embedded_list = [_]EmbeddedPlug{
-    .{ .path = "plug/ai_plugin.wasm",  .data = plug_ai },
-    .{ .path = "plug/api_plugin.wasm", .data = plug_api },
+    .{ .path = "plug/ai_plugin.wasm",       .data = plug_ai },
+    .{ .path = "plug/api_plugin.wasm",      .data = plug_api },
+    .{ .path = "plug/test_dht_plugin.wasm", .data = plug_dht_test },
 };
 
 const PlugConfig = struct {
@@ -177,7 +183,7 @@ const TimeoutGuard = struct {
     }
 };
 
-fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8) void {
+fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode) void {
     std.debug.print("\n=== [启动] {s} (mem={d}KB, timeout={d}ms, net={}, write={}, host_info={}) ===\n", .{
         cfg.name, cfg.mem_kb, cfg.timeout_ms, cfg.network, cfg.write, cfg.allow_host_info,
     });
@@ -193,7 +199,8 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8) void {
     };
     defer wasm3.m3_FreeEnvironment(env);
 
-    const runtime = wasm3.m3_NewRuntime(env, cfg.mem_kb * 1024, null) orelse {
+    const chord_userdata: ?*anyopaque = @ptrCast(maybe_chord);
+    const runtime = wasm3.m3_NewRuntime(env, cfg.mem_kb * 1024, chord_userdata) orelse {
         std.debug.print("[错误] {s}: 创建运行时失败\n", .{cfg.name});
         return;
     };
@@ -236,6 +243,24 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8) void {
                 }
             }
         }
+    }
+
+    // 注册 P2P 宿主函数（如果 P2P 网络已启用）
+    if (maybe_chord != null and cfg.network) {
+        inline for (.{
+            .{ "dht_get", "i(ii)", &p2p_bindings.host_dht_get },
+            .{ "dht_put", "i(iiiii)", &p2p_bindings.host_dht_put },
+            .{ "node_info", "i()", &p2p_bindings.host_node_info },
+        }) |entry| {
+            const result = wasm3.m3_LinkRawFunction(mod, "host", entry[0], entry[1], @ptrCast(entry[2]));
+            if (result) |msg| {
+                const slice = std.mem.sliceTo(msg, 0);
+                if (std.mem.indexOf(u8, slice, "function lookup") == null) {
+                    std.debug.print("[警告] {s}: 绑定 {s} 失败 ({s})\n", .{ cfg.name, entry[0], slice });
+                }
+            }
+        }
+        std.debug.print("[p2p] 已为 {s} 注册 P2P 宿主函数\n", .{cfg.name});
     }
     if (guard.check()) return;
 
@@ -332,7 +357,39 @@ pub fn main() !void {
         null;
     defer if (top_cfg) |p| p.deinit();
 
-    const p2p_cfg = if (top_cfg) |c| c.value.p2p else null;
+    var p2p_cfg = if (top_cfg) |c| c.value.p2p else null;
+
+    var public_host: ?[]const u8 = null;
+    // ── 自动网络检测（覆盖 transport_mode） ──────────────────
+    if (p2p_cfg) |_| {
+        if (builtin.os.tag == .linux) {
+            std.debug.print("\n[net_detect] 正在检测网络环境 (port {d})...\n", .{p2p_cfg.?.listen_port});
+            const detect_result = net_detect.fullNetDetect(alloc, p2p_cfg.?.listen_port, p2p_cfg.?.listen_host, p2p_cfg.?.prefer_ipv4);
+            if (detect_result) |result| {
+                if (result.public_ip) |ip| {
+                    public_host = try alloc.dupe(u8, ip);
+                    std.debug.print("[net_detect] 公网 IP: {s}\n", .{ip});
+                }
+                const new_mode: p2p_config_mod.TransportMode = switch (result.level) {
+                    .full_public => .dual,
+                    .lan_only => .udp,
+                    .strict_limit => .tcp,
+                };
+                if (new_mode != p2p_cfg.?.transport_mode) {
+                    std.debug.print("[net_detect] 传输模式: {s} → {s} (检测覆盖)\n", .{
+                        @tagName(p2p_cfg.?.transport_mode), @tagName(new_mode),
+                    });
+                    p2p_cfg.?.transport_mode = new_mode;
+                } else {
+                    std.debug.print("[net_detect] 传输模式: {s} (与配置一致)\n", .{@tagName(p2p_cfg.?.transport_mode)});
+                }
+            } else |err| {
+                std.debug.print("[net_detect] 检测失败: {}, 使用配置默认值\n", .{err});
+            }
+        } else {
+            std.debug.print("[net_detect] 非 Linux 平台, 跳过自动检测\n", .{});
+        }
+    }
 
     // ── P2P 网络初始化 ───────────────────────────────────────
     var maybe_chord: ?*chord_node.ChordNode = null;
@@ -340,6 +397,12 @@ pub fn main() !void {
     var maybe_proxy_server: ?*proxy.TcpProxyServer = null;
     var proxy_server_thread: ?std.Thread = null;
     var proxy_reader_thread: ?std.Thread = null;
+    var maybe_relay_server: ?*relay.RelayServer = null;
+    var relay_server_thread: ?std.Thread = null;
+    var maybe_relay_client: ?*relay.RelayClient = null;
+    var relay_reader_thread: ?std.Thread = null;
+    var maybe_wss_server: ?*wss.WssServer = null;
+    var wss_server_thread: ?std.Thread = null;
 
     if (p2p_cfg) |cfg| {
         if (cfg.enabled) {
@@ -372,10 +435,83 @@ pub fn main() !void {
                 test_socket.close();
             }
 
+            // ── 原生 TCP Relay 初始化（必须在 ChordNode 之前，因为 ChordNode 需要 relay_client 引用）──
+            //   relay server: 监听 listen_port 接受其他节点的连接
+            //   relay client: 连接 remote_host:remote_port
+            //   两者可同时存在（级联 relay）
+            if (cfg.proxy.enabled and std.mem.eql(u8, cfg.proxy.transport, "relay")) {
+                // 启动 relay server（如果配置了 listen_port）
+                if (cfg.proxy.listen_port > 0) {
+                    const rs = try alloc.create(relay.RelayServer);
+                    rs.* = try relay.RelayServer.init(alloc, cfg.proxy.relay_listen_host, cfg.proxy.listen_port);
+                    maybe_relay_server = rs;
+                    relay_server_thread = try std.Thread.spawn(.{}, relay.RelayServer.run, .{rs});
+                    std.debug.print("[relay] 中继服务器已启动 :{d}\n", .{cfg.proxy.listen_port});
+                }
+                // 启动 relay client（如果配置了 remote_host）
+                if (cfg.proxy.remote_host.len > 0) {
+                    const rc = try alloc.create(relay.RelayClient);
+                    const init_result = blk: {
+                        if (cfg.proxy.relay_ws) {
+                            break :blk relay.RelayClient.initWithOpts(
+                                alloc, cfg.proxy.remote_host, cfg.proxy.remote_port,
+                                public_host orelse cfg.listen_host, cfg.listen_port, cfg.listen_port,
+                                true, cfg.proxy.remote_path,
+                            );
+                        } else {
+                            break :blk relay.RelayClient.init(
+                                alloc, cfg.proxy.remote_host, cfg.proxy.remote_port,
+                                public_host orelse cfg.listen_host, cfg.listen_port, cfg.listen_port,
+                            );
+                        }
+                    };
+                    if (init_result) |client| {
+                        rc.* = client;
+                        maybe_relay_client = rc;
+                        relay_reader_thread = try std.Thread.spawn(.{}, relay.RelayClient.readerLoop, .{rc});
+                        // 如果同时有 relay server，把 client 设为 server 的上游（级联转发）
+                        if (maybe_relay_server) |rs| {
+                            rs.upstream_client = rc;
+                            std.debug.print("[relay] 级联转发: 本地 client → {s}:{d}\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port});
+                        } else {
+                            std.debug.print("[relay] 中继客户端已连接 {s}:{d}\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port});
+                        }
+                    } else |err| {
+                        std.debug.print("[relay] 连接到 {s}:{d} 失败: {}, 跳过 relay client\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port, err});
+                        alloc.destroy(rc);
+                    }
+                }
+            }
+
+            // 转换 BootstrapAddr → NodeAddr（兜底重连用）
+            // 先从配置的 bootstrap 列表构建
+            var boot_list = std.ArrayList(chord_types.NodeAddr).init(alloc);
+            for (cfg.bootstrap) |b| {
+                try boot_list.append(chord_types.NodeAddr{
+                    .id = 0, .host = b.host, .port = b.port, .tcp_port = b.tcp_port,
+                });
+            }
+
+            // 从 dns_seeds URL 获取种子节点（HTTP JSON: [{"host":"...","port":...,"tcp_port":...}]）
+            for (cfg.dns_seeds) |seed_url| {
+                std.debug.print("[p2p] 从 DNS 种子获取节点: {s}\n", .{seed_url});
+                const fetched = fetchBootstrapFromUrl(alloc, seed_url) catch |err| {
+                    std.debug.print("[p2p] DNS 种子 {s} 获取失败: {}\n", .{ seed_url, err });
+                    continue;
+                };
+                defer alloc.free(fetched);
+                for (fetched) |addr| {
+                    try boot_list.append(addr);
+                    std.debug.print("[p2p] DNS 种子发现节点: {s}:{d} tcp={d}\n", .{ addr.host, addr.port, addr.tcp_port });
+                }
+            }
+
+            const boot_addrs = try boot_list.toOwnedSlice();
+
             var chord = try chord_node.ChordNode.init(
                 alloc,
                 node_id,
-                cfg.listen_host,
+                public_host orelse cfg.listen_host,
                 cfg.listen_port,
                 cfg.stabilize_interval_ms,
                 cfg.proxy.transport,
@@ -384,8 +520,50 @@ pub fn main() !void {
                 cfg.proxy.remote_path,
                 cfg.proxy.route_host,
                 cfg.proxy.route_port,
+                cfg.data_dir,
+                pk_hex[0..],
+                maybe_relay_client,
+                cfg.transport_mode,
+                cfg.tcp_port,
+                boot_addrs,
             );
             maybe_chord = &chord;
+
+            // 启动 TCP 监听器（transport_mode == tcp 或 dual 时）
+            if (cfg.transport_mode != .udp) {
+                chord.startTcpListener(cfg.tcp_port) catch |err| {
+                    std.debug.print("[chord] TCP 监听器启动失败: {}\n", .{err});
+                };
+            }
+
+            // ── WSS 服务器初始化 ──
+            if (cfg.proxy.enabled and cfg.proxy.wss_enabled) {
+                const ws = try alloc.create(wss.WssServer);
+                if (cfg.proxy.wss_tcp_bridge) {
+                    ws.* = try wss.WssServer.initRelayBridge(
+                        alloc,
+                        "0.0.0.0",
+                        cfg.proxy.wss_port,
+                        cfg.proxy.wss_path,
+                        cfg.proxy.wss_cert_file,
+                        cfg.proxy.wss_key_file,
+                        "127.0.0.1",
+                        cfg.proxy.listen_port,
+                    );
+                } else {
+                    ws.* = try wss.WssServer.init(
+                        alloc,
+                        "0.0.0.0",
+                        cfg.proxy.wss_port,
+                        cfg.proxy.wss_path,
+                        cfg.proxy.wss_cert_file,
+                        cfg.proxy.wss_key_file,
+                        cfg.listen_port,
+                    );
+                }
+                maybe_wss_server = ws;
+                wss_server_thread = try std.Thread.spawn(.{}, wss.WssServer.run, .{ws});
+            }
 
             // 代理线程初始化
             if (cfg.proxy.enabled) {
@@ -397,8 +575,6 @@ pub fn main() !void {
                         maybe_proxy_server = ps_ptr;
                         proxy_server_thread = try std.Thread.spawn(.{}, proxy.TcpProxyServer.run, .{ps_ptr});
                         std.debug.print("[p2p] 代理服务器(TCP): :{d} → UDP :{d}\n", .{ cfg.proxy.listen_port, cfg.listen_port });
-                    } else {
-                        std.debug.print("[p2p] WebSocket 服务器模式由外部 index.js 提供\n", .{});
                     }
                 } else if (std.mem.eql(u8, cfg.proxy.mode, "client")) {
                     // ── 客户端模式 ──
@@ -421,22 +597,34 @@ pub fn main() !void {
                 }
             }
 
-            // Bootstrap 加入网络
+            // Bootstrap 加入网络（遍历所有地址，任一成功即可）
             if (cfg.bootstrap.len > 0) {
-                const boot_cfg = cfg.bootstrap[0];
-                const boot_addr = chord_types.NodeAddr{
-                    .id = 0, .host = boot_cfg.host, .port = boot_cfg.port,
-                };
-                std.debug.print("[chord] Bootstrap 连接: {s}:{d}\n", .{ boot_cfg.host, boot_cfg.port });
-                chord.join(boot_addr) catch |err| {
-                    std.debug.print("[chord] Bootstrap 失败: {}, 以孤立节点运行\n", .{err});
-                };
+                for (boot_addrs) |boot_addr| {
+                    std.debug.print("[chord] Bootstrap 连接: {s}:{d}\n", .{ boot_addr.host, boot_addr.port });
+                    chord.join(boot_addr) catch |err| {
+                        std.debug.print("[chord] Bootstrap {s}:{d} 失败: {}\n", .{ boot_addr.host, boot_addr.port, err });
+                        continue;
+                    };
+                    break; // 任一成功就退出循环
+                }
             } else {
                 std.debug.print("[chord] 无 Bootstrap 配置, 作为孤立节点\n", .{});
             }
 
             // 启动后台事件循环
             chord_thread = try std.Thread.spawn(.{}, chordEventLoop, .{ &chord });
+
+            // UDP Echo 调试服务（仅当配置了端口时启动）
+            if (cfg.proxy.udp_echo_port > 0) {
+                const echo_server = try alloc.create(@import("src/p2p/udpecho.zig").UdpEchoServer);
+                echo_server.* = try @import("src/p2p/udpecho.zig").UdpEchoServer.init(cfg.proxy.udp_echo_port);
+                _ = try std.Thread.spawn(.{}, struct {
+                    fn run(server: *@import("src/p2p/udpecho.zig").UdpEchoServer) void {
+                        server.run();
+                    }
+                }.run, .{echo_server});
+            }
+
             std.debug.print("=== [P2P] 初始化完成 ===\n\n", .{});
         } else {
             std.debug.print("[p2p] P2P 网络已禁用\n", .{});
@@ -476,7 +664,7 @@ pub fn main() !void {
             std.debug.print("[skip] {s}: embedded file {s} not found\n", .{ name, plug_cfg.embed_path });
             continue;
         };
-        const thread = try std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data });
+        const thread = try std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data, maybe_chord });
         try threads.append(thread);
     }
 
@@ -521,6 +709,45 @@ pub fn main() !void {
         std.debug.print("[proxy] 代理 reader 已关闭\n", .{});
     }
 
+    // ── 关闭 Relay Reader ────────────────────────────────────
+    if (relay_reader_thread) |t| {
+        if (maybe_relay_client) |rc| {
+            rc.running = false;
+        }
+        t.join();
+        std.debug.print("[relay] reader 已关闭\n", .{});
+    }
+    if (maybe_relay_client) |rc| {
+        rc.deinit();
+        alloc.destroy(rc);
+    }
+
+    // ── 关闭 Relay Server ────────────────────────────────────
+    if (relay_server_thread) |t| {
+        if (maybe_relay_server) |rs| {
+            rs.stop();
+        }
+        t.join();
+        std.debug.print("[relay] 服务器已关闭\n", .{});
+    }
+    if (maybe_relay_server) |rs| {
+        rs.deinit();
+        alloc.destroy(rs);
+    }
+
+    // ── 关闭 WSS 服务器 ────────────────────────────────────
+    if (wss_server_thread) |t| {
+        if (maybe_wss_server) |ws| {
+            ws.stop();
+        }
+        t.join();
+        std.debug.print("[wss] 服务器已关闭\n", .{});
+    }
+    if (maybe_wss_server) |ws| {
+        ws.deinit();
+        alloc.destroy(ws);
+    }
+
     // ── 关闭 P2P 网络 ────────────────────────────────────────
     if (chord_thread) |ct| {
         if (maybe_chord) |chord| {
@@ -533,4 +760,48 @@ pub fn main() !void {
     if (maybe_chord) |chord| {
         chord.deinit();
     }
+}
+
+/// 从 HTTP URL 获取 Bootstrap 节点列表
+/// 期望响应格式: [{"host":"...","port":...,"tcp_port":...}]
+fn fetchBootstrapFromUrl(alloc: std.mem.Allocator, url: []const u8) ![]chord_types.NodeAddr {
+    if (!std.mem.startsWith(u8, url, "http://")) return error.UnsupportedProtocol;
+    const rest = url["http://".len..];
+    const slash_pos = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const host_port = rest[0..slash_pos];
+    const path = if (slash_pos < rest.len) rest[slash_pos..] else "/";
+
+    const colon = std.mem.indexOfScalar(u8, host_port, ':') orelse return error.InvalidUrl;
+    const host = host_port[0..colon];
+    const port = try std.fmt.parseInt(u16, host_port[colon + 1 ..], 10);
+
+    const addr = try std.net.Address.parseIp(host, port);
+    const stream = try std.net.tcpConnectToAddress(addr);
+    defer stream.close();
+
+    var req = std.ArrayList(u8).init(alloc);
+    defer req.deinit();
+    try req.writer().print("GET {s} HTTP/1.0\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ path, host });
+    try stream.writeAll(req.items);
+
+    var resp: [8192]u8 = undefined;
+    const n = try stream.readAll(&resp);
+    if (n == 0) return error.EmptyResponse;
+
+    const body_start = std.mem.indexOf(u8, resp[0..n], "\r\n\r\n") orelse return error.InvalidResponse;
+    const body = resp[body_start + 4 .. n];
+
+    const parsed = try std.json.parseFromSlice([]const p2p_config_mod.BootstrapAddr, alloc, body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    var list = std.ArrayList(chord_types.NodeAddr).init(alloc);
+    for (parsed.value) |b| {
+        try list.append(chord_types.NodeAddr{
+            .id = 0, .host = try alloc.dupe(u8, b.host),
+            .port = b.port, .tcp_port = b.tcp_port,
+        });
+    }
+    return list.toOwnedSlice();
 }
