@@ -4,27 +4,12 @@
         "listen_host": "0.0.0.0",
         "listen_port": 20808,
         "transport_mode": "tcp",
-        "tcp_port": 20808,
+        "tcp_port": 8400,
         "prefer_ipv4": true,
         "bootstrap": [{"host": "192.140.185.171", "port": 20808, "tcp_port": 8444}],
         "key_file": "p2p_key_ext.bin",
         "stabilize_interval_ms": 30000,
-        "run_duration_s": 86400,
-        "proxy": {
-            "enabled": true,
-            "mode": "client",
-            "transport": "relay",
-            "remote_host": "192.140.185.171",
-            "remote_port": 8356,
-            "route_host": "",
-            "route_port": 0,
-            "remote_path": "/chord",
-            "wss_enabled": true,
-            "wss_port": 8356,
-            "wss_path": "/chord",
-            "wss_cert_file": "",
-            "wss_key_file": ""
-        }
+        "run_duration_s": 86400
     },
     "plugins": []
 }
