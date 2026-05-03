@@ -13,6 +13,7 @@ const p2p_config_mod = @import("src/p2p/config.zig");
 const chord_ring = @import("src/p2p/chord/ring.zig");
 const chord_node = @import("src/p2p/chord/node.zig");
 const chord_types = @import("src/p2p/chord/types.zig");
+const socks_relay = @import("src/p2p/socks_relay.zig");
 const udp = @import("src/p2p/transport/udp.zig");
 const proxy = @import("src/p2p/proxy.zig");
 const relay = @import("src/p2p/relay.zig");
@@ -364,7 +365,7 @@ pub fn main() !void {
             const detect_result = net_detect.fullNetDetect(alloc, p2p_cfg.?.listen_port, p2p_cfg.?.listen_host, p2p_cfg.?.prefer_ipv4);
             if (detect_result) |result| {
                 if (result.public_ip) |ip| {
-                    public_host = try alloc.dupe(u8, ip);
+                    public_host = ip; // 直接取走所有权，不额外 dupe
                     std.debug.print("[net_detect] 公网 IP: {s}\n", .{ip});
                 }
                 const new_mode: p2p_config_mod.TransportMode = switch (result.level) {
@@ -440,6 +441,11 @@ pub fn main() !void {
                 (public_host orelse cfg.listen_host)
             else
                 cfg.listen_host;
+            // public_host 已转移所有权到 effective_host，或未使用。不再单独管理生命周期。
+            if (public_host != null and !std.mem.eql(u8, cfg.listen_host, "0.0.0.0")) {
+                alloc.free(public_host.?);
+                public_host = null;
+            }
 
             // ── 原生 TCP Relay 初始化（必须在 ChordNode 之前，因为 ChordNode 需要 relay_client 引用）──
             //   relay server: 监听 listen_port 接受其他节点的连接
@@ -476,9 +482,15 @@ pub fn main() !void {
                         maybe_relay_client = rc;
                         relay_reader_thread = try std.Thread.spawn(.{}, relay.RelayClient.readerLoop, .{rc});
                         // 如果同时有 relay server，把 client 设为 server 的上游（级联转发）
+                        // 注意：如果 relay client 连接到 127.0.0.1（本机 loopback），跳过上游设置
+                        // 否则会形成路由环（upstream_client 把请求发回自身 relay server）
                         if (maybe_relay_server) |rs| {
-                            rs.upstream_client = rc;
-                            std.debug.print("[relay] 级联转发: 本地 client → {s}:{d}\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port});
+                            if (!std.mem.eql(u8, cfg.proxy.remote_host, "127.0.0.1")) {
+                                rs.upstream_client = rc;
+                                std.debug.print("[relay] 级联转发: 本地 client → {s}:{d}\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port});
+                            } else {
+                                std.debug.print("[relay] 跳过级联: client 连接到 127.0.0.1（本机 loopback）\n", .{});
+                            }
                         } else {
                             std.debug.print("[relay] 中继客户端已连接 {s}:{d}\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port});
                         }
@@ -531,6 +543,7 @@ pub fn main() !void {
                 maybe_relay_client,
                 cfg.transport_mode,
                 cfg.tcp_port,
+                cfg.external_tcp_port,
                 boot_addrs,
             );
             maybe_chord = &chord;
@@ -540,6 +553,23 @@ pub fn main() !void {
                 chord.startTcpListener(cfg.tcp_port) catch |err| {
                     std.debug.print("[chord] TCP 监听器启动失败: {}\n", .{err});
                 };
+            }
+
+            // ── SOCKS5 代理（通过独立 relay TCP 隧道） ──
+            if (cfg.socks_proxy_port > 0 and cfg.socks_relay_host.len > 0) {
+                const socks_thread = try std.Thread.spawn(.{}, socks_relay.startProxy, .{
+                    alloc,
+                    cfg.socks_relay_host,
+                    cfg.socks_relay_port,
+                    effective_host,
+                    cfg.socks_proxy_port, // 用 SOCKS 端口注册，避免与 Chord relay client 冲突
+                    cfg.listen_port,
+                    cfg.socks_proxy_port,
+                });
+                socks_thread.detach();
+                std.debug.print("[p2p] SOCKS5 代理已启动 :{d} (独立 relay → {s}:{d})\n", .{
+                    cfg.socks_proxy_port, cfg.socks_relay_host, cfg.socks_relay_port,
+                });
             }
 
             // ── WSS 服务器初始化 ──

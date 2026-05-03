@@ -33,6 +33,18 @@ fn timestamp() i64 {
 }
 
 /// Bootstrap 发送回调（适配 bootstrap.Client 到 ChordNode.sendAndWait）
+/// 判断是否为内网 IP
+fn isPrivateIP(host: []const u8) bool {
+    if (std.mem.startsWith(u8, host, "10.")) return true;
+    if (std.mem.startsWith(u8, host, "172.")) {
+        const second = std.fmt.parseInt(u16, host[4..6], 10) catch return false;
+        if (second >= 16 and second <= 31) return true;
+    }
+    if (std.mem.startsWith(u8, host, "192.168.")) return true;
+    if (std.mem.startsWith(u8, host, "127.")) return true;
+    return false;
+}
+
 fn chordNodeBootstrapSend(ctx: *anyopaque, msg: types.Message, expected_type: types.MsgType, target: types.NodeAddr, timeout_ms: u64) anyerror!types.Message {
     const self: *ChordNode = @ptrCast(@alignCast(ctx));
     return self.sendAndWait(msg, expected_type, target, timeout_ms);
@@ -53,6 +65,9 @@ pub const ChordNode = struct {
     transport_mode: TransportMode = .udp,
     /// 对外通告的 TCP 端口（0 = 不支持 TCP）
     tcp_port: u16 = 0,
+    /// 外部映射端口（0 = 与 tcp_port 相同）
+    /// 内部监听 tcp_port，但通告 external_tcp_port 给其他节点
+    external_tcp_port: u16 = 0,
     /// TCP 传输（用于 accept 入站 + sendAndWait 出站）
     tcp_transport: ?TcpTransport = null,
     /// TCP accept 线程
@@ -85,6 +100,11 @@ pub const ChordNode = struct {
     stabilize_ms: u64,
     fix_fingers_ms: u64,
 
+    /// 获取通告给其他节点的 TCP 端口
+    pub fn advertiseTcpPort(self: ChordNode) u16 {
+        return if (self.external_tcp_port > 0) self.external_tcp_port else self.tcp_port;
+    }
+
     /// 分配器 + 节点 ID + 监听地址 + 配置 → 初始化 Chord 节点
     pub fn init(
         alloc: std.mem.Allocator,
@@ -103,6 +123,7 @@ pub const ChordNode = struct {
         relay_client: ?*relay.RelayClient,
         transport_mode: TransportMode,
         tcp_port: u16,
+        external_tcp_port: u16,
         bootstrap_addrs: []NodeAddr,
     ) !ChordNode {
         const socket = try UdpSocket.bind(port);
@@ -135,6 +156,7 @@ pub const ChordNode = struct {
             .own_pk_hex = try alloc.dupe(u8, own_pk_hex),
             .transport_mode = transport_mode,
             .tcp_port = tcp_port,
+            .external_tcp_port = external_tcp_port,
             .bootstrap_addrs = bootstrap_addrs,
         };
         // 加载持久化数据
@@ -148,24 +170,25 @@ pub const ChordNode = struct {
     pub fn startTcpListener(self: *ChordNode, port: u16) !void {
         if (self.transport_mode == .udp) return; // UDP 模式不需要 TCP
         const effective_port = if (port > 0) port else self.own_port;
+        // 绑定 0.0.0.0 以同时接受内部转发和直接入站
         const transport = try TcpTransport.init(effective_port);
         self.tcp_transport = transport;
         self.tcp_port = transport.port;
-        self.routing.own_tcp_port = transport.port; // 同步到路由表
+        self.routing.own_tcp_port = self.advertiseTcpPort(); // 同步通告端口到路由表
         // 同时更新所有 successor 条目的 tcp_port
         if (self.routing.successor) |*succ| {
             if (succ.id == self.own_id) {
-                succ.tcp_port = transport.port;
+                succ.tcp_port = self.advertiseTcpPort();
             }
         }
         for (&self.routing.backup_successors) |*slot| {
             if (slot.*) |*b| {
                 if (b.id == self.own_id) {
-                    b.tcp_port = transport.port;
+                    b.tcp_port = self.advertiseTcpPort();
                 }
             }
         }
-        std.debug.print("[chord] TCP 监听 :{d} (通告 tcp_port={d})\n", .{ transport.port, self.tcp_port });
+        std.debug.print("[chord] TCP 监听 :{d} (通告 tcp_port={d})\n", .{ transport.port, self.advertiseTcpPort() });
         // 启动 accept 线程（处理入站 TCP 连接）
         const T = struct {
             fn runLoop(trans: *TcpTransport, udp_port: u16) void {
@@ -330,7 +353,16 @@ pub const ChordNode = struct {
                 }
                 self.reply(from, Message{ .notify_ok = {} }) catch {};
             },
-            .pong, .find_successor_resp, .get_predecessor_resp, .notify_ok, .ping_req, .ping_resp => {
+            .get_identity => {
+                std.debug.print("[chord] ← get_identity from {}\n", .{from});
+                self.reply(from, Message{ .identity_resp = .{
+                    .node_id = self.own_id,
+                    .node_addr = self.own_host,
+                    .node_port = self.own_port,
+                    .node_tcp_port = self.advertiseTcpPort(),
+                } }) catch {};
+            },
+            .pong, .find_successor_resp, .get_predecessor_resp, .notify_ok, .ping_req, .ping_resp, .identity_resp => {
                 // 这些是响应类型，应该在 sendAndWait 中处理
             },
 
@@ -549,6 +581,14 @@ pub const ChordNode = struct {
                     const ok = self.store.delete(body.key);
                     return Message{ .dht_delete_resp = .{ .ok = ok } };
                 },
+                .get_identity => {
+                    return Message{ .identity_resp = .{
+                        .node_id = self.own_id,
+                        .node_addr = self.own_host,
+                        .node_port = self.own_port,
+                        .node_tcp_port = self.advertiseTcpPort(),
+                    } };
+                },
                 inline else => {},
             }
         }
@@ -582,6 +622,10 @@ pub const ChordNode = struct {
                 if (std.mem.indexOfScalar(u8, target.host, ':') != null) {
                     std.debug.print("[chord] relay 跳过（目标 {s} 为 IPv6，中继协议不支持）\n", .{target.host});
                     if (self.transport_mode == .tcp) return error.ProxyFailed;
+                    break :relay_blk;
+                }
+                // 跳过内网 IP（直接 UDP 更快，relay 路由表也不会有内网节点）
+                if (isPrivateIP(target.host)) {
                     break :relay_blk;
                 }
                 const encoded = try msg.encode(self.alloc);
@@ -771,6 +815,38 @@ pub const ChordNode = struct {
         };
         // 全量重连：清空备份后继列表
         self.routing.backup_successors = .{null, null};
+
+        // 自环检测：Bootstrap 返回了本机 ID，说明该节点的路由表仍指向我们
+        // （如重启后残留的 finger 表项）。改用 Bootstrap 节点自身作为后继
+        // 以打破无限循环。通过 get_identity 获取引导节点的真实 Chord ID。
+        if (result.successor.id == self.own_id) {
+            std.debug.print("[chord] tryBootstrap: 自环检测，查询引导节点 {s}:{d} 真实 ID\n", .{
+                result.used_addr.host, result.used_addr.port,
+            });
+            // 向引导节点发送 get_identity 获取其真实 NodeId
+            const id_resp = self.sendAndWait(Message{ .get_identity = {} }, .identity_resp, result.used_addr, 5000) catch |err| {
+                std.debug.print("[chord] tryBootstrap: 查询引导节点 ID 失败: {}，使用配置地址\n", .{err});
+                self.routing.setSuccessor(result.used_addr);
+                return true;
+            };
+            switch (id_resp) {
+                .identity_resp => |body| {
+                    const real_addr = NodeAddr{
+                        .id = body.node_id,
+                        .host = body.node_addr,
+                        .port = body.node_port,
+                        .tcp_port = body.node_tcp_port,
+                    };
+                    self.routing.setSuccessor(real_addr);
+                    std.debug.print("[chord] tryBootstrap: 引导节点真实 ID={s} 已设为后继\n", .{ring.idToHex(body.node_id)});
+                },
+                else => {
+                    self.routing.setSuccessor(result.used_addr);
+                },
+            }
+            return true;
+        }
+
         self.routing.setSuccessor(result.successor);
         std.debug.print("[chord] tryBootstrap: 通过 {s}:{d} 找到后继 {s}:{d} tcp={d}\n", .{
             result.used_addr.host, result.used_addr.port,
@@ -834,7 +910,7 @@ pub const ChordNode = struct {
             .node_id = self.own_id,
             .node_addr = self.own_host,
             .node_port = self.own_port,
-            .node_tcp_port = self.tcp_port,
+            .node_tcp_port = self.advertiseTcpPort(),
         } }, .notify_ok, current_succ, 5000) catch |err| {
             std.debug.print("[chord] stabilize: notify 失败 {}\n", .{err});
             return;

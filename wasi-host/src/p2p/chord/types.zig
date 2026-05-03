@@ -24,6 +24,8 @@ pub const MsgType = enum(u8) {
     dht_delete_resp = 16,
     dht_replicate = 17,
     dht_replicate_resp = 18,
+    get_identity = 19,
+    identity_resp = 20,
 
     pub fn name(self: MsgType) []const u8 {
         return switch (self) {
@@ -45,6 +47,8 @@ pub const MsgType = enum(u8) {
             .dht_delete_resp => "dht_delete_resp",
             .dht_replicate => "dht_replicate",
             .dht_replicate_resp => "dht_replicate_resp",
+            .get_identity => "get_identity",
+            .identity_resp => "identity_resp",
         };
     }
 };
@@ -69,6 +73,8 @@ pub const Message = union(MsgType) {
     dht_delete_resp: DhtDeleteResp,
     dht_replicate: DhtReplicateReq,
     dht_replicate_resp: DhtReplicateResp,
+    get_identity: void,
+    identity_resp: struct { node_id: NodeId, node_addr: []const u8, node_port: u16, node_tcp_port: u16 = 0 },
 
     pub fn encode(self: Message, alloc: std.mem.Allocator) ![]u8 {
         return std.json.stringifyAlloc(alloc, self, .{});

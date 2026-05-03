@@ -21,6 +21,10 @@ pub const P2PConfig = struct {
     transport_mode: TransportMode = .udp,
     /// TCP 监听端口（0 = 与 listen_port 相同，仅 transport_mode != udp 时有效）
     tcp_port: u16 = 0,
+    /// 外部映射端口（0 = 与 tcp_port 相同）
+    /// 用于 NAT/端口映射场景：内部监听 tcp_port，外部通过 external_tcp_port 入站
+    /// 例：ext 内部监听 8400，AlwaysData 外部映射 443→8400，设 external_tcp_port=443
+    external_tcp_port: u16 = 0,
     /// Bootstrap 节点地址列表
     bootstrap: []const BootstrapAddr = &.{},
     /// 节点密钥文件路径（PEM 格式保存 ED25519 种子）
@@ -33,6 +37,13 @@ pub const P2PConfig = struct {
     stabilize_interval_ms: u64 = 30_000,
     /// DNS 种子地址（可选，用于自动发现种子节点）
     dns_seeds: []const []const u8 = &.{},
+    /// SOCKS5 代理端口（0 = 禁用）。
+    /// 在此端口启动 SOCKS5 代理，通过独立 relay TCP 隧道转发流量到 relay server。
+    socks_proxy_port: u16 = 0,
+    /// SOCKS5 代理 relay 服务器地址（用于创建独立 relay 连接）
+    socks_relay_host: []const u8 = "",
+    /// SOCKS5 代理 relay 服务器端口
+    socks_relay_port: u16 = 0,
     /// 如果为 true，在检测公网 IP 时优先使用 IPv4 地址
     /// 用于 relay 协议不支持 IPv6 的环境（如 ext 节点 on alwaysdata）
     prefer_ipv4: bool = true,

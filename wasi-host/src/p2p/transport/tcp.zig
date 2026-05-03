@@ -71,14 +71,18 @@ pub const TcpTransport = struct {
     running: bool,
 
     pub fn init(port: u16) !TcpTransport {
-        const addr = try std.net.Address.parseIp("0.0.0.0", port);
+        return initBind("0.0.0.0", port);
+    }
+
+    pub fn initBind(host: []const u8, port: u16) !TcpTransport {
+        const addr = try std.net.Address.parseIp(host, port);
         const server = try addr.listen(.{
             .reuse_address = true,
             .reuse_port = true,
             .kernel_backlog = 16,
         });
         const actual_port = server.listen_address.getPort();
-        std.debug.print("[tcp] TCP 监听 :{d}\n", .{actual_port});
+        std.debug.print("[tcp] TCP 监听 {s}:{d}\n", .{ host, actual_port });
         return TcpTransport{
             .listener = server,
             .port = actual_port,

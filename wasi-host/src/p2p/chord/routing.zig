@@ -101,8 +101,12 @@ pub const Routing = struct {
             if (ring.between(candidate.id, pred.id, self.own_id)) {
                 self.predecessor = candidate;
             } else if (candidate.id == pred.id) {
-                // 同一节点但地址可能已变化（如 ext 从 0.0.0.0 变为公网 IP）
-                self.predecessor = candidate;
+                // 同节点ID但地址不同。只有当新地址有明显更好的连接信息时才更新
+                const pred_has_ext_tcp = pred.tcp_port > 0 and pred.tcp_port != pred.port;
+                const cand_has_ext_tcp = candidate.tcp_port > 0 and candidate.tcp_port != candidate.port;
+                if (cand_has_ext_tcp and !pred_has_ext_tcp) {
+                    self.predecessor = candidate;
+                }
             }
         }
     }

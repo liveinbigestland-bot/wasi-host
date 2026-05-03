@@ -90,8 +90,11 @@ pub fn fullNetDetect(alloc: std.mem.Allocator, test_port: u16, listen_host: []co
     if (pub_ip) |ip| {
         const ip_copy = alloc.dupe(u8, ip) catch null;
         if (ip_copy) |ipc| {
-            const probe_thread = std.Thread.spawn(.{}, probeBg, .{ alloc, ipc, actual_port }) catch null;
-            if (probe_thread) |pt| pt.detach();
+            if (std.Thread.spawn(.{}, probeBg, .{ alloc, ipc, actual_port })) |pt| {
+                pt.detach();
+            } else |_| {
+                alloc.free(ipc); // 线程创建失败时释放
+            }
         }
     }
 

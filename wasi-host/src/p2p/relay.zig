@@ -16,6 +16,11 @@ const FRAME_REQUEST: u8 = 1;
 const FRAME_RESPONSE: u8 = 2;
 const FRAME_FORWARD: u8 = 3;
 const FRAME_REPLY: u8 = 4;
+const FRAME_TCP_CONNECT: u8 = 5; // [5][conn_id 4LE][host_len 1][host][port 2BE] — TCP 隧道连接请求
+const FRAME_TCP_DATA: u8 = 6;    // [6][conn_id 4LE][data_len 4BE][data] — TCP 隧道数据
+const FRAME_TCP_CLOSE: u8 = 7;   // [7][conn_id 4LE]
+const FRAME_PING: u8 = 8;        // [8] — 心跳
+const FRAME_PONG: u8 = 9;        // [9] — 心跳回复 — TCP 隧道关闭
 
 const BUF_SIZE = 65536;
 
@@ -95,6 +100,39 @@ fn readFrame(fd: posix.socket_t, buf: []u8) !usize {
             if (total > buf.len) return error.ResponseTooLarge;
             if (payload_len > 0) try readExact(fd, buf[header_len..total]);
             return total;
+        },
+        FRAME_TCP_CONNECT => {
+            // [5][conn_id 4LE][host_len 1][host][port 2BE]
+            const header_len = 1 + 4 + 1;
+            if (buf.len < header_len + 2) return error.ResponseTooLarge;
+            try readExact(fd, buf[1..header_len]);
+            const host_len = buf[header_len - 1];
+            const total = header_len + host_len + 2;
+            if (total > buf.len) return error.ResponseTooLarge;
+            if (host_len > 0) try readExact(fd, buf[header_len..total]);
+            return total;
+        },
+        FRAME_TCP_DATA => {
+            // [6][conn_id 4LE][data_len 4BE][data]
+            const header_len = 1 + 4 + 4;
+            if (buf.len < header_len) return error.ResponseTooLarge;
+            try readExact(fd, buf[1..header_len]);
+            const data_len = std.mem.readInt(u32, buf[header_len - 4 ..][0..4], .big);
+            const total = header_len + data_len;
+            if (total > buf.len) return error.ResponseTooLarge;
+            if (data_len > 0) try readExact(fd, buf[header_len..total]);
+            return total;
+        },
+        FRAME_TCP_CLOSE => {
+            // [7][conn_id 4LE]
+            const header_len = 1 + 4;
+            if (buf.len < header_len) return error.ResponseTooLarge;
+            try readExact(fd, buf[1..header_len]);
+            return header_len;
+        },
+        FRAME_PING, FRAME_PONG => {
+            // [8] or [9] — just 1 byte
+            return 1;
         },
         else => return error.InvalidData,
     }
@@ -211,11 +249,20 @@ const RateLimiter = struct {
     }
 };
 
+const TcpTunnel = struct {
+    conn_id: u32,
+    relay_fd: posix.socket_t,   // relay client 的连接 fd（用于发回数据）
+    target_fd: posix.socket_t,  // 出站 TCP 连接 fd
+    node_key: []const u8,       // relay client 的 node_key（仅引用）
+};
+
 pub const RelayServer = struct {
     listen_fd: posix.socket_t,
     port: u16,
     routing: std.StringHashMap(*Connection),
     pending: std.AutoHashMap(u32, PendingEntry),
+    tcp_tunnels: std.AutoHashMap(u32, *TcpTunnel),
+    tcp_tunnel_mutex: std.Thread.Mutex = .{},
     next_req_id: u32,
     alloc: std.mem.Allocator,
     running: bool,
@@ -244,6 +291,7 @@ pub const RelayServer = struct {
             .port = port,
             .routing = std.StringHashMap(*Connection).init(alloc),
             .pending = std.AutoHashMap(u32, PendingEntry).init(alloc),
+            .tcp_tunnels = std.AutoHashMap(u32, *TcpTunnel).init(alloc),
             .next_req_id = 1,
             .alloc = alloc,
             .running = false,
@@ -259,6 +307,7 @@ pub const RelayServer = struct {
     pub fn deinit(self: *RelayServer) void {
         self.routing.deinit();
         self.pending.deinit();
+        self.tcp_tunnels.deinit();
         self.limiter.deinit();
     }
 
@@ -359,6 +408,34 @@ pub const RelayServer = struct {
                     const payload_len = std.mem.readInt(u32, buf[5..9], .big);
                     const payload = buf[9..][0..payload_len];
                     self.routeResponse(req_id, payload);
+                },
+                FRAME_TCP_CONNECT => {
+                    // [5][conn_id 4LE][host_len 1][host][port 2BE]
+                    const conn_id = std.mem.readInt(u32, buf[1..5], .little);
+                    const host_len = buf[5];
+                    const host = buf[6..][0..host_len];
+                    const port = std.mem.readInt(u16, buf[6 + host_len ..][0..2], .big);
+                    self.handleTcpConnect(fd, node_key, conn_id, host, port);
+                },
+                FRAME_TCP_DATA => {
+                    // [6][conn_id 4LE][data_len 4BE][data]
+                    const conn_id = std.mem.readInt(u32, buf[1..5], .little);
+                    const data_len = std.mem.readInt(u32, buf[5..9], .big);
+                    const data = buf[9..][0..data_len];
+                    self.handleTcpData(conn_id, data);
+                },
+                FRAME_TCP_CLOSE => {
+                    // [7][conn_id 4LE]
+                    const conn_id = std.mem.readInt(u32, buf[1..5], .little);
+                    self.handleTcpClose(conn_id);
+                },
+                FRAME_PING => {
+                    // [8] — 心跳，回复 PONG
+                    const pong: [1]u8 = .{FRAME_PONG};
+                    _ = posix.write(fd, &pong) catch {};
+                },
+                FRAME_PONG => {
+                    // [9] — 心跳回复，忽略
                 },
                 else => {
                     std.debug.print("[relay] 未知帧类型 {} 来自 {s}\n", .{ buf[0], node_key });
@@ -486,6 +563,162 @@ pub const RelayServer = struct {
         };
     }
 
+    /// TCP 隧道：客户端请求连接目标 host:port
+    fn handleTcpConnect(self: *RelayServer, relay_fd: posix.socket_t, node_key: []const u8, conn_id: u32, host: []const u8, port: u16) void {
+        // 创建出站 TCP 连接
+        // DNS 解析（支持域名和 IP）
+        const addr_list = std.net.getAddressList(self.alloc, host, port) catch |err| {
+            std.debug.print("[relay/tcp] DNS 解析失败 {s}:{d}: {}\n", .{ host, port, err });
+            return;
+        };
+        defer addr_list.deinit();
+
+        if (addr_list.addrs.len == 0) {
+            std.debug.print("[relay/tcp] DNS 解析结果为空 {s}:{d}\n", .{ host, port });
+            return;
+        }
+
+        const target_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |err| {
+            std.debug.print("[relay/tcp] 创建 socket 失败: {}\n", .{err});
+            return;
+        };
+        errdefer closeSocket(target_fd);
+
+        // 尝试连接每个解析到的地址（仅 IPv4）
+        var connected = false;
+        for (addr_list.addrs) |addr| {
+            if (addr.any.family != posix.AF.INET) continue;
+            posix.connect(target_fd, &addr.any, addr.getOsSockLen()) catch |err| {
+                std.debug.print("[relay/tcp] 连接地址 {} 失败: {}\n", .{ addr, err });
+                continue;
+            };
+            connected = true;
+            break;
+        }
+
+        if (!connected) {
+            std.debug.print("[relay/tcp] 连接失败 {s}:{d} (尝试了所有地址)\n", .{ host, port });
+            return;
+        }
+
+
+
+        const tunnel = self.alloc.create(TcpTunnel) catch {
+            std.debug.print("[relay/tcp] alloc 失败\n", .{});
+            return;
+        };
+        tunnel.* = .{
+            .conn_id = conn_id,
+            .relay_fd = relay_fd,
+            .target_fd = target_fd,
+            .node_key = node_key,
+        };
+
+        {
+            self.tcp_tunnel_mutex.lock();
+            defer self.tcp_tunnel_mutex.unlock();
+            // 如果 conn_id 已存在，关闭旧的
+            if (self.tcp_tunnels.get(conn_id)) |old| {
+                closeSocket(old.target_fd);
+                self.alloc.destroy(old);
+            }
+            self.tcp_tunnels.put(conn_id, tunnel) catch {};
+        }
+
+        std.debug.print("[relay/tcp] 隧道已建立 conn_id={d} → {s}:{d}\n", .{ conn_id, host, port });
+
+        // 启动出站 TCP reader 线程
+        if (std.Thread.spawn(.{}, tcpTunnelReader, .{self, conn_id, target_fd, relay_fd})) |thread| {
+            thread.detach();
+        } else |err| {
+            std.debug.print("[relay/tcp] 线程创建失败: {}\n", .{err});
+        }
+    }
+
+    /// 出站 TCP 读取循环：读取远程数据，发送 FRAME_TCP_DATA 回 relay client
+    fn tcpTunnelReader(server: *RelayServer, conn_id: u32, target_fd: posix.socket_t, relay_fd: posix.socket_t) void {
+        defer {
+            closeSocket(target_fd);
+            server.tcp_tunnel_mutex.lock();
+            _ = server.tcp_tunnels.remove(conn_id);
+            server.tcp_tunnel_mutex.unlock();
+        }
+
+        var buf: [BUF_SIZE]u8 = undefined;
+        // 设置接收超时
+        setRecvTimeout(target_fd, 5000);
+
+        while (true) {
+            const n = posix.read(target_fd, &buf) catch |err| {
+                if (err == error.WouldBlock or err == error.Timeout) {
+                    // 检查隧道是否仍存在
+                    server.tcp_tunnel_mutex.lock();
+                    const exists = server.tcp_tunnels.contains(conn_id);
+                    server.tcp_tunnel_mutex.unlock();
+                    if (!exists) return;
+                    continue;
+                }
+                if (err == error.ConnectionResetByPeer or err == error.ConnectionClosed) {
+                    std.debug.print("[relay/tcp] 远程关闭 conn_id={d}\n", .{conn_id});
+                } else {
+                    std.debug.print("[relay/tcp] 读取错误 conn_id={d}: {}\n", .{conn_id, err});
+                }
+                break;
+            };
+            if (n == 0) {
+                std.debug.print("[relay/tcp] 远程关闭(EOF) conn_id={d}\n", .{conn_id});
+                break;
+            }
+
+            // 发送 FRAME_TCP_DATA 回 relay client
+            var frame: [BUF_SIZE]u8 = undefined;
+            frame[0] = FRAME_TCP_DATA;
+            std.mem.writeInt(u32, frame[1..5], conn_id, .little);
+            const write_len = @min(@as(usize, n), buf.len);
+            std.mem.writeInt(u32, frame[5..9], @as(u32, @intCast(write_len)), .big);
+            if (write_len > 0) @memcpy(frame[9..][0..write_len], buf[0..write_len]);
+
+            _ = posix.write(relay_fd, frame[0 .. 9 + write_len]) catch |err| {
+                std.debug.print("[relay/tcp] 写回 relay 失败 conn_id={d}: {}\n", .{conn_id, err});
+                break;
+            };
+        }
+
+        // 发送关闭通知到 relay client
+        var close_frame: [5]u8 = undefined;
+        close_frame[0] = FRAME_TCP_CLOSE;
+        std.mem.writeInt(u32, close_frame[1..5], conn_id, .little);
+        _ = posix.write(relay_fd, &close_frame) catch {};
+    }
+
+    /// TCP 隧道：转发来自 relay client 的数据到出站 TCP
+    fn handleTcpData(self: *RelayServer, conn_id: u32, data: []const u8) void {
+        self.tcp_tunnel_mutex.lock();
+        const tunnel = self.tcp_tunnels.get(conn_id) orelse {
+            self.tcp_tunnel_mutex.unlock();
+            return;
+        };
+        const target_fd = tunnel.target_fd;
+        self.tcp_tunnel_mutex.unlock();
+
+        _ = posix.write(target_fd, data) catch |err| {
+            std.debug.print("[relay/tcp] 写入目标失败 conn_id={d}: {}\n", .{conn_id, err});
+        };
+    }
+
+    /// TCP 隧道：关闭连接
+    fn handleTcpClose(self: *RelayServer, conn_id: u32) void {
+        self.tcp_tunnel_mutex.lock();
+        defer self.tcp_tunnel_mutex.unlock();
+
+        if (self.tcp_tunnels.get(conn_id)) |tunnel| {
+            closeSocket(tunnel.target_fd);
+            self.alloc.destroy(tunnel);
+            _ = self.tcp_tunnels.remove(conn_id);
+            std.debug.print("[relay/tcp] 隧道关闭 conn_id={d}\n", .{conn_id});
+        }
+    }
+
     /// 直接发送 REPLY 帧给请求者（用于上游转发后的回送）
     fn sendReply(self: *RelayServer, requester_key: []const u8, original_seq: u32, payload: []const u8) void {
         const requester_conn = blk: {
@@ -529,6 +762,13 @@ pub const RelayClient = struct {
     remote_host: []const u8,
     remote_port: u16,
     ws_path: []const u8,
+
+    /// TCP 隧道回调（由 SOCKS5 代理注册）
+    /// data != null → TCP 数据；data == null → 连接关闭
+    tcp_callback: ?*const fn (conn_id: u32, data: ?[]const u8) void = null,
+
+    /// 上次收到数据的时间戳（用于心跳保活）
+    last_recv_ms: i64 = 0,
 
     const PendingEntry = struct {
         event: std.Thread.ResetEvent,
@@ -598,6 +838,12 @@ pub const RelayClient = struct {
         @memcpy(reg_buf[2..][0..reg_addr.len], reg_addr);
         try relayWriteRaw(&client, reg_buf[0 .. 2 + reg_addr.len]);
 
+        // 连接后立即发 PING，防止 NAT 过早断连
+        {
+            const ping: [1]u8 = .{FRAME_PING};
+            _ = posix.write(client.fd, &ping) catch {};
+        }
+
         std.debug.print("[relay/conn] 连接到 relay {s}:{d} (本机 {s}:{d})\n", .{ remote_host, remote_port, local_host, local_port });
         return client;
     }
@@ -664,6 +910,47 @@ pub const RelayClient = struct {
         return entry.result_len;
     }
 
+    /// TCP 隧道：发送连接请求
+    pub fn tcpConnect(self: *RelayClient, conn_id: u32, host: []const u8, port: u16) !void {
+        var frame: [BUF_SIZE]u8 = undefined;
+        frame[0] = FRAME_TCP_CONNECT;
+        std.mem.writeInt(u32, frame[1..5], conn_id, .little);
+        const host_len = @as(u8, @intCast(@min(host.len, @as(usize, 255))));
+        frame[5] = host_len;
+        @memcpy(frame[6..][0..host_len], host[0..host_len]);
+        std.mem.writeInt(u16, frame[6 + host_len ..][0..2], port, .big);
+        const total = 6 + host_len + 2;
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try relayWriteRaw(self, frame[0..total]);
+    }
+
+    /// TCP 隧道：发送数据
+    pub fn tcpData(self: *RelayClient, conn_id: u32, data: []const u8) !void {
+        var frame: [BUF_SIZE]u8 = undefined;
+        frame[0] = FRAME_TCP_DATA;
+        std.mem.writeInt(u32, frame[1..5], conn_id, .little);
+        const write_len = @min(data.len, BUF_SIZE - 9);
+        std.mem.writeInt(u32, frame[5..9], @as(u32, @intCast(write_len)), .big);
+        if (write_len > 0) @memcpy(frame[9..][0..write_len], data[0..write_len]);
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try relayWriteRaw(self, frame[0 .. 9 + write_len]);
+    }
+
+    /// TCP 隧道：关闭连接
+    pub fn tcpClose(self: *RelayClient, conn_id: u32) !void {
+        var frame: [5]u8 = undefined;
+        frame[0] = FRAME_TCP_CLOSE;
+        std.mem.writeInt(u32, frame[1..5], conn_id, .little);
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try relayWriteRaw(self, &frame);
+    }
+
     /// 重新连接到 relay server（连接断开后自动重连）
     fn reconnect(self: *RelayClient) bool {
         // 关闭旧 socket
@@ -720,6 +1007,13 @@ pub const RelayClient = struct {
             @memcpy(reg_buf[2..][0..reg_addr.len], reg_addr);
             relayWriteRaw(self, reg_buf[0 .. 2 + reg_addr.len]) catch continue;
 
+            // 重连后立即发 PING 保活
+            {
+                const ping: [1]u8 = .{FRAME_PING};
+                _ = posix.write(self.fd, &ping) catch {};
+            }
+
+
             std.debug.print("[relay/reader] 重连成功\n", .{});
             setRecvTimeout(self.fd, 3000);
             return true;
@@ -739,10 +1033,22 @@ pub const RelayClient = struct {
             setRecvTimeout(self.fd, 3000);
             var buf: [BUF_SIZE]u8 = undefined;
 
+            // 初始化心跳时间戳（设为过去，让第一个心跳立即触发）
+            self.last_recv_ms = std.time.milliTimestamp() - 10_000;
+
             // 内层循环：正常帧读取处理
             while (self.running) {
                 const frame_n = relayReadRaw(self, &buf) catch |err| {
-                    if (err == error.Timeout) continue;
+                    if (err == error.Timeout) {
+                        // 心跳保活：5 秒无数据则发送 PING（NAT 空闲超时通常≥10s）
+                        const now = std.time.milliTimestamp();
+                        if (now - self.last_recv_ms > 5_000) {
+                            const ping: [1]u8 = .{FRAME_PING};
+                            _ = posix.write(self.fd, &ping) catch {};
+                            self.last_recv_ms = now;
+                        }
+                        continue;
+                    }
                     if (err == error.ConnectionClosed or err == error.WouldBlock) {
                         std.debug.print("[relay/reader] 连接断开\n", .{});
                         break;
@@ -751,6 +1057,7 @@ pub const RelayClient = struct {
                     break;
                 };
                 _ = frame_n;
+                self.last_recv_ms = std.time.milliTimestamp();
 
                 switch (buf[0]) {
                     FRAME_FORWARD => {
@@ -759,8 +1066,21 @@ pub const RelayClient = struct {
                         const payload_len = std.mem.readInt(u32, buf[5..9], .big);
                         const payload = buf[9..][0..payload_len];
 
+                        // ── 每个 FRAME_FORWARD 使用临时 UDP socket，避免响应串扰 ──
+                        const tmp_udp = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP) catch |err| {
+                            std.debug.print("[relay/reader] 创建临时 UDP socket 失败: {}\n", .{err});
+                            continue;
+                        };
+                        defer posix.close(tmp_udp);
+
+                        const tmp_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+                        posix.bind(tmp_udp, &tmp_bind.any, tmp_bind.getOsSockLen()) catch |err| {
+                            std.debug.print("[relay/reader] 绑定临时 UDP socket 失败: {}\n", .{err});
+                            continue;
+                        };
+
                         // 转发到本地 wasi-host UDP
-                        _ = posix.sendto(self.udp_fd, payload, 0, &target_addr.any, @sizeOf(posix.sockaddr.in)) catch |err| {
+                        _ = posix.sendto(tmp_udp, payload, 0, &target_addr.any, @sizeOf(posix.sockaddr.in)) catch |err| {
                             std.debug.print("[relay/reader] UDP 转发错误: {}\n", .{err});
                             continue;
                         };
@@ -769,8 +1089,8 @@ pub const RelayClient = struct {
                         var resp_buf: [BUF_SIZE]u8 = undefined;
                         var resp_addr: std.net.Address = undefined;
                         var resp_addr_len: posix.socklen_t = @sizeOf(std.net.Address);
-                        setRecvTimeout(self.udp_fd, 5000);
-                        const resp_n = posix.recvfrom(self.udp_fd, &resp_buf, 0, &resp_addr.any, &resp_addr_len) catch |err| {
+                        setRecvTimeout(tmp_udp, 5000);
+                        const resp_n = posix.recvfrom(tmp_udp, &resp_buf, 0, &resp_addr.any, &resp_addr_len) catch |err| {
                             if (err == error.WouldBlock or err == error.Timeout) {
                                 // 无响应（如 notify 等单向消息）
                                 continue;
@@ -778,7 +1098,6 @@ pub const RelayClient = struct {
                             std.debug.print("[relay/reader] UDP recv 错误: {}\n", .{err});
                             continue;
                         };
-
                         // 发送响应回 relay server
                         var resp_frame: [BUF_SIZE]u8 = undefined;
                         resp_frame[0] = FRAME_RESPONSE;
@@ -792,6 +1111,22 @@ pub const RelayClient = struct {
                             break;
                         };
                         self.write_mutex.unlock();
+                    },
+                    FRAME_TCP_DATA => {
+                        // [6][conn_id 4LE][data_len 4BE][data]
+                        const conn_id = std.mem.readInt(u32, buf[1..5], .little);
+                        const data_len = std.mem.readInt(u32, buf[5..9], .big);
+                        const data = buf[9..][0..data_len];
+                        if (self.tcp_callback) |cb| {
+                            cb(conn_id, data);
+                        }
+                    },
+                    FRAME_TCP_CLOSE => {
+                        // [7][conn_id 4LE]
+                        const conn_id = std.mem.readInt(u32, buf[1..5], .little);
+                        if (self.tcp_callback) |cb| {
+                            cb(conn_id, null);
+                        }
                     },
                     FRAME_REPLY => {
                         // [4][seq(4)][payload_len(4)][payload]
