@@ -2,13 +2,13 @@
 
 ## 机器信息
 
-| 项目 | 值 |
-|------|-----|
-| 主机 | ssh-metaai.alwaysdata.net:22 |
-| 用户 | metaai |
-| 架构 | x86_64 Debian 12 |
-| Public IP | 185.31.41.85 |
-| 工作目录 | /home/metaai/ |
+| 项目        | 值                            |
+| --------- | ---------------------------- |
+| 主机        | ssh-metaai.alwaysdata.net:22 |
+| 用户        | metaai                       |
+| 架构        | x86_64 Debian 12             |
+| Public IP | 185.31.41.85                 |
+| 工作目录      | /home/metaai/                |
 
 ## 服务进程
 
@@ -36,6 +36,7 @@ if (url === '/chord') {
 ```
 
 **关键行为**:
+
 1. WS 帧格式: `[target_ip(4)B][target_port(2)B][payload]` — 但 index.js **忽略** target_ip/target_port
 2. 始终将 payload 转发到 `127.0.0.1:20808` (本机 wasi-host)
 3. UDP 响应通过同一 WS 连接返回给客户端
@@ -53,11 +54,11 @@ if (url === '/chord') {
 
 **通信路径**:
 
-| 方向 | 路径 |
-|------|------|
-| 外部→ext | WS → index.js:8356 → UDP 127.0.0.1:20808 → wasi-host |
-| ext→外部(回复) | wasi-host → UDP → index.js ephemeral port → WS → 外部 |
-| ext→外部(主动发起) | wasi-host → 直接 UDP → 目标 (仅公网 IP 可达，内网私有 IP 不可达) |
+| 方向           | 路径                                                   |
+| ------------ | ---------------------------------------------------- |
+| 外部→ext       | WS → index.js:8356 → UDP 127.0.0.1:20808 → wasi-host |
+| ext→外部(回复)   | wasi-host → UDP → index.js ephemeral port → WS → 外部  |
+| ext→外部(主动发起) | wasi-host → 直接 UDP → 目标 (仅公网 IP 可达，内网私有 IP 不可达)      |
 
 ## 已知问题
 
@@ -66,6 +67,7 @@ if (url === '/chord') {
 本地配置文件中的 `remote_port` 写的是 `80`，但 index.js 实际运行在 **8356**。
 
 需要修改的文件:
+
 - `config-remote-node59.json`: `remote_port` 80 → 8356
 - `config-remote-node60.json`: `remote_port` 80 → 8356
 - `config-remote-seed.json`: `remote_port` 80 → 8356
@@ -83,6 +85,7 @@ if (url === '/chord') {
 ### 3. Ring 顺序限制
 
 Chord ID 排序:
+
 ```
 node59(67adbb) < 外2(720b1f) < seed(a39831) < node60(e4aba7) < ext(f4da45)
 ```

@@ -48,15 +48,15 @@ wasi-host/
 
 编辑 `config.json` 控制每个插件的权限：
 
-| 字段 | 说明 |
-|------|------|
-| `name` | 插件名称 |
-| `embed_path` | 内嵌 WASM 文件路径 |
-| `mem_kb` | 内存上限（KB） |
-| `timeout_ms` | 超时熔断（毫秒） |
-| `network` | 是否允许网络访问 |
-| `write` | 是否允许写文件系统 |
-| `allow_host_info` | 是否可读宿主硬件信息 |
+| 字段                | 说明           |
+| ----------------- | ------------ |
+| `name`            | 插件名称         |
+| `embed_path`      | 内嵌 WASM 文件路径 |
+| `mem_kb`          | 内存上限（KB）     |
+| `timeout_ms`      | 超时熔断（毫秒）     |
+| `network`         | 是否允许网络访问     |
+| `write`           | 是否允许写文件系统    |
+| `allow_host_info` | 是否可读宿主硬件信息   |
 
 如果 `config.json` 不存在，将使用默认配置运行所有内嵌插件。
 
@@ -75,6 +75,7 @@ pub fn main() void {
 ```
 
 编译：
+
 ```bash
 zig build-exe plugins/my_plugin.zig -target wasm32-wasi -rdynamic -O ReleaseSmall -femit-bin="plug/my_plugin.wasm"
 ```
@@ -83,6 +84,6 @@ zig build-exe plugins/my_plugin.zig -target wasm32-wasi -rdynamic -O ReleaseSmal
 
 ## 系统要求
 
-- Zig 0.13+
+- Zig 0.14+
 - Git（用于克隆 Wasm3）
 - （可选）zig build 跨平台目标：`x86_64-windows-gnu`、`aarch64-linux-gnu` 等

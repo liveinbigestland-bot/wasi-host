@@ -19,8 +19,8 @@ zig build
 # ARM (armv7l 节点)
 zig build -Dtarget=arm-linux-musleabihf -p /d/tmp/zig-out-arm && cp /d/tmp/zig-out-arm/bin/wasi-host zig-out/bin/wasi-host-arm-v5
 
-# x86_64 Linux (外网服务器)
-zig build -Dtarget=x86_64-linux-gnu -p /d/tmp/zig-out-x64 && cp /d/tmp/zig-out-x64/bin/wasi-host zig-out/bin/wasi-host-x86_64
+# x86_64 Linux (外网服务器 + relay-server)
+zig build -Dtarget=x86_64-linux-gnu -p /d/tmp/zig-out-x64 && cp /d/tmp/zig-out-x64/bin/wasi-host zig-out/bin/wasi-host-x86_64 && cp /d/tmp/zig-out-x64/bin/relay-server zig-out/bin/relay-server-x86_64
 ```
 
 ## 配置映射
