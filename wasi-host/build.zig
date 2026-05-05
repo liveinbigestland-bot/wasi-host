@@ -45,7 +45,6 @@ pub fn build(b: *std.Build) void {
         host_target.result.os.tag == native_target.result.os.tag;
 
     // WSS TLS 支持需要 OpenSSL（仅本机 Linux 编译）
-    // 交叉编译时不链接 OpenSSL，WSS 降级为纯 WS
     const wss_tls_enabled = building_natively and host_target.result.os.tag == .linux;
     if (wss_tls_enabled) {
         exe.linkSystemLibrary("ssl");
@@ -80,7 +79,18 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // ── Phase 5: wasi-hostd 守护进程 ──
+    // ── Encrypted Relay Server 独立二进制 ──
+    const relay_server = b.addExecutable(.{
+        .name = "relay-server",
+        .root_source_file = b.path("src/relay/main.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .strip = optimize != .Debug,
+    });
+    relay_server.linkLibC();
+    b.installArtifact(relay_server);
+
+    // ── wasi-hostd 守护进程 ──
     const daemon = b.addExecutable(.{
         .name = "wasi-hostd",
         .root_source_file = b.path("src/daemon/main.zig"),
@@ -90,9 +100,6 @@ pub fn build(b: *std.Build) void {
     });
     daemon.linkLibC();
 
-    // 注：daemon 使用自己的类型定义，不依赖 p2p 模块
-
-    // 尝试获取 git 版本
     const version_str = getGitDescribe(b) orelse "0.0.0";
     const daemon_opts = b.addOptions();
     daemon_opts.addOption([]const u8, "version", version_str);
@@ -100,7 +107,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(daemon);
 
-    // ── Phase 3 单元测试 ──
+    // ── 单元测试 ──
     const test_step = b.step("test", "Run unit tests");
     inline for (.{
         "src/p2p/metadata/types.zig",
@@ -113,15 +120,28 @@ pub fn build(b: *std.Build) void {
             .target = host_target,
             .optimize = optimize,
         });
-        test_step.dependOn(&test_obj.step);
+        const run_test = b.addRunArtifact(test_obj);
+        test_step.dependOn(&run_test.step);
     }
 
-    // ── Phase 5: wasi-hostd 单元测试 ──
+    // relay-server 测试需要 linkLibC（posix.recvfrom 需要 libc）
+    {
+        const relay_test = b.addTest(.{
+            .root_source_file = b.path("src/relay/main.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        });
+        relay_test.linkLibC();
+        const run_relay_test = b.addRunArtifact(relay_test);
+        test_step.dependOn(&run_relay_test.step);
+    }
+
     const daemon_test = b.addTest(.{
         .root_source_file = b.path("src/daemon/test.zig"),
         .target = host_target,
         .optimize = optimize,
     });
     daemon_test.linkLibC();
-    test_step.dependOn(&daemon_test.step);
+    const run_daemon_test = b.addRunArtifact(daemon_test);
+    test_step.dependOn(&run_daemon_test.step);
 }

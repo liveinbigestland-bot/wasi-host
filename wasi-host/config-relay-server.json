@@ -1,0 +1,11 @@
+{
+    "_comment": "加密中继服务器配置",
+    "listen_host": "0.0.0.0",
+    "listen_port": 20809,
+    "max_sessions": 1000,
+    "heartbeat_timeout_ms": 60000,
+    "max_packets_per_second": 1000,
+    "max_packet_size": 1400,
+    "buffer_size": 65536,
+    "reap_interval_ms": 10000
+}
