@@ -1,0 +1,18 @@
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 9999))
+s.listen(1)
+sys.stderr.write("ready\n")
+sys.stderr.flush()
+conn, addr = s.accept()
+sys.stderr.write(f"conn {addr}\n")
+sys.stderr.flush()
+data = conn.recv(65536)
+sys.stderr.write(f"recv {len(data)} bytes\n")
+with open("/tmp/received_file", "wb") as f:
+    f.write(data)
+conn.send(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+conn.close()
+s.close()
+sys.stderr.write("done\n")

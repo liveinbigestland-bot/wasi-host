@@ -31,6 +31,12 @@ p2p_key*.bin
 # Planning files (development only)
 .planning/
 
+# Graphify knowledge graph (auto-generated)
+graphify-out/
+
+# Spec work (development only)
+openspec/
+
 # OS files
 .DS_Store
 Thumbs.db

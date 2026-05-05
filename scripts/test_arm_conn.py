@@ -1,0 +1,40 @@
+import paramiko
+
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect('192.168.2.59', username='root', password='ecoo1234', timeout=10)
+
+# Write a connectivity test
+sftp = ssh.open_sftp()
+f = sftp.open('/tmp/conn_test.py', 'w')
+f.write('import socket,sys\n')
+f.write('s=socket.socket()\n')
+f.write('s.settimeout(5)\n')
+f.write("try:\n")
+f.write('    s.connect(("192.140.185.171",8356))\n')
+f.write('    print("OK:connected")\n')
+f.write('    s.close()\n')
+f.write("except Exception as e:\n")
+f.write('    print("FAIL:",e)\n')
+f.close()
+sftp.close()
+
+stdin, stdout, stderr = ssh.exec_command('python3 /tmp/conn_test.py 2>&1')
+print(stdout.read().decode())
+# Also test ext relay (WSS)
+f2 = sftp.open('/tmp/conn_test2.py', 'w')
+f2.write('import socket\n')
+f2.write('s=socket.socket()\n')
+f2.write('s.settimeout(5)\n')
+f2.write("try:\n")
+f2.write('    s.connect(("192.140.185.171",8444))\n')
+f2.write('    print("TCP 8444 OK")\n')
+f2.write('    s.close()\n')
+f2.write("except Exception as e:\n")
+f2.write('    print("8444 FAIL:",e)\n')
+f2.close()
+
+stdin2, stdout2, stderr2 = ssh.exec_command('python3 /tmp/conn_test2.py 2>&1')
+print(stdout2.read().decode())
+
+ssh.close()
