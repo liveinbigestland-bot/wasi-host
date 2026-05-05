@@ -3,25 +3,32 @@
 /// 连接到加密中继服务器，注册并鉴权，发送/接收转发数据。
 /// 支持主/备中继列表，主中继不可达时自动切换备用。
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const crypto = std.crypto;
 
 const Ed25519 = crypto.sign.Ed25519;
 const NodeID = @import("registry.zig").NodeID;
 
+/// 跨平台无效套接字值
+const invalid_socket: posix.socket_t = if (builtin.os.tag == .windows)
+    @ptrFromInt(@as(usize, std.math.maxInt(usize)))
+else
+    @as(posix.socket_t, -1);
+
 // ── 协议常量（与 main.zig 一致）──
 
-const CMD_CTRL: u8 = 0x00;
-const CMD_DATA: u8 = 0x01;
+pub const CMD_CTRL: u8 = 0x00;
+pub const CMD_DATA: u8 = 0x01;
 
-const CTRL_REGISTER: u8 = 0x01;
-const CTRL_CHALLENGE: u8 = 0x02;
-const CTRL_AUTH: u8 = 0x03;
-const CTRL_AUTH_OK: u8 = 0x04;
-const CTRL_AUTH_FAIL: u8 = 0x05;
-const CTRL_PING: u8 = 0x06;
-const CTRL_PONG: u8 = 0x07;
-const CTRL_ERROR: u8 = 0x08;
+pub const CTRL_REGISTER: u8 = 0x01;
+pub const CTRL_CHALLENGE: u8 = 0x02;
+pub const CTRL_AUTH: u8 = 0x03;
+pub const CTRL_AUTH_OK: u8 = 0x04;
+pub const CTRL_AUTH_FAIL: u8 = 0x05;
+pub const CTRL_PING: u8 = 0x06;
+pub const CTRL_PONG: u8 = 0x07;
+pub const CTRL_ERROR: u8 = 0x08;
 
 // ── 配置 ──
 
@@ -66,7 +73,7 @@ pub const RelayClient = struct {
         return RelayClient{
             .alloc = alloc,
             .config = config,
-            .fd = -1,
+            .fd = invalid_socket,
             .relay_addr = undefined,
             .current_relay_index = 0,
             .registered = false,
@@ -76,7 +83,7 @@ pub const RelayClient = struct {
 
     pub fn deinit(self: *RelayClient) void {
         self.running = false;
-        if (self.fd >= 0) {
+        if (self.fd != invalid_socket) {
             posix.close(self.fd);
         }
     }
@@ -87,7 +94,6 @@ pub const RelayClient = struct {
             const addr = resolveRelay(self.alloc, relay) catch {
                 continue;
             };
-            defer std.net.Address.deinit(addr);
 
             const fd = if (self.config.use_tcp)
                 connectTCP(addr, self.config.timeout_ms) catch continue
@@ -128,8 +134,6 @@ pub const RelayClient = struct {
 
     /// 发送数据到目标节点
     pub fn sendTo(self: *RelayClient, target_id: NodeID, data: []const u8) !void {
-        var buf: [self.config.timeout_ms]u8 = undefined;
-        _ = buf;
         // 构建数据帧: [CMD_DATA][target NodeID 20][payload]
         // For UDP: single datagram
         // For TCP: framed write
@@ -163,9 +167,9 @@ pub const RelayClient = struct {
 
     /// 自动重新连接（切换到下一个可用中继）
     pub fn reconnect(self: *RelayClient) !void {
-        if (self.fd >= 0) {
+        if (self.fd != invalid_socket) {
             posix.close(self.fd);
-            self.fd = -1;
+            self.fd = invalid_socket;
         }
         self.registered = false;
 
@@ -175,7 +179,6 @@ pub const RelayClient = struct {
             const idx = (next + i) % self.config.relays.len;
             const relay = self.config.relays[idx];
             const addr = resolveRelay(self.alloc, relay) catch continue;
-            defer std.net.Address.deinit(addr);
 
             const fd = if (self.config.use_tcp)
                 connectTCP(addr, self.config.timeout_ms) catch continue
@@ -238,14 +241,15 @@ pub const RelayClient = struct {
 
     fn sendAuth(self: *RelayClient, challenge: [32]u8) !void {
         // 用 ED25519 签名挑战
-        const key_pair = try Ed25519.KeyPair.fromSecretKey(self.config.secret_key);
-        const sig = try Ed25519.sign(key_pair, &challenge, null);
+        const key_pair = try Ed25519.KeyPair.generateDeterministic(self.config.secret_key);
+        const sig = try key_pair.sign(&challenge, null);
 
         var frame: [86]u8 = undefined;
         frame[0] = CMD_CTRL;
         frame[1] = CTRL_AUTH;
         @memcpy(frame[2..22], &self.config.node_id);
-        @memcpy(frame[22..86], sig.toBytes());
+        const sig_bytes = sig.toBytes();
+        @memcpy(frame[22..86], &sig_bytes);
 
         if (self.config.use_tcp) {
             _ = try posix.write(self.fd, &frame);
@@ -363,7 +367,7 @@ fn connectTCP(addr: std.net.Address, timeout_ms: u64) !posix.socket_t {
     return fd;
 }
 
-fn connectUDP(addr: std.net.Address) !posix.socket_t {
+fn connectUDP(_: std.net.Address) !posix.socket_t {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
     errdefer posix.close(fd);
     // 绑定随机端口

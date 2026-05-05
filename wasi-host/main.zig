@@ -17,6 +17,7 @@ const socks_relay = @import("src/p2p/socks_relay.zig");
 const udp = @import("src/p2p/transport/udp.zig");
 const proxy = @import("src/p2p/proxy.zig");
 const relay = @import("src/p2p/relay_v2.zig");
+const encrypted_relay_mod = @import("src/p2p/encrypted_relay_adapter.zig");
 const wss = @import("src/p2p/wss.zig");
 const net_detect = @import("src/p2p/net_detect.zig");
 const p2p_bindings = @import("src/host/p2p_bindings.zig");
@@ -399,6 +400,7 @@ pub fn main() !void {
     var relay_server_thread: ?std.Thread = null;
     var maybe_relay_client: ?*relay.RelayClient = null;
     var relay_reader_thread: ?std.Thread = null;
+    var maybe_encrypted_relay: ?*encrypted_relay_mod.EncryptedRelayAdapter = null;
     var maybe_wss_server: ?*wss.WssServer = null;
     var wss_server_thread: ?std.Thread = null;
 
@@ -501,6 +503,37 @@ pub fn main() !void {
                 }
             }
 
+            // ── 加密中继客户端初始化（在 ChordNode 之前） ──
+            if (cfg.encrypted_relay.enabled and cfg.encrypted_relay.relays.len > 0) {
+                // 转换 RelayAddr 类型（config.EncryptedRelayAddr → relay_client.RelayAddr）
+                var relay_buf: [8]encrypted_relay_mod.RelayAddr = undefined;
+                const count = @min(cfg.encrypted_relay.relays.len, relay_buf.len);
+                for (cfg.encrypted_relay.relays[0..count], 0..) |r, i| {
+                    relay_buf[i] = .{ .host = r.host, .port = r.port };
+                }
+                const er_relays = relay_buf[0..count];
+
+                const erc = try alloc.create(encrypted_relay_mod.EncryptedRelayAdapter);
+                erc.* = try encrypted_relay_mod.EncryptedRelayAdapter.init(
+                    alloc,
+                    .{
+                        .relays = er_relays,
+                        .use_tcp = cfg.encrypted_relay.use_tcp,
+                        .heartbeat_interval_ms = cfg.encrypted_relay.heartbeat_interval_ms,
+                        .timeout_ms = cfg.encrypted_relay.timeout_ms,
+                    },
+                    identity.chordId(),
+                    identity.seed(),
+                    identity.publicKeyBytes(),
+                );
+                // 连接到中继（失败不阻塞，sendRequest 时自动重连）
+                erc.connect() catch |err| {
+                    std.debug.print("[encrypted_relay] 连接失败: {}, 延迟重连\n", .{err});
+                };
+                maybe_encrypted_relay = erc;
+                std.debug.print("[encrypted_relay] 适配器已初始化 ({} relays)\n", .{cfg.encrypted_relay.relays.len});
+            }
+
             // 转换 BootstrapAddr → NodeAddr（兜底重连用）
             // 先从配置的 bootstrap 列表构建
             var boot_list = std.ArrayList(chord_types.NodeAddr).init(alloc);
@@ -541,6 +574,7 @@ pub fn main() !void {
                 cfg.data_dir,
                 pk_hex[0..],
                 maybe_relay_client,
+                maybe_encrypted_relay,
                 cfg.transport_mode,
                 cfg.tcp_port,
                 cfg.external_tcp_port,
@@ -756,6 +790,13 @@ pub fn main() !void {
     if (maybe_relay_client) |rc| {
         rc.deinit();
         alloc.destroy(rc);
+    }
+
+    // ── 关闭加密中继客户端 ──────────────────────────────
+    if (maybe_encrypted_relay) |erc| {
+        erc.deinit();
+        alloc.destroy(erc);
+        std.debug.print("[encrypted_relay] 适配器已关闭\n", .{});
     }
 
     // ── 关闭 Relay Server ────────────────────────────────────

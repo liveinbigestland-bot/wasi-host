@@ -9,6 +9,7 @@ const tcp_mod = @import("../transport/tcp.zig");
 const bootstrap_mod = @import("../transport/bootstrap.zig");
 const proxy = @import("../proxy.zig");
 const relay = @import("../relay_v2.zig");
+const encrypted_relay_mod = @import("../encrypted_relay_adapter.zig");
 const kv_store = @import("../metadata/store.zig");
 const meta_permission = @import("../metadata/permission.zig");
 const replication = @import("../metadata/replication.zig");
@@ -83,6 +84,8 @@ pub const ChordNode = struct {
     proxy_route_port: u16 = 0,
     // 原生 TCP Relay 客户端（替代 index.js）
     relay_client: ?*relay.RelayClient = null,
+    // 加密中继客户端适配器
+    encrypted_relay: ?*encrypted_relay_mod.EncryptedRelayAdapter = null,
     // 兜底 Bootstrap 节点地址列表（当后继不可达时尝试重新加入）
     bootstrap_addrs: []NodeAddr = &.{},
 
@@ -121,6 +124,7 @@ pub const ChordNode = struct {
         data_dir: []const u8,
         own_pk_hex: []const u8,
         relay_client: ?*relay.RelayClient,
+        encrypted_relay: ?*encrypted_relay_mod.EncryptedRelayAdapter,
         transport_mode: TransportMode,
         tcp_port: u16,
         external_tcp_port: u16,
@@ -151,6 +155,7 @@ pub const ChordNode = struct {
             .proxy_route_host = proxy_route_host,
             .proxy_route_port = proxy_route_port,
             .relay_client = relay_client,
+            .encrypted_relay = encrypted_relay,
             .store = KVStore.init(alloc, try alloc.dupe(u8, data_dir)),
             .replication_mgr = ReplicationManager.init(alloc),
             .own_pk_hex = try alloc.dupe(u8, own_pk_hex),
@@ -616,6 +621,35 @@ pub const ChordNode = struct {
         }
 
         // ═══ 3. 原生 TCP Relay 路径（适合外网节点间通信）═══
+        // Encrypted relay path (ED25519 auth, NodeID routing)
+        if (self.encrypted_relay) |client| {
+            if (!isPrivateIP(target.host)) {
+                const encoded = try msg.encode(self.alloc);
+                defer self.alloc.free(encoded);
+                var buf: [65536]u8 = undefined;
+                const target_node_id = ring.idToBytes(target.id);
+                var resp_len: usize = 0;
+                if (client.sendRequest(target_node_id, encoded, &buf, timeout_ms)) |len| {
+                    resp_len = len;
+                } else |err| {
+                    std.debug.print("[chord] encrypted relay send err: {}\n", .{err});
+                    if (self.transport_mode == .tcp) return error.ProxyFailed;
+                }
+                if (resp_len > 0) {
+                    const resp = try Message.decode(buf[0..resp_len], self.msg_arena.allocator());
+                    const tag_matches = switch (resp) {
+                        inline else => |_, tag| tag == expected_type,
+                    };
+                    if (!tag_matches) {
+                        std.debug.print("[chord] encrypted relay: expected={s}, got={s}\n", .{ @tagName(expected_type), @tagName(resp) });
+                        return error.ProxyWrongType;
+                    }
+                    std.debug.print("[chord] encrypted relay ok -> {s}\n", .{ring.idToHex(target.id)});
+                    return resp;
+                }
+            }
+        }
+
         relay_blk: {
             if (self.relay_client) |client| {
                 // 中继协议仅支持 IPv4（路由键使用 u32 IP 地址）

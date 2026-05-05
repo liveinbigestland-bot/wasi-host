@@ -49,6 +49,8 @@ pub const P2PConfig = struct {
     prefer_ipv4: bool = true,
     /// 节点存活时间（秒），之后自动退出
     run_duration_s: u64 = 15,
+    /// 加密中继客户端配置
+    encrypted_relay: EncryptedRelayConfig = .{},
 };
 
 /// Bootstrap 节点地址
@@ -99,6 +101,25 @@ pub const ProxyConfig = struct {
     relay_listen_host: []const u8 = "0.0.0.0",
     /// UDP echo debug server port (0 = disabled)
     udp_echo_port: u16 = 0,
+};
+
+/// 加密中继客户端配置
+pub const EncryptedRelayConfig = struct {
+    enabled: bool = false,
+    /// 中继服务器地址列表（主/备）
+    relays: []const EncryptedRelayAddr = &.{},
+    /// 使用 TCP (true) 还是 UDP (false)
+    use_tcp: bool = true,
+    /// 心跳间隔 (ms)
+    heartbeat_interval_ms: u64 = 25_000,
+    /// 请求超时 (ms)
+    timeout_ms: u64 = 5_000,
+};
+
+/// 加密中继服务器地址
+pub const EncryptedRelayAddr = struct {
+    host: []const u8 = "",
+    port: u16 = 20809,
 };
 
 pub const default_bootstrap = [_]BootstrapAddr{

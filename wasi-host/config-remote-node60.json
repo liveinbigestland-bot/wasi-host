@@ -18,5 +18,12 @@
             "remote_path": "/chord"
         }
     },
+    "encrypted_relay": {
+        "enabled": true,
+        "relays": [{"host": "192.140.185.171", "port": 20809}],
+        "use_tcp": true,
+        "heartbeat_interval_ms": 25000,
+        "timeout_ms": 5000
+    },
     "plugins": []
 }
