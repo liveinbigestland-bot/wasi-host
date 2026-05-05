@@ -1,0 +1,68 @@
+
+# ==============================
+# 强制忽略所有无关目录（必加）
+# ==============================
+target/
+dist/
+build/
+out/
+bin/
+obj/
+node_modules/
+vendor/
+Pods/
+.venv/
+venv/
+.env
+.git/
+.github/
+.idea/
+.vscode/
+__pycache__/
+.cache/
+tmp/
+temp/
+assets/
+public/
+static/
+
+# 忽略所有媒体、压缩包、二进制
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+*.log
+*.tmp
+*.zip
+*.tar
+*.gz
+*.rar
+*.exe
+*.dll
+*.so
+*.dylib
+*.pyc
+*.pyo
+
+# ==============================
+# 【强力】只保留代码文件（最关键！）
+# ==============================
+*/*
+!*.rs
+!*.js
+!*.ts
+!*.jsx
+!*.tsx
+!*.py
+!*.go
+!*.java
+!*.c
+!*.cpp
+!*.h
+!*.md
+!*.json
+!*.yml
+!*.yaml
+!*.toml
