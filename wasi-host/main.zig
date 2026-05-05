@@ -455,7 +455,7 @@ pub fn main() !void {
                 // 启动 relay server（如果配置了 listen_port）
                 if (cfg.proxy.listen_port > 0) {
                     const rs = try alloc.create(relay.RelayServer);
-                    rs.* = try relay.RelayServer.init(alloc, cfg.proxy.relay_listen_host, cfg.proxy.listen_port, cfg.proxy.max_connections, cfg.proxy.max_per_user, cfg.proxy.bandwidth_limit_kb);
+                    rs.* = try relay.RelayServer.init(alloc, cfg.proxy.relay_listen_host, cfg.proxy.listen_port, cfg.proxy.max_connections, cfg.proxy.max_per_user, 0);
                     maybe_relay_server = rs;
                     relay_server_thread = try std.Thread.spawn(.{}, relay.RelayServer.run, .{rs});
                     std.debug.print("[relay] 中继服务器已启动 :{d}\n", .{cfg.proxy.listen_port});
