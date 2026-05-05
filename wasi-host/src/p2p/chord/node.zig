@@ -857,7 +857,17 @@ pub const ChordNode = struct {
 
     /// Stabilize: 验证后继并通知
     fn doStabilize(self: *ChordNode) !void {
-        const succ = self.routing.successor orelse return;
+        const succ = self.routing.successor orelse {
+            // 后继为空 -> 孤立节点(seed)，指向自身形成单节点环
+            std.debug.print("[chord] stabilize: 孤立节点，设置自指后继\n", .{});
+            self.routing.setSuccessor(.{
+                .id = self.own_id,
+                .host = self.own_host,
+                .port = self.own_port,
+                .tcp_port = self.advertiseTcpPort(),
+            });
+            return;
+        };
         std.debug.print("[chord] stabilize: 后继={s}\n", .{ring.idToHex(succ.id)});
 
         // 询问后继的前驱

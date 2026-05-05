@@ -319,7 +319,7 @@ pub const WebServer = struct {
         var w = buf.writer();
 
         try w.writeAll("{\n");
-        try w.print("\"status\": \"ok\",\n");
+        try w.print("\"status\": \"ok\",\n", .{});
         try w.print("\"node_count\": {d},\n", .{self.backend.controller.nodeCount()});
         try w.print("\"version\": \"{s}\",\n", .{self.backend.version});
         try w.print("\"uptime\": {d}\n", .{time.timestamp()});
