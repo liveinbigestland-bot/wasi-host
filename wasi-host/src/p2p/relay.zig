@@ -39,13 +39,20 @@ fn setRecvTimeout(fd: posix.socket_t, timeout_ms: u64) void {
     if (builtin.os.tag == .windows) {
         const ms: u32 = @intCast(@min(timeout_ms, std.math.maxInt(u32)));
         _ = posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(ms)) catch {};
-    } else {
-        const tv = posix.timeval{
-            .sec = @as(isize, @intCast(timeout_ms / 1000)),
-            .usec = @as(isize, @intCast((timeout_ms % 1000) * 1000)),
-        };
-        _ = posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(tv)) catch {};
+        return;
     }
+    // 使用 raw C 函数避免 Zig 标准库在 EBADF（fd 已关闭）时 unreachable
+    const tv = posix.timeval{
+        .sec = @as(isize, @intCast(timeout_ms / 1000)),
+        .usec = @as(isize, @intCast((timeout_ms % 1000) * 1000)),
+    };
+    _ = posix.system.setsockopt(
+        @as(i32, @intCast(fd)),
+        @as(u32, @intCast(posix.SOL.SOCKET)),
+        @as(u32, @intCast(posix.SO.RCVTIMEO)),
+        @as(*const posix.timeval, @ptrCast(&tv)),
+        @as(u32, @intCast(@sizeOf(posix.timeval))),
+    );
 }
 
 fn readExact(fd: posix.socket_t, buf: []u8) !void {

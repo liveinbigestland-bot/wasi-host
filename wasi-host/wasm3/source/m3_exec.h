@@ -41,8 +41,24 @@ d_m3BeginExternC
 # define immediate(TYPE)            * ((TYPE *) _pc++)
 # define skip_immediate(TYPE)       (_pc++)
 
-# define slot(TYPE)                 * (TYPE *) (_sp + immediate (i32))
+# define slot(TYPE)                 d_m3SlotRead(TYPE)
 # define slot_ptr(TYPE)             (TYPE *) (_sp + immediate (i32))
+# define slot_w(TYPE, VAL)          d_m3SlotWrite(TYPE, VAL)
+
+// 32-bit slots 下 slot(u64) 的 _sp+index 可能仅 4 字节对齐，
+// ARMv7 ldrd 需要 8 字节对齐 → alignment fault。
+// memcpy 保证安全加载/存储。
+# define d_m3SlotRead(TYPE) \
+    ({ i32 _off = immediate(i32); \
+       TYPE _val; \
+       memcpy(&_val, (u8*)(_sp + _off), sizeof(TYPE)); \
+       _val; })
+
+# define d_m3SlotWrite(TYPE, VAL) \
+    do { i32 _off = immediate(i32); \
+         TYPE _val = (VAL); \
+         memcpy((u8*)(_sp + _off), &_val, sizeof(TYPE)); \
+    } while (0)
 
 
 # if d_m3EnableOpProfiling
@@ -431,7 +447,7 @@ d_m3Op(TO##_##NAME##_##FROM##_r_r)                          \
                                                             \
 d_m3Op(TO##_##NAME##_##FROM##_s_r)                          \
 {                                                           \
-    slot (TO) = (TO) ((FROM) REG_FROM);                     \
+    slot_w (TO, (TO) ((FROM) REG_FROM));                    \
     nextOp ();                                              \
 }                                                           \
                                                             \
@@ -445,7 +461,7 @@ d_m3Op(TO##_##NAME##_##FROM##_r_s)                          \
 d_m3Op(TO##_##NAME##_##FROM##_s_s)                          \
 {                                                           \
     FROM from = slot (FROM);                                \
-    slot (TO) = (TO) (from);                                \
+    slot_w (TO, (TO) (from));                               \
     nextOp ();                                              \
 }
 
@@ -483,7 +499,7 @@ d_m3Op(TO##_Reinterpret_##FROM##_s_r)                       \
 {                                                           \
     union { FROM c; TO t; } u;                              \
     u.c = (FROM) SRC;                                       \
-    slot (TO) = u.t;                                        \
+    slot_w (TO, u.t);                                       \
     nextOp ();                                              \
 }                                                           \
                                                             \
@@ -491,7 +507,7 @@ d_m3Op(TO##_Reinterpret_##FROM##_s_s)                       \
 {                                                           \
     union { FROM c; TO t; } u;                              \
     u.c = slot (FROM);                                      \
-    slot (TO) = u.t;                                        \
+    slot_w (TO, u.t);                                       \
     nextOp ();                                              \
 }
 
@@ -506,7 +522,7 @@ d_m3ReinterpretOp (_fp0, f64, _r0, i64)
 d_m3Op  (GetGlobal_s32)
 {
     u32 * global = immediate (u32 *);
-    slot (u32) = * global;                        //  printf ("get global: %p %" PRIi64 "\n", global, *global);
+    slot_w (u32, * global);                       //  printf ("get global: %p %" PRIi64 "\n", global, *global);
 
     nextOp ();
 }
@@ -515,7 +531,7 @@ d_m3Op  (GetGlobal_s32)
 d_m3Op  (GetGlobal_s64)
 {
     u64 * global = immediate (u64 *);
-    slot (u64) = * global;                        // printf ("get global: %p %" PRIi64 "\n", global, *global);
+    slot_w (u64, * global);                       // printf ("get global: %p %" PRIi64 "\n", global, *global);
 
     nextOp ();
 }
@@ -950,7 +966,7 @@ d_m3Op  (SetRegister_##TYPE)            \
                                         \
 d_m3Op (SetSlot_##TYPE)                 \
 {                                       \
-    slot (TYPE) = (TYPE) REG;           \
+    slot_w (TYPE, (TYPE) REG);          \
     nextOp ();                          \
 }                                       \
                                         \
@@ -1241,7 +1257,7 @@ d_m3Op  (ContinueLoopIf)
 d_m3Op  (Const32)
 {
     u32 value = * (u32 *)_pc++;
-    slot (u32) = value;
+    slot_w (u32, value);
     nextOp ();
 }
 
@@ -1250,7 +1266,7 @@ d_m3Op  (Const64)
 {
     u64 value = * (u64 *)_pc;
     _pc += (M3_SIZEOF_PTR == 4) ? 2 : 1;
-    slot (u64) = value;
+    slot_w (u64, value);
     nextOp ();
 }
 
