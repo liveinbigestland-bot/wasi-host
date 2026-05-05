@@ -24,6 +24,48 @@ const FRAME_PONG: u8 = 9;        // [9] — 心跳回复 — TCP 隧道关闭
 
 const BUF_SIZE = 65536;
 
+/// 增量帧解析：检查缓冲区中是否有一个完整的帧
+/// 纯函数，无状态，返回 Some(total_bytes) 或 null
+/// 用于非阻塞 I/O — 每次 readable 事件后调用
+fn tryCompleteFrame(buf: []const u8) ?usize {
+    if (buf.len == 0) return null;
+    const frame_type = buf[0];
+    const total = switch (frame_type) {
+        FRAME_REGISTER => {
+            if (buf.len < 2) return null;
+            2 + buf[1];
+        },
+        FRAME_REQUEST => blk: {
+            const header = 1 + 4 + 2 + 4 + 4;
+            if (buf.len < header) return null;
+            const payload_len = std.mem.readInt(u32, buf[header - 4 ..][0..4], .big);
+            break :blk header + payload_len;
+        },
+        FRAME_RESPONSE, FRAME_FORWARD, FRAME_REPLY => blk: {
+            const header = 1 + 4 + 4;
+            if (buf.len < header) return null;
+            const payload_len = std.mem.readInt(u32, buf[header - 4 ..][0..4], .big);
+            break :blk header + payload_len;
+        },
+        FRAME_TCP_CONNECT => blk: {
+            const header = 1 + 4 + 1;
+            if (buf.len < header) return null;
+            break :blk header + buf[header - 1] + 2;
+        },
+        FRAME_TCP_DATA => blk: {
+            const header = 1 + 4 + 4;
+            if (buf.len < header) return null;
+            const data_len = std.mem.readInt(u32, buf[header - 4 ..][0..4], .big);
+            break :blk header + data_len;
+        },
+        FRAME_TCP_CLOSE => 1 + 4,
+        FRAME_PING, FRAME_PONG => 1,
+        else => return null,
+    };
+    if (buf.len >= total) return total;
+    return null;
+}
+
 fn closeSocket(fd: posix.socket_t) void {
     if (builtin.os.tag == .windows) {
         _ = std.os.windows.ws2_32.closesocket(fd);

@@ -3,7 +3,7 @@
 /// 与 Chord 的 relay client 完全独立，不干扰 Chord 消息
 const std = @import("std");
 const posix = std.posix;
-const relay = @import("relay.zig");
+const relay = @import("relay_v2.zig");
 const RelayClient = relay.RelayClient;
 
 const BUF_SIZE = 65536;
