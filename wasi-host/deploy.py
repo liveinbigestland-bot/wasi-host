@@ -35,6 +35,9 @@ BINARIES = {
     "x86_64": os.path.join(PROJECT_DIR, "zig-out", "bin", "wasi-host-x86_64"),
 }
 
+RELAY_BINARY = os.path.join(PROJECT_DIR, "zig-out", "bin", "relay-server-x86_64")
+RELAY_CONFIG = os.path.join(PROJECT_DIR, "config-relay-server.json")
+
 MACHINES = [
     {
         "name": "外2",
@@ -144,6 +147,7 @@ class RemoteNode:
         self.exec("pkill -f wasi-host 2>/dev/null || true", timeout=5)
         self.exec("pkill -f 'index.js' 2>/dev/null || true", timeout=5)
         self.exec("pkill -f 'ws-bridge' 2>/dev/null || true", timeout=5)
+        self.exec("pkill -f relay-server 2>/dev/null || true", timeout=5)
         self.exec("fuser -k 8356/tcp 2>/dev/null || true", timeout=5)
         time.sleep(1)
 
@@ -179,6 +183,47 @@ class RemoteNode:
         time.sleep(2)
         pids = self.pgrep()
         return pids[0] if pids else None
+
+    def upload_relay(self):
+        """上传 relay-server 二进制"""
+        remote_tmp = "/tmp/relay-server-deploy"
+        sftp = self.client.open_sftp()
+        sftp.put(RELAY_BINARY, remote_tmp)
+        sftp.close()
+        self.exec(
+            f"rm -f /root/relay-server && cp {remote_tmp} /root/relay-server"
+            f" && chmod +x /root/relay-server && rm -f {remote_tmp}",
+            timeout=10,
+        )
+
+    def upload_relay_config(self):
+        """上传 relay-server 配置"""
+        remote_tmp = "/tmp/relay-config-deploy.json"
+        sftp = self.client.open_sftp()
+        sftp.put(RELAY_CONFIG, remote_tmp)
+        sftp.close()
+        self.exec(
+            f"rm -f /root/config-relay-server.json && cp {remote_tmp} /root/config-relay-server.json"
+            f" && rm -f {remote_tmp}",
+            timeout=10,
+        )
+
+    def start_relay(self):
+        """启动 relay-server（后台运行）"""
+        self.exec("pkill -f relay-server 2>/dev/null || true", timeout=5)
+        time.sleep(1)
+        cmd = "nohup /root/relay-server --config /root/config-relay-server.json > /root/relay-server.log 2>&1 &"
+        self.exec(cmd, timeout=5)
+        time.sleep(2)
+        _, out, _ = self.exec("pgrep -f relay-server || echo NOT_RUNNING", timeout=5)
+        if "NOT_RUNNING" in out:
+            return None
+        return out.strip()
+
+    def stop_relay(self):
+        """停止 relay-server"""
+        self.exec("pkill -f relay-server 2>/dev/null || true", timeout=5)
+        time.sleep(1)
 
     def stop(self):
         self.exec("pkill -f wasi-host 2>/dev/null || true", timeout=5)
@@ -246,23 +291,46 @@ def cmd_deploy():
             print(f"  {m['name']}: ", end="", flush=True)
             n.upload_binary()
             n.upload_config()
-            print("已上传")
+            print("binary + config 已上传")
 
-    # 阶段 3: 启动 外2（中继服务器）
-    print("\n── 阶段 3: 启动 外2（中继服务器）──")
+    # 上传 relay-server binary + config 到 外2
+    if os.path.exists(RELAY_BINARY):
+        print("\n── relay-server 上传 ──")
+        ext2 = MACHINES[0]
+        with RemoteNode(ext2) as n:
+            n.upload_relay()
+            n.upload_relay_config()
+            print(f"  {ext2['name']}: relay-server + config 已上传")
+
+    # 阶段 3: 启动 外2（中继服务器 + relay-server）
+    print("\n── 阶段 3: 启动 外2（中继服务器 + relay-server）──")
     ext2 = MACHINES[0]
     with RemoteNode(ext2) as n:
         pid = n.start()
         if pid:
-            print(f"  [OK] {ext2['name']} PID={pid}")
+            print(f"  [OK] {ext2['name']} wasi-host PID={pid}")
         else:
-            print(f"  [ERR] {ext2['name']} 启动失败!")
+            print(f"  [ERR] {ext2['name']} wasi-host 启动失败!")
             print(f"  {n.tail_log(10)}")
             sys.exit(1)
         if n.check_port(8356):
             print(f"  [OK] port 8356 (relay) listening")
         if n.check_port(443) or n.check_port(8443):
             print(f"  [OK] WSS listening")
+
+        # 启动新 relay-server
+        if os.path.exists(RELAY_BINARY):
+            n.upload_relay()
+            n.upload_relay_config()
+            relay_pid = n.start_relay()
+            if relay_pid:
+                print(f"  [OK] relay-server PID={relay_pid}")
+                if n.check_port(20809):
+                    print(f"  [OK] port 20809 (relay-server) listening")
+            else:
+                print(f"  [..] relay-server 跳过（未找到 binary 或启动失败）")
+        else:
+            print(f"  [..] relay-server binary 未找到，跳过（编译: zig build -Dtarget=x86_64-linux-gnu）")
 
     print("  等待 外2 就绪 (5s)...")
     time.sleep(5)
@@ -310,6 +378,16 @@ def cmd_status(verbose=False):
                     print(f"  {m['name']:<10} ({m['host']}): [OK] PID={status}{port_str}")
                 else:
                     print(f"  {m['name']:<10} ({m['host']}): [--] stopped")
+
+                # relay-server 状态（仅 外2）
+                if m["name"] == "外2":
+                    _, relay_out, _ = n.exec("pgrep -f relay-server || echo NOT_RUNNING", timeout=5)
+                    if "NOT_RUNNING" not in relay_out:
+                        relay_ok = n.check_port(20809)
+                        relay_mark = "[OK]" if relay_ok else "[ERR]"
+                        print(f"  {'':10}  relay-server: {relay_mark} PID={relay_out.strip()}")
+                    else:
+                        print(f"  {'':10}  relay-server: [--] stopped")
         except Exception as e:
             print(f"  {m['name']:<10} ({m['host']}): [ERR] {e}")
 
@@ -390,6 +468,9 @@ def cmd_cleanup():
             with RemoteNode(m) as n:
                 n.kill_all()
                 print(f"  [OK] {m['name']}: 已清理")
+                if m["name"] == "外2":
+                    n.stop_relay()
+                    print(f"  [OK] {m['name']}: relay-server 已停止")
         except Exception as e:
             print(f"  [ERR] {m['name']}: {e}")
 
@@ -404,6 +485,11 @@ def cmd_logs(tail=20):
             with RemoteNode(m) as n:
                 print(f"\n── {m['name']} ({m['host']}) ──")
                 print(n.tail_log(tail))
+                if m["name"] == "外2":
+                    _, relay_log, _ = n.exec(f"tail -{tail} /root/relay-server.log 2>/dev/null || echo '(no relay-server log)'", timeout=5)
+                    if relay_log and "(no relay-server log)" not in relay_log:
+                        print(f"  relay-server 日志:")
+                        print(relay_log)
         except Exception as e:
             print(f"\n── {m['name']}: [ERR] {e}")
 
@@ -419,10 +505,12 @@ def cmd_check_stale():
                 print(f"\n── {m['name']} ({m['host']}) ──")
                 _, idx_out, _ = n.exec("pgrep -af 'index.js' 2>/dev/null || echo 'none'", timeout=5)
                 _, bridge_out, _ = n.exec("pgrep -af 'bridge' 2>/dev/null || echo 'none'", timeout=5)
+                _, relay_out, _ = n.exec("pgrep -af relay-server 2>/dev/null || echo 'none'", timeout=5)
                 port_8356 = n.check_port(8356)
-                print(f"  index.js: {'[YES]' if idx_out != 'none' else '[--]'}")
-                print(f"  bridge:   {'[YES]' if bridge_out != 'none' else '[--]'}")
-                print(f"  port 8356: {'[OK]  listening' if port_8356 else '[--]  not listening'}")
+                print(f"  index.js:       {'[YES]' if idx_out != 'none' else '[--]'}")
+                print(f"  bridge:         {'[YES]' if bridge_out != 'none' else '[--]'}")
+                print(f"  relay-server:   {'[YES]' if relay_out != 'none' else '[--]'}")
+                print(f"  port 8356:      {'[OK]  listening' if port_8356 else '[--]  not listening'}")
         except Exception as e:
             print(f"\n── {m['name']}: [ERR] {e}")
 
