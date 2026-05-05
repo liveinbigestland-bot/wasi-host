@@ -866,55 +866,59 @@ pub const RelayClient = struct {
     }
 
     /// 发送请求到目标节点，等待响应
+    /// 超时后自动重试一次（应对 relay 链路瞬时延迟波动）
     pub fn sendRequest(self: *RelayClient, target_ip_be: u32, target_port: u16, data: []const u8, recv_buf: []u8, timeout_ms: u64) !usize {
-        const seq = @atomicRmw(u32, &self.next_seq, .Add, 1, .monotonic);
+        var attempt: u2 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const seq = @atomicRmw(u32, &self.next_seq, .Add, 1, .monotonic);
 
-        // 注册 pending 条目
-        var entry = PendingEntry{
-            .event = .{},
-            .result_buf = recv_buf,
-            .result_len = 0,
-            .timed_out = false,
-        };
+            var entry = PendingEntry{
+                .event = .{},
+                .result_buf = recv_buf,
+                .result_len = 0,
+                .timed_out = false,
+            };
 
-        self.pending_mutex.lock();
-        self.pending.put(seq, &entry) catch {
+            self.pending_mutex.lock();
+            self.pending.put(seq, &entry) catch {
+                self.pending_mutex.unlock();
+                return error.OutOfMemory;
+            };
             self.pending_mutex.unlock();
-            return error.OutOfMemory;
-        };
-        self.pending_mutex.unlock();
 
-        // 构建并发送请求帧
-        // [FRAME_REQUEST(1)][target_ip(4)][target_port(2)][seq(4)][payload_len(4)][payload]
-        var frame: [BUF_SIZE]u8 = undefined;
-        frame[0] = FRAME_REQUEST;
-        std.mem.writeInt(u32, frame[1..5], target_ip_be, .big);
-        std.mem.writeInt(u16, frame[5..7], target_port, .big);
-        std.mem.writeInt(u32, frame[7..11], seq, .little);
-        std.mem.writeInt(u32, frame[11..15], @as(u32, @intCast(data.len)), .big);
-        if (data.len > 0) @memcpy(frame[15..][0..data.len], data);
+            // [FRAME_REQUEST(1)][target_ip(4)][target_port(2)][seq(4)][payload_len(4)][payload]
+            var frame: [BUF_SIZE]u8 = undefined;
+            frame[0] = FRAME_REQUEST;
+            std.mem.writeInt(u32, frame[1..5], target_ip_be, .big);
+            std.mem.writeInt(u16, frame[5..7], target_port, .big);
+            std.mem.writeInt(u32, frame[7..11], seq, .little);
+            std.mem.writeInt(u32, frame[11..15], @as(u32, @intCast(data.len)), .big);
+            if (data.len > 0) @memcpy(frame[15..][0..data.len], data);
 
-        {
-            self.write_mutex.lock();
-            defer self.write_mutex.unlock();
-            relayWriteRaw(self, frame[0 .. 15 + data.len]) catch |err| {
+            {
+                self.write_mutex.lock();
+                defer self.write_mutex.unlock();
+                relayWriteRaw(self, frame[0 .. 15 + data.len]) catch |err| {
+                    self.pending_mutex.lock();
+                    _ = self.pending.remove(seq);
+                    self.pending_mutex.unlock();
+                    return err;
+                };
+            }
+
+            const timeout_ns = timeout_ms * std.time.ns_per_ms;
+            entry.event.timedWait(timeout_ns) catch {
                 self.pending_mutex.lock();
                 _ = self.pending.remove(seq);
                 self.pending_mutex.unlock();
-                return err;
+                // 首次超时重试，再次超时返回错误
+                if (attempt == 0) continue;
+                return error.Timeout;
             };
+            // 成功获取响应
+            return entry.result_len;
         }
-
-        // 等待响应或超时
-        const timeout_ns = timeout_ms * std.time.ns_per_ms;
-        entry.event.timedWait(timeout_ns) catch {
-            self.pending_mutex.lock();
-            _ = self.pending.remove(seq);
-            self.pending_mutex.unlock();
-            return error.Timeout;
-        };
-
-        return entry.result_len;
+        return error.Timeout;
     }
 
     /// TCP 隧道：发送连接请求
