@@ -84,8 +84,14 @@ pub const ChordNode = struct {
     proxy_route_port: u16 = 0,
     // 原生 TCP Relay 客户端（替代 index.js）
     relay_client: ?*relay.RelayClient = null,
-    // 加密中继客户端适配器
+    // 加密中继适配器
     encrypted_relay: ?*encrypted_relay_mod.EncryptedRelayAdapter = null,
+    // 中继服务审批状态
+    relay_service_approved: bool = false,
+    /// 中继服务请求次数（上限 3 次）
+    relay_service_request_count: u32 = 0,
+    /// 是否有可用外网中继（false = 仅内部环）
+    relay_external_available: bool = true,
     // 兜底 Bootstrap 节点地址列表（当后继不可达时尝试重新加入）
     bootstrap_addrs: []NodeAddr = &.{},
 
@@ -100,6 +106,7 @@ pub const ChordNode = struct {
     last_stabilize: i64 = 0,
     last_fix_fingers: i64 = 0,
     last_check_pred: i64 = 0,
+    last_relay_req_ms: i64 = 0,
     stabilize_ms: u64,
     fix_fingers_ms: u64,
 
@@ -302,6 +309,23 @@ pub const ChordNode = struct {
                 self.last_check_pred = now;
             }
 
+            // 加密中继排尽检测 — 每 30s 检查一次，自动向主控申请
+            if (now - self.last_relay_req_ms >= 30_000) {
+                self.last_relay_req_ms = now;
+                if (self.encrypted_relay) |erc| {
+                    if (erc.relays_exhausted and !self.relay_service_approved and self.relay_external_available) {
+                        std.debug.print("[chord] 加密中继已排尽, 向主控申请中继服务\n", .{});
+                        const succ = self.routing.successor orelse {
+                            std.debug.print("[chord] 无后继节点, 跳过中继申请\n", .{});
+                            return;
+                        };
+                        self.sendRelayServiceRequest(succ) catch |err| {
+                            std.debug.print("[chord] 中继申请发送失败: {}\n", .{err});
+                        };
+                    }
+                }
+            }
+
             // 处理副本同步队列
             try self.processReplication();
 
@@ -367,6 +391,46 @@ pub const ChordNode = struct {
                     .node_tcp_port = self.advertiseTcpPort(),
                 } }) catch {};
             },
+            .relay_service_req => |body| {
+                std.debug.print("[chord] ← relay_service_req from id={s} ({s}:{d})\n", .{
+                    ring.idToHex(body.node_id), body.node_addr, body.node_port,
+                });
+                // 自动审批（以后可扩展为审核队列）
+                const resp = self.reply(from, Message{ .relay_service_resp = .{
+                    .approved = true,
+                    .relay_host = "", // 中继地址由申请方自身配置决定
+                    .relay_port = 0,
+                } });
+                if (resp) |_| {
+                    std.debug.print("[chord] → relay_service_resp(approved) to {s}\n", .{ring.idToHex(body.node_id)});
+                } else |err| {
+                    std.debug.print("[chord] relay_service_resp 发送失败: {}\n", .{err});
+                }
+            },
+            .relay_service_resp => |body| {
+                if (body.approved) {
+                    self.relay_service_approved = true;
+                    self.relay_service_request_count = 0;
+                    std.debug.print("[chord] ← 加密中继已获批", .{});
+                    if (body.relay_host.len > 0) {
+                        std.debug.print(": {s}:{d}", .{ body.relay_host, body.relay_port });
+                    }
+                    std.debug.print("\n", .{});
+                    // 重置加密中继适配器（允许重新尝试连接）
+                    if (self.encrypted_relay) |erc| {
+                        erc.resetExhausted();
+                    }
+                    // 关闭原生 relay 客户端，防止双客户端冲突
+                    if (self.relay_client) |rc| {
+                        rc.disable();
+                        std.debug.print("[chord] 原生 relay 客户端已禁用\n", .{});
+                    }
+                    self.relay_external_available = true;
+                } else {
+                    std.debug.print("[chord] ← 加密中继申请被拒\n", .{});
+                }
+            },
+
             .pong, .find_successor_resp, .get_predecessor_resp, .notify_ok, .ping_req, .ping_resp, .identity_resp => {
                 // 这些是响应类型，应该在 sendAndWait 中处理
             },
@@ -652,6 +716,8 @@ pub const ChordNode = struct {
 
         relay_blk: {
             if (self.relay_client) |client| {
+                // 加密中继获批后，不再使用原生 relay（防止双客户端冲突）
+                if (self.relay_service_approved) break :relay_blk;
                 // 中继协议仅支持 IPv4（路由键使用 u32 IP 地址）
                 if (std.mem.indexOfScalar(u8, target.host, ':') != null) {
                     std.debug.print("[chord] relay 跳过（目标 {s} 为 IPv6，中继协议不支持）\n", .{target.host});
@@ -1078,6 +1144,70 @@ pub const ChordNode = struct {
         if (count > 0) std.debug.print("  已填充 {d} 项\n", .{count});
         std.debug.print("DHT 存储: {d} 条目, {d} 待复制\n", .{ self.store.count(), self.replication_mgr.pendingCount() });
         std.debug.print("------------------------\n", .{});
+    }
+
+    /// 向目标节点申请加密中继服务
+    /// 申请失败累计 3 次后标记 relay_external_available = false
+    pub fn sendRelayServiceRequest(self: *ChordNode, target: NodeAddr) !void {
+        if (self.relay_service_request_count >= 3) {
+            std.debug.print("[chord] 加密中继申请已达上限(3次), 标记无外网中继\n", .{});
+            self.relay_external_available = false;
+            return;
+        }
+
+        const req_msg = Message{ .relay_service_req = .{
+            .node_id = self.own_id,
+            .node_addr = self.own_host,
+            .node_port = self.own_port,
+        } };
+
+        self.relay_service_request_count += 1;
+        std.debug.print("[chord] → relay_service_req to {s}:{d} (第{d}次)\n", .{
+            target.host, target.port, self.relay_service_request_count,
+        });
+
+        const resp = self.sendAndWait(req_msg, .relay_service_resp, target, 10000) catch |err| {
+            std.debug.print("[chord] relay_service_req 失败: {} (第{d}/3)\n", .{ err, self.relay_service_request_count });
+            if (self.relay_service_request_count >= 3) {
+                self.relay_external_available = false;
+                std.debug.print("[chord] 3次申请均失败, 设置无外网中继, 仅内部环\n", .{});
+            }
+            return;
+        };
+
+        switch (resp) {
+            .relay_service_resp => |body| {
+                if (body.approved) {
+                    self.relay_service_approved = true;
+                    self.relay_service_request_count = 0;
+                    std.debug.print("[chord] 加密中继申请获批", .{});
+                    if (body.relay_host.len > 0) {
+                        std.debug.print(": {s}:{d}", .{ body.relay_host, body.relay_port });
+                    }
+                    std.debug.print("\n", .{});
+                    if (self.encrypted_relay) |erc| {
+                        erc.resetExhausted();
+                    }
+                    // 关闭原生 relay 客户端，防止双客户端冲突
+                    if (self.relay_client) |rc| {
+                        rc.disable();
+                        std.debug.print("[chord] 原生 relay 客户端已禁用\n", .{});
+                    }
+                    self.relay_external_available = true;
+                } else {
+                    std.debug.print("[chord] 加密中继申请被拒\n", .{});
+                    if (self.relay_service_request_count >= 3) {
+                        self.relay_external_available = false;
+                    }
+                }
+            },
+            else => {
+                std.debug.print("[chord] relay_service_req 意外响应类型\n", .{});
+                if (self.relay_service_request_count >= 3) {
+                    self.relay_external_available = false;
+                }
+            },
+        }
     }
 
     pub fn deinit(self: *ChordNode) void {

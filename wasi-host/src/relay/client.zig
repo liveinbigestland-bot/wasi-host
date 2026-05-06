@@ -165,6 +165,25 @@ pub const RelayClient = struct {
         }
     }
 
+    /// 连接到指定索引的中继
+    pub fn connectTo(self: *RelayClient, index: usize) !void {
+        if (index >= self.config.relays.len) return error.AllRelaysFailed;
+        if (self.fd != invalid_socket) {
+            posix.close(self.fd);
+            self.fd = invalid_socket;
+        }
+        const relay = self.config.relays[index];
+        const addr = resolveRelay(self.alloc, relay) catch return error.AllRelaysFailed;
+        const fd = if (self.config.use_tcp)
+            connectTCP(addr, self.config.timeout_ms) catch return error.AllRelaysFailed
+        else
+            connectUDP(addr) catch return error.AllRelaysFailed;
+        self.fd = fd;
+        self.relay_addr = addr;
+        self.current_relay_index = index;
+        self.registered = false;
+    }
+
     /// 自动重新连接（切换到下一个可用中继）
     pub fn reconnect(self: *RelayClient) !void {
         if (self.fd != invalid_socket) {

@@ -434,6 +434,7 @@ pub const RelayServer = struct {
 
     /// 将新客户端指派给 worker（round-robin）
     fn dispatchClient(self: *RelayServer, fd: posix.socket_t, addr: std.net.Address) void {
+        setKeepalive(fd);
         const handler = self.alloc.create(ClientHandler) catch {
             closeSocket(fd);
             return;
@@ -709,6 +710,8 @@ pub const RelayServer = struct {
                 self.handleTcpClose(conn_id, loop);
             },
             FRAME_PING => {
+                const from = if (handler.node_key.len > 0) handler.node_key else handler.user_key_buf[0..handler.user_key_len];
+                std.debug.print("[relay/v2] PING from {s}\n", .{from});
                 const pong: [1]u8 = .{FRAME_PONG};
                 writeOrBuffer(handler, &pong, loop);
             },
@@ -956,6 +959,8 @@ pub const RelayClient = struct {
     running: bool,
     registered: bool,
     ws_mode: bool,
+    /// 被禁用标记 — true 时 readerLoop 停止重连并退出
+    disabled: bool = false,
 
     write_buf: [BUF_SIZE]u8,
     write_len: usize,
@@ -990,6 +995,8 @@ pub const RelayClient = struct {
         if (addr_list.addrs.len == 0) return error.HostNotFound;
         const addr = addr_list.addrs[0];
         try posix.connect(fd, &addr.any, addr.getOsSockLen());
+
+        setKeepalive(fd);
 
         if (ws_mode_param) {
             // TODO: WS upgrade
@@ -1064,6 +1071,16 @@ pub const RelayClient = struct {
         self.alloc.free(self.listen_host);
         self.alloc.free(self.remote_host);
         if (self.ws_path.len > 0) self.alloc.free(self.ws_path);
+    }
+
+    /// 禁用 native relay 客户端 — 关闭连接、停止 readerLoop 线程
+    /// 由中继服务获批后调用，防止双客户端冲突
+    pub fn disable(self: *RelayClient) void {
+        self.disabled = true;
+        self.running = false;
+        closeSocket(self.fd);
+        closeSocket(self.udp_fd);
+        self.loop.stop();
     }
 
     pub fn sendRequest(self: *RelayClient, target_ip_be: u32, target_port: u16, data: []const u8, recv_buf: []u8, timeout_ms: u64) !usize {
@@ -1250,6 +1267,7 @@ pub const RelayClient = struct {
         }
         self.read_len += n;
         self.last_recv_ms = std.time.milliTimestamp();
+        std.debug.print("[relay/v2/reader] 收到 {d} 字节\n", .{n});
 
         while (tryCompleteFrame(self.read_buf[0..self.read_len])) |frame_len| {
             const frame = self.read_buf[0..frame_len];
@@ -1297,18 +1315,35 @@ pub const RelayClient = struct {
             return;
         }
         const now = std.time.milliTimestamp();
-        if (now - self.last_recv_ms > 5000) {
-            const ping: [1]u8 = .{FRAME_PING};
-            _ = posix.write(self.fd, &ping) catch {};
-            self.last_recv_ms = now;
+
+        // 超过 15s 未收到任何数据 → 连接已断开（NAT 超时 / 对端崩溃）
+        if (now - self.last_recv_ms > 15_000) {
+            std.debug.print("[relay/v2] 连接空闲超时 (last_recv={d}ms), 重连\n", .{now - self.last_recv_ms});
+            clientReaderCleanup(self, loop);
+            return;
         }
+
+        // 5s 无数据则发 PING 保活（不修改 last_recv_ms — 仅由 clientOnReadable 更新）
+        if (now - self.last_recv_ms > 5_000) {
+            const ping: [1]u8 = .{FRAME_PING};
+            _ = posix.write(self.fd, &ping) catch {
+                clientReaderCleanup(self, loop);
+                return;
+            };
+            std.debug.print("[relay/v2] 发送 PING (idle={d}ms)\n", .{now - self.last_recv_ms});
+        }
+
         loop.addTimer(5000, self, &self.fd_vtbl);
     }
 
     fn clientReaderCleanup(self: *RelayClient, loop: *EventLoop) void {
         loop.removeFd(self.fd);
         loop.removeFd(self.udp_fd);
-        if (!self.running) return;
+        if (!self.running or self.disabled) {
+            self.running = false;
+            loop.stop();
+            return;
+        }
         std.debug.print("[relay/v2/reader] 连接断开, 尝试重连...\n", .{});
         if (self.reconnect()) {
             self.loop.addFd(self.fd, posix.POLL.IN, self, &self.fd_vtbl);
@@ -1392,10 +1427,13 @@ pub const RelayClient = struct {
                 entry.event.set();
             },
             FRAME_PING => {
+                std.debug.print("[relay/v2/reader] 收到 PING, 回复 PONG\n", .{});
                 const pong: [1]u8 = .{FRAME_PONG};
                 _ = posix.write(self.fd, &pong) catch {};
             },
-            FRAME_PONG => {},
+            FRAME_PONG => {
+                std.debug.print("[relay/v2/reader] 收到 PONG\n", .{});
+            },
             else => {
                 std.debug.print("[relay/v2/reader] 未知帧类型 {}\n", .{frame[0]});
             },
@@ -1408,7 +1446,23 @@ pub fn sendViaRelay(client: *RelayClient, target_ip_be: u32, target_port: u16, d
     return client.sendRequest(target_ip_be, target_port, data, recv_buf, timeout_ms);
 }
 
+/// 设置 TCP keepalive（所有平台 SO_KEEPALIVE，Linux 额外细粒度参数）
+fn setKeepalive(fd: posix.socket_t) void {
+    const keepalive: u32 = 1;
+    _ = posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(keepalive)) catch {};
+
+    if (builtin.os.tag == .linux) {
+        const idle: u32 = 10;
+        const interval: u32 = 5;
+        const count: u32 = 3;
+        _ = posix.setsockopt(fd, posix.IPPROTO.TCP, @as(u32, 4), &std.mem.toBytes(idle)) catch {};
+        _ = posix.setsockopt(fd, posix.IPPROTO.TCP, @as(u32, 5), &std.mem.toBytes(interval)) catch {};
+        _ = posix.setsockopt(fd, posix.IPPROTO.TCP, @as(u32, 6), &std.mem.toBytes(count)) catch {};
+    }
+}
+
 comptime {
     _ = RelayClient;
     _ = sendViaRelay;
+    _ = setKeepalive;
 }

@@ -26,8 +26,8 @@ fn safeClose(fd: posix.socket_t) void {
         const close_fd: usize = @intCast(@as(isize, @intCast(fd)));
         _ = std.os.linux.syscall3(.close, close_fd, 0, 0);
     } else if (builtin.os.tag == .windows) {
-        // Windows: use std.os.closesocket
-        _ = std.os.windows.closesocket(@ptrFromInt(@as(usize, @intCast(fd))));
+        // Windows: SOCKET handle is already the right type in Zig 0.14
+        std.os.windows.closesocket(fd) catch {};
     } else {
         // On non-Linux, use os.close which returns a void (no unreachable)
         std.os.close(fd);
