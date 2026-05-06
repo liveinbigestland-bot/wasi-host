@@ -171,6 +171,17 @@ pub fn host_dht_put(rt: ?*anyopaque, _: ?*anyopaque, sp: ?*u64, _: ?*anyopaque) 
             chord.replication_mgr.enqueue(&entry) catch {};
         }
         std.debug.print("[p2p_bindings] dht_put: key={s} 已存储\n", .{key});
+        // Post dht_put event to Lua if lua_manager is registered
+        if (chord.lua_manager) |m| {
+            m.postEvent(lua_events.EventPayload{
+                .dht_put = .{
+                    .key = key,
+                    .value_size = value.len,
+                },
+            }) catch |err| {
+                std.debug.print("[p2p_bindings] Lua 事件队列满: {}\n", .{err});
+            };
+        }
         setRet(sp, 0);
         return null;
     }

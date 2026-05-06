@@ -1,0 +1,11 @@
+{
+    name = "wasi-host",
+    version = "0.1.0",
+    dependencies = [
+        {
+            name = "lua",
+            url = "https://github.com/ziglang/zig-lua/archive/refs/tags/v0.5.0.tar.gz",
+            hash = "1220c4a3b8c5b3e5a7d1e8f9a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2",
+        },
+    ],
+}

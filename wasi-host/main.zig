@@ -22,6 +22,8 @@ const wss = @import("src/p2p/wss.zig");
 const net_detect = @import("src/p2p/net_detect.zig");
 const p2p_bindings = @import("src/host/p2p_bindings.zig");
 const posix = std.posix;
+const lua = @import("src/lua/api.zig");
+const lua_events = @import("src/lua/events.zig");
 
 const plug_ai  = @embedFile("plug/ai_plugin.wasm");
 const plug_api = @embedFile("plug/api_plugin.wasm");
@@ -52,6 +54,9 @@ const AppConfig = struct {
 const TopConfig = struct {
     p2p: ?p2p_config_mod.P2PConfig = null,
     plugins: ?[]PlugConfig = null,
+    lua_script: ?[]const u8 = null,
+    lua_events_enabled: bool = true,
+    lua_p2p_events_enabled: bool = true,
 };
 
 fn readCpuUsage() f32 {
@@ -182,10 +187,28 @@ const TimeoutGuard = struct {
     }
 };
 
-fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode) void {
+const lua_state_manager_type = @import("src/lua/state.zig").LuaStateManager;
+
+fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
+    const plugin_handle = if (lua_manager) |m| m.generatePluginHandle() else 0;
+    const start_time = std.time.nanoTimestamp();
+
     std.debug.print("\n=== [启动] {s} (mem={d}KB, timeout={d}ms, net={}, write={}, host_info={}) ===\n", .{
         cfg.name, cfg.mem_kb, cfg.timeout_ms, cfg.network, cfg.write, cfg.allow_host_info,
     });
+
+    if (lua_manager) |m| {
+        const payload = lua_events.EventPayload{
+            .plugin_start = .{
+                .plugin_handle = plugin_handle,
+                .plugin_name = cfg.name,
+                .connection_id = null,
+            },
+        };
+        m.postEvent(payload) catch |e| {
+            std.debug.print("[警告] Lua 事件队列满: {}\n", .{e});
+        };
+    }
 
     var guard = TimeoutGuard.start(cfg.timeout_ms) catch {
         std.debug.print("[错误] {s}: 无法创建定时器\n", .{cfg.name});
@@ -194,6 +217,16 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
 
     const env = wasm3.m3_NewEnvironment() orelse {
         std.debug.print("[错误] {s}: 创建环境失败\n", .{cfg.name});
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_error = .{
+                    .plugin_handle = plugin_handle,
+                    .error_code = -1,
+                    .error_message = "Failed to create WASM environment",
+                },
+            };
+            m.postEvent(payload) catch {};
+        }
         return;
     };
     defer wasm3.m3_FreeEnvironment(env);
@@ -201,24 +234,63 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
     const chord_userdata: ?*anyopaque = @ptrCast(maybe_chord);
     const runtime = wasm3.m3_NewRuntime(env, cfg.mem_kb * 1024, chord_userdata) orelse {
         std.debug.print("[错误] {s}: 创建运行时失败\n", .{cfg.name});
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_error = .{
+                    .plugin_handle = plugin_handle,
+                    .error_code = -1,
+                    .error_message = "Failed to create WASM runtime",
+                },
+            };
+            m.postEvent(payload) catch {};
+        }
         return;
     };
     defer wasm3.m3_FreeRuntime(runtime);
 
     if (guard.check()) {
         std.debug.print("[超时] {s}: 初始化超时\n", .{cfg.name});
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_timeout = .{
+                    .plugin_handle = plugin_handle,
+                    .timeout_ms = cfg.timeout_ms,
+                },
+            };
+            m.postEvent(payload) catch {};
+        }
         return;
     }
 
     var mod: ?*wasm3.M3Module = null;
     if (wasm3.m3_ParseModule(env, &mod, wasm_bin.ptr, @intCast(wasm_bin.len)) != 0) {
         std.debug.print("[错误] {s}: 模块解析失败\n", .{cfg.name});
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_error = .{
+                    .plugin_handle = plugin_handle,
+                    .error_code = -2,
+                    .error_message = "Failed to parse WASM module",
+                },
+            };
+            m.postEvent(payload) catch {};
+        }
         return;
     }
     if (guard.check()) return;
 
     if (wasm3.m3_LoadModule(runtime, mod) != 0) {
         std.debug.print("[错误] {s}: 模块加载失败\n", .{cfg.name});
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_error = .{
+                    .plugin_handle = plugin_handle,
+                    .error_code = -3,
+                    .error_message = "Failed to load WASM module",
+                },
+            };
+            m.postEvent(payload) catch {};
+        }
         return;
     }
     if (guard.check()) return;
@@ -266,18 +338,64 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
     var entry_fn: ?*wasm3.M3Function = null;
     if (wasm3.m3_FindFunction(&entry_fn, runtime, "_start") != 0) {
         std.debug.print("[警告] {s}: 未找到 _start 入口\n", .{cfg.name});
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_error = .{
+                    .plugin_handle = plugin_handle,
+                    .error_code = -4,
+                    .error_message = "Failed to find _start entry point",
+                },
+            };
+            m.postEvent(payload) catch {};
+        }
         return;
     }
     if (entry_fn == null) return;
 
     const call_result = wasm3.m3_Call(entry_fn, 0, null);
+    const end_time = std.time.nanoTimestamp();
+    const duration_ms = @as(u64, @divTrunc(end_time - start_time, std.time.ns_per_ms));
+
     if (call_result) |msg| {
         const slice = std.mem.sliceTo(msg, 0);
         if (std.mem.indexOf(u8, slice, "exit") == null) {
             std.debug.print("[错误] {s}: 执行失败 ({s})\n", .{ cfg.name, slice });
+            if (lua_manager) |m| {
+                const payload = lua_events.EventPayload{
+                    .plugin_error = .{
+                        .plugin_handle = plugin_handle,
+                        .error_code = -5,
+                        .error_message = slice,
+                    },
+                };
+                m.postEvent(payload) catch {};
+            }
+        } else {
+            std.debug.print("=== [完成] {s} ===\n", .{cfg.name});
+            if (lua_manager) |m| {
+                const payload = lua_events.EventPayload{
+                    .plugin_complete = .{
+                        .plugin_handle = plugin_handle,
+                        .exit_code = 0,
+                        .duration_ms = duration_ms,
+                    },
+                };
+                m.postEvent(payload) catch {};
+            }
+        }
+    } else {
+        std.debug.print("=== [完成] {s} ===\n", .{cfg.name});
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_complete = .{
+                    .plugin_handle = plugin_handle,
+                    .exit_code = 0,
+                    .duration_ms = duration_ms,
+                },
+            };
+            m.postEvent(payload) catch {};
         }
     }
-    std.debug.print("=== [完成] {s} ===\n", .{cfg.name});
 }
 
 /// 初始化 P2P 身份：加载或生成 ED25519 密钥
@@ -315,13 +433,19 @@ fn initP2PIdentity(cfg: ?p2p_config_mod.P2PConfig) !p2p_identity.Identity {
 }
 
 /// Chord 事件循环（在后台线程中运行）
-fn chordEventLoop(node: *chord_node.ChordNode) void {
+fn chordEventLoop(node: *chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
     std.debug.print("[chord] 事件循环已启动\n", .{});
     node.running = true;
     while (node.running) {
         node.tick() catch |err| {
             std.debug.print("[chord] tick 错误: {}\n", .{err});
         };
+
+        // Process Lua events with 10ms budget per tick
+        if (lua_manager) |m| {
+            m.processEvents(10);
+        }
+
         std.time.sleep(100 * std.time.ns_per_ms); // 100ms tick 间隔
     }
     std.debug.print("[chord] 事件循环已停止\n", .{});
@@ -359,6 +483,26 @@ pub fn main() !void {
     var p2p_cfg = if (top_cfg) |c| c.value.p2p else null;
 
     var public_host: ?[]const u8 = null;
+    // ── Lua 初始化 ─────────────────────────────────────────────
+    std.debug.print("[lua] 初始化 Lua 引擎\n", .{});
+    const lua_state_manager = try @import("src/lua/state.zig").LuaStateManager.init(alloc);
+    defer lua_state_manager.deinit();
+
+    // Set global LuaStateManager reference for host functions
+    @import("src/lua/host_functions.zig").HostFunctions.setLuaStateManager(&lua_state_manager);
+
+    // Load Lua script if configured
+    if (top_cfg) |c| {
+        if (c.value.lua_script) |script_path| {
+            std.debug.print("[lua] 加载 Lua 脚本: {s}\n", .{script_path});
+            lua_state_manager.loadScript(script_path) catch |err| {
+                std.debug.print("[lua] 警告: 加载 Lua 脚本失败: {}\n", .{err});
+            };
+        }
+    }
+
+    std.debug.print("[lua] Lua 引擎初始化完成\n", .{});
+
     // ── 自动网络检测（覆盖 transport_mode） ──────────────────
     if (p2p_cfg) |_| {
         if (builtin.os.tag == .linux) {
@@ -582,6 +726,9 @@ pub fn main() !void {
                 cfg.external_tcp_port,
                 boot_addrs,
             );
+            // Initialize Lua integration for P2P events
+            const p2p_events_enabled = if (top_cfg) |c| c.value.lua_p2p_events_enabled else true;
+            chord.initLua(&lua_state_manager, p2p_events_enabled);
             maybe_chord = &chord;
 
             // 启动加密中继 readerLoop（接收其他节点转发来的数据）
@@ -692,7 +839,7 @@ pub fn main() !void {
             }
 
             // 启动后台事件循环
-            chord_thread = try std.Thread.spawn(.{}, chordEventLoop, .{ &chord });
+            chord_thread = try std.Thread.spawn(.{}, chordEventLoop, .{ &chord, &lua_state_manager });
 
             // UDP Echo 调试服务（仅当配置了端口时启动）
             if (cfg.proxy.udp_echo_port > 0) {
@@ -744,7 +891,7 @@ pub fn main() !void {
             std.debug.print("[skip] {s}: embedded file {s} not found\n", .{ name, plug_cfg.embed_path });
             continue;
         };
-        const thread = try std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data, maybe_chord });
+        const thread = try std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data, maybe_chord, &lua_state_manager });
         try threads.append(thread);
     }
 

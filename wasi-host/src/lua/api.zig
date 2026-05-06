@@ -11,6 +11,33 @@ pub const Lua = opaque {
         errfile = 6,
     };
 
+    pub const GC = enum(c_int) {
+        STOP = 0,
+        RESTART = 1,
+        COLLECT = 2,
+        COUNT = 3,
+        STOPPERCENTAGE = 4,
+        RESTARTPERCENTAGE = 5,
+        SETSTEP = 6,
+        SETSTEPMUL = 7,
+        SETMAJORINC = 8,
+        SETMINORMUL = 9,
+        ISRUNNING = 10,
+        GENE = 11,
+        GCMODESTOP = 12,
+        GCMODERESTART = 13,
+        GCMODEGEN = 14,
+        INCSTEP = 15,
+        INCSTEPMUL = 16,
+        INCMAJORINC = 17,
+        INCMINORMUL = 18,
+        INCGCMODESTOP = 19,
+        INCGCMODERESTART = 20,
+        INCGCMODEGEN = 21,
+        INCSTEPFAST = 22,
+        INCSTEPFAST2 = 23,
+    };
+
     pub const Type = enum(c_int) {
         none = -1,
         nil = 0,
@@ -225,4 +252,24 @@ pub const Lua = opaque {
             return new_ptr.ptr;
         }
     };
+
+    pub fn fromPtr(ptr: ?*Lua) LuaState {
+        return LuaState{ .state = ptr };
+    }
+
+    pub fn allocator(_: LuaState) std.mem.Allocator {
+        return std.heap.c_allocator;
+    }
+
+    pub fn ref(self: LuaState, index: c_int) c_int {
+        return luaL_ref(self.state, index);
+    }
+
+    pub fn unref(self: LuaState, ref: c_int) void {
+        luaL_unref(self.state, ref);
+    }
 };
+
+// Lua reference management functions
+extern fn luaL_ref(L: ?*Lua, index: c_int) callconv(.C) c_int;
+extern fn luaL_unref(L: ?*Lua, ref: c_int) callconv(.C) void;
