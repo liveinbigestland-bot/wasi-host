@@ -11,8 +11,8 @@ const Metrics = struct {
         };
     }
 
-    pub fn logWritten(metrics: *Metrics) void {
-        metrics.total_logs += 1;
+    pub fn logWritten(self: *Metrics) void {
+        self.total_logs += 1;
     }
 
     pub fn getLogsPerSecond(metrics: *const Metrics) f64 {
@@ -23,17 +23,24 @@ const Metrics = struct {
 };
 
 var metrics_mutex = std.Thread.Mutex{};
-var global_metrics: ?Metrics = null;
+var global_metrics: ?*Metrics = null;
+var metrics_allocator: ?std.mem.Allocator = null;
 var latency_samples: std.ArrayList(i64) = undefined;
 var latency_samples_initialized = false;
 var latency_mutex = std.Thread.Mutex{};
 
-pub fn initMetrics() !*Metrics {
+pub fn initMetrics(allocator: std.mem.Allocator) !*Metrics {
     metrics_mutex.lock();
     defer metrics_mutex.unlock();
 
     if (global_metrics == null) {
-        global_metrics = Metrics.init();
+        metrics_allocator = allocator;
+        global_metrics = try allocator.create(Metrics);
+        global_metrics.?.* = Metrics.init();
+    }
+
+    if (global_metrics == null) {
+        return error.InitFailed;
     }
 
     return global_metrics.?;
@@ -45,7 +52,7 @@ pub fn recordLog() void {
     metrics_mutex.lock();
     defer metrics_mutex.unlock();
 
-    if (global_metrics) |*m| {
+    if (global_metrics) |m| {
         m.logWritten();
     }
 

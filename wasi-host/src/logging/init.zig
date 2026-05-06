@@ -8,7 +8,7 @@ pub const Config = logger.Config;
 
 pub fn init(allocator: std.mem.Allocator, module_name: []const u8, config: Config) !void {
     // Initialize performance metrics
-    _ = try perf.initMetrics();
+    _ = try perf.initMetrics(allocator);
 
     // Set global configuration
     logger.setConfig(config);
@@ -36,14 +36,14 @@ pub fn setLogLevel(level: LogLevel) void {
 
     if (!valid) {
         // Fallback to info level and log warning
-        std.debug.print("Invalid log level: {}, falling back to info\n", .{@tagName(level)});
-        var config = logger.current_config;
+        std.debug.print("Invalid log level: {s}, falling back to info\n", .{@tagName(level)});
+        var config = logger.Config{};
         config.level = .info;
         logger.setConfig(config);
         return;
     }
 
-    var config = logger.current_config;
+    var config = logger.Config{};
     config.level = level;
     logger.setConfig(config);
 }

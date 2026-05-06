@@ -178,6 +178,12 @@ class RemoteNode:
     def start(self):
         """启动 wasi-host（先 kill 旧进程）"""
         self.kill_all()
+
+        # Create log directory if it doesn't exist
+        log_dir = os.path.dirname(self.m["remote_log"])
+        if log_dir:
+            self.exec(f"mkdir -p {log_dir}", timeout=5)
+
         cmd = f"nohup {self.m['remote_bin']} {self.m['remote_config']} > {self.m['remote_log']} 2>&1 &"
         self.exec(cmd, timeout=5)
         time.sleep(2)
@@ -212,7 +218,11 @@ class RemoteNode:
         """启动 relay-server（后台运行）"""
         self.exec("pkill -f relay-server 2>/dev/null || true", timeout=5)
         time.sleep(1)
-        cmd = "nohup /root/relay-server --config /root/config-relay-server.json > /root/relay-server.log 2>&1 &"
+
+        # Create log directory if it doesn't exist
+        self.exec("mkdir -p /var/log/wasi-host", timeout=5)
+
+        cmd = "nohup /root/relay-server --config /root/config-relay-server.json > /var/log/wasi-host/relay-server.log 2>&1 &"
         self.exec(cmd, timeout=5)
         time.sleep(2)
         _, out, _ = self.exec("pgrep -f relay-server || echo NOT_RUNNING", timeout=5)

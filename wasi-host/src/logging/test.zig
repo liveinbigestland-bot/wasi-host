@@ -1,5 +1,7 @@
 const std = @import("std");
 const init = @import("init.zig");
+const logger = @import("logger.zig");
+const time = std.time;
 
 test "file output test" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -68,9 +70,9 @@ test "file output test" {
     init.log.trace("This trace message should be filtered", .{});
 
     // Test module-specific levels
-    init.setModuleLogLevel("chord", .error);
+    init.setModuleLogLevel("chord", logger.Level.err);
     init.log.info("Chord info message (should be filtered)", .{});
-    init.log.error("Chord error message (should appear)", .{});
+    init.log.err("Chord error message (should appear)", .{});
 
     // Test high volume logging
     std.debug.print("Testing high volume logging...\n", .{});
@@ -84,5 +86,4 @@ test "file output test" {
     const lps = @as(f64, @floatFromInt(count)) / (@as(f64, @floatFromInt(elapsed)) / 1000.0);
 
     std.debug.print("Logged {} messages in {} ms ({:.1} LPS)\n", .{ count, elapsed, lps });
-}
 }
