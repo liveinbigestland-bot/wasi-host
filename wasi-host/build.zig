@@ -50,8 +50,42 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("ssl");
         exe.linkSystemLibrary("crypto");
     }
+
+    // Lua 5.4 支持 - 交叉平台动态链接
+    const lua_enabled = true;
+    if (lua_enabled) {
+        // 系统库链接 (优先)
+        if (building_natively) {
+            switch (host_target.result.os.tag) {
+                .linux => {
+                    exe.linkSystemLibrary("lua5.4");
+                    exe.linkSystemLibrary("lua");
+                },
+                .windows => {
+                    exe.linkSystemLibrary("lua54");
+                    exe.linkSystemLibrary("lua");
+                },
+                else => {
+                    // 其他平台使用静态链接
+                    const lua_dep = b.dependency("lua", .{
+                        .target = host_target,
+                        .optimize = optimize,
+                    });
+                    exe.root_module.addImport("lua", lua_dep.module("lua"));
+                },
+            }
+        } else {
+            // 交叉编译 - 使用静态链接
+            const lua_dep = b.dependency("lua", .{
+                .target = host_target,
+                .optimize = optimize,
+            });
+            exe.root_module.addImport("lua", lua_dep.module("lua"));
+        }
+    }
     const options = b.addOptions();
     options.addOption(bool, "wss_tls_enabled", wss_tls_enabled);
+    options.addOption(bool, "lua_enabled", lua_enabled);
     exe.root_module.addOptions("build_options", options);
 
     exe.addCSourceFiles(.{
@@ -114,6 +148,14 @@ pub fn build(b: *std.Build) void {
     daemon.root_module.addOptions("build_options", daemon_opts);
 
     b.installArtifact(daemon);
+
+    // ── Lua 5.4 依赖 ──
+    const lua_dep = b.dependency("lua", .{
+        .target = host_target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("lua", lua_dep.module("lua"));
+    daemon.root_module.addImport("lua", lua_dep.module("lua"));
 
     // ── 单元测试 ──
     const test_step = b.step("test", "Run unit tests");
