@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const logging = @import("logging");
 
 const FRAME_REGISTER: u8 = 0;
 const FRAME_REQUEST: u8 = 1;
@@ -318,13 +319,14 @@ pub const RelayServer = struct {
     limiter: RateLimiter,
     mutex: std.Thread.Mutex = .{},
     upstream_client: ?*RelayClient = null,
+    logger: ?*logging.Logger,
 
     const PendingEntry = struct {
         requester_key: []const u8,
         original_seq: u32,
     };
 
-    pub fn init(alloc: std.mem.Allocator, listen_host: []const u8, port: u16, max_connections: u32, max_per_user: u32, bandwidth_limit_kb: u32) !RelayServer {
+    pub fn init(alloc: std.mem.Allocator, listen_host: []const u8, port: u16, max_connections: u32, max_per_user: u32, bandwidth_limit_kb: u32, logger: ?*logging.Logger) !RelayServer {
         const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer closeSocket(listen_fd);
 
@@ -345,6 +347,7 @@ pub const RelayServer = struct {
             .alloc = alloc,
             .running = false,
             .limiter = RateLimiter.init(alloc, max_connections, max_per_user, bandwidth_limit_kb),
+            .logger = logger,
         };
     }
 
@@ -362,19 +365,19 @@ pub const RelayServer = struct {
 
     pub fn run(self: *RelayServer) void {
         self.running = true;
-        std.debug.print("[relay] TCP relay server 已启动 :{d}\n", .{self.port});
+        if (self.logger) |l| { l.info("[relay] TCP relay server 已启动 :{d}", .{self.port}); }
         while (self.running) {
             var client_addr: std.net.Address = undefined;
             var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
             const client_fd = posix.accept(self.listen_fd, &client_addr.any, &addr_len, 0) catch |err| {
                 if (!self.running) break;
                 if (err != error.WouldBlock and err != error.ConnectionAborted) {
-                    std.debug.print("[relay] accept 错误: {}\n", .{err});
+                    if (self.logger) |l| { l.info("[relay] accept 错误: {}", .{err}); }
                 }
                 continue;
             };
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, client_fd, client_addr }) catch |err| {
-                std.debug.print("[relay] 线程创建失败: {}\n", .{err});
+                if (self.logger) |l| { l.info("[relay] 线程创建失败: {}", .{err}); }
                 closeSocket(client_fd);
                 continue;
             };
@@ -391,15 +394,15 @@ pub const RelayServer = struct {
         // 1. 等待注册帧
         var buf: [BUF_SIZE]u8 = undefined;
         const n = readFrame(fd, &buf) catch |err| {
-            std.debug.print("[relay] 注册帧读取失败: {}\n", .{err});
+            if (self.logger) |l| { l.info("[relay] 注册帧读取失败: {}", .{err}); }
             return;
         };
         if (buf[0] != FRAME_REGISTER) {
-            std.debug.print("[relay] 期望注册帧, 收到 type={}\n", .{buf[0]});
+            if (self.logger) |l| { l.info("[relay] 期望注册帧, 收到 type={}", .{buf[0]}); }
             return;
         }
         const node_key = self.alloc.dupe(u8, buf[2..n]) catch {
-            std.debug.print("[relay] 注册地址 alloc 失败\n", .{});
+            if (self.logger) |l| { l.info("[relay] 注册地址 alloc 失败", .{}); }
             return;
         };
         errdefer self.alloc.free(node_key);
@@ -408,14 +411,14 @@ pub const RelayServer = struct {
         var user_key_buf: [48]u8 = undefined;
         const user_key = std.fmt.bufPrint(&user_key_buf, "{}", .{addr}) catch "unknown";
         if (self.limiter.acquire(user_key)) |reason| {
-            std.debug.print("[relay] 拒绝连接 {s} (来自 {}): {s}\n", .{ node_key, addr, reason });
+            if (self.logger) |l| { l.info("[relay] 拒绝连接 {s} (来自 {}): {s}", .{ node_key, addr, reason }); }
             return;
         }
         errdefer self.limiter.release(user_key);
 
         // 2. 注册连接 (如果已存在, 关闭旧连接)
         const conn = self.alloc.create(Connection) catch {
-            std.debug.print("[relay] Connection alloc 失败\n", .{});
+            if (self.logger) |l| { l.info("[relay] Connection alloc 失败", .{}); }
             return;
         };
         conn.* = .{ .fd = fd, .addr = addr, .node_key = node_key };
@@ -430,7 +433,7 @@ pub const RelayServer = struct {
             }
             self.routing.put(node_key, conn) catch {};
         }
-        std.debug.print("[relay] 节点已注册: {s} ({})\n", .{ node_key, addr });
+        if (self.logger) |l| { l.info("[relay] 节点已注册: {s} ({})", .{ node_key, addr }); }
 
         // 3. 处理该连接的帧（超时时继续等待，不断开）
         setRecvTimeout(fd, 5000);
@@ -438,7 +441,7 @@ pub const RelayServer = struct {
             _ = readFrame(fd, &buf) catch |err| {
                 if (err == error.Timeout) continue;
                 if (err == error.ConnectionClosed or err == error.WouldBlock) break;
-                std.debug.print("[relay] 帧读取错误 {s}: {}\n", .{ node_key, err });
+                if (self.logger) |l| { l.info("[relay] 帧读取错误 {s}: {}", .{ node_key, err }); }
                 break;
             };
             switch (buf[0]) {
@@ -487,14 +490,14 @@ pub const RelayServer = struct {
                     // [9] — 心跳回复，忽略
                 },
                 else => {
-                    std.debug.print("[relay] 未知帧类型 {} 来自 {s}\n", .{ buf[0], node_key });
+                    if (self.logger) |l| { l.info("[relay] 未知帧类型 {} 来自 {s}\n", .{{ buf[0], node_key }}) };
                     break;
                 },
             }
         }
 
         // 4. 清理
-        std.debug.print("[relay] 节点断开: {s}\n", .{node_key});
+        if (self.logger) |l| { l.info("[relay] 节点断开: {s}\n", .{{node_key}}) };
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -526,10 +529,10 @@ pub const RelayServer = struct {
         const key = std.fmt.bufPrint(&key_buf, "{d}.{d}.{d}.{d}:{d}", .{
             ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], target_port,
         }) catch {
-            std.debug.print("[relay] ROUTEKEY_FAIL\n", .{});
+            if (self.logger) |l| { l.info("[relay] ROUTEKEY_FAIL\n", .{{}}) };
             return;
         };
-        std.debug.print("[relay] ROUTEKEY: {s}\n", .{key});
+        if (self.logger) |l| { l.info("[relay] ROUTEKEY: {s}\n", .{{key}}) };
 
         const target_conn = blk: {
             self.mutex.lock();
@@ -552,7 +555,7 @@ pub const RelayServer = struct {
             std.mem.writeInt(u32, fwd_buf[5..9], @as(u32, @intCast(payload.len)), .big);
             if (payload.len > 0) @memcpy(fwd_buf[9..][0..payload.len], payload);
             writeFrame(conn.fd, fwd_buf[0 .. 9 + payload.len]) catch |err| {
-                std.debug.print("[relay] 转发失败 {s}→{s}: {}\n", .{ from_key, key, err });
+                if (self.logger) |l| { l.info("[relay] 转发失败 {s}→{s}: {}\n", .{{ from_key, key, err }}) };
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 _ = self.pending.remove(req_id);
@@ -561,10 +564,10 @@ pub const RelayServer = struct {
             self.limiter.trackBytes(payload.len);
         } else if (self.upstream_client) |client| {
             // 目标不在本地路由表，通过上游 relay client 转发
-            std.debug.print("[relay] 上游转发 {s}→{s}\n", .{ from_key, key });
+            if (self.logger) |l| { l.info("[relay] 上游转发 {s}→{s}\n", .{{ from_key, key }}) };
             var resp_buf: [BUF_SIZE]u8 = undefined;
             const resp_len = client.sendRequest(target_ip, target_port, payload, &resp_buf, 5000) catch |err| {
-                std.debug.print("[relay] 上游转发失败 {s}→{s}: {}\n", .{ from_key, key, err });
+                if (self.logger) |l| { l.info("[relay] 上游转发失败 {s}→{s}: {}\n", .{{ from_key, key, err }}) };
                 return;
             };
             // 跟踪转发流量（请求 + 响应）
@@ -572,7 +575,7 @@ pub const RelayServer = struct {
             // 回送响应给原始请求者
             self.sendReply(from_key, seq, resp_buf[0..resp_len]);
         } else {
-            std.debug.print("[relay] 目标未注册: {s}\n", .{key});
+            if (self.logger) |l| { l.info("[relay] 目标未注册: {s}\n", .{{key}}) };
         }
     }
 
@@ -581,7 +584,7 @@ pub const RelayServer = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             const entry = self.pending.get(req_id) orelse {
-                std.debug.print("[relay] 未知 req_id={}\n", .{req_id});
+                if (self.logger) |l| { l.info("[relay] 未知 req_id={}\n", .{{req_id}}) };
                 return;
             };
             const key = self.alloc.dupe(u8, entry.requester_key) catch return;
@@ -595,7 +598,7 @@ pub const RelayServer = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             break :blk self.routing.get(requester_key.key) orelse {
-                std.debug.print("[relay] 请求者已断开: {s}\n", .{requester_key.key});
+                if (self.logger) |l| { l.info("[relay] 请求者已断开: {s}\n", .{{requester_key.key}}) };
                 return;
             };
         };
@@ -608,7 +611,7 @@ pub const RelayServer = struct {
         std.mem.writeInt(u32, reply_buf[5..9], @as(u32, @intCast(payload.len)), .big);
         if (payload.len > 0) @memcpy(reply_buf[9..][0..payload.len], payload);
         writeFrame(requester_conn.fd, reply_buf[0 .. 9 + payload.len]) catch |err| {
-            std.debug.print("[relay] 回复失败 {s}: {}\n", .{ requester_key.key, err });
+            if (self.logger) |l| { l.info("[relay] 回复失败 {s}: {}\n", .{{ requester_key.key, err }}) };
         };
     }
 
@@ -617,18 +620,18 @@ pub const RelayServer = struct {
         // 创建出站 TCP 连接
         // DNS 解析（支持域名和 IP）
         const addr_list = std.net.getAddressList(self.alloc, host, port) catch |err| {
-            std.debug.print("[relay/tcp] DNS 解析失败 {s}:{d}: {}\n", .{ host, port, err });
+            if (self.logger) |l| { l.info("[relay/tcp] DNS 解析失败 {s}:{d}: {}\n", .{{ host, port, err }}) };
             return;
         };
         defer addr_list.deinit();
 
         if (addr_list.addrs.len == 0) {
-            std.debug.print("[relay/tcp] DNS 解析结果为空 {s}:{d}\n", .{ host, port });
+            if (self.logger) |l| { l.info("[relay/tcp] DNS 解析结果为空 {s}:{d}\n", .{{ host, port }}) };
             return;
         }
 
         const target_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |err| {
-            std.debug.print("[relay/tcp] 创建 socket 失败: {}\n", .{err});
+            if (self.logger) |l| { l.info("[relay/tcp] 创建 socket 失败: {}\n", .{{err}}) };
             return;
         };
         errdefer closeSocket(target_fd);
@@ -638,7 +641,7 @@ pub const RelayServer = struct {
         for (addr_list.addrs) |addr| {
             if (addr.any.family != posix.AF.INET) continue;
             posix.connect(target_fd, &addr.any, addr.getOsSockLen()) catch |err| {
-                std.debug.print("[relay/tcp] 连接地址 {} 失败: {}\n", .{ addr, err });
+                if (self.logger) |l| { l.info("[relay/tcp] 连接地址 {} 失败: {}\n", .{{ addr, err }}) };
                 continue;
             };
             connected = true;
@@ -646,14 +649,14 @@ pub const RelayServer = struct {
         }
 
         if (!connected) {
-            std.debug.print("[relay/tcp] 连接失败 {s}:{d} (尝试了所有地址)\n", .{ host, port });
+            if (self.logger) |l| { l.info("[relay/tcp] 连接失败 {s}:{d} (尝试了所有地址)\n", .{{ host, port }}) };
             return;
         }
 
 
 
         const tunnel = self.alloc.create(TcpTunnel) catch {
-            std.debug.print("[relay/tcp] alloc 失败\n", .{});
+            if (self.logger) |l| { l.info("[relay/tcp] alloc 失败\n", .{{}}) };
             return;
         };
         tunnel.* = .{
@@ -674,13 +677,13 @@ pub const RelayServer = struct {
             self.tcp_tunnels.put(conn_id, tunnel) catch {};
         }
 
-        std.debug.print("[relay/tcp] 隧道已建立 conn_id={d} → {s}:{d}\n", .{ conn_id, host, port });
+        if (self.logger) |l| { l.info("[relay/tcp] 隧道已建立 conn_id={d} → {s}:{d}\n", .{{ conn_id, host, port }}) };
 
         // 启动出站 TCP reader 线程
         if (std.Thread.spawn(.{}, tcpTunnelReader, .{self, conn_id, target_fd, relay_fd})) |thread| {
             thread.detach();
         } else |err| {
-            std.debug.print("[relay/tcp] 线程创建失败: {}\n", .{err});
+            if (self.logger) |l| { l.info("[relay/tcp] 线程创建失败: {}\n", .{{err}}) };
         }
     }
 
@@ -708,14 +711,14 @@ pub const RelayServer = struct {
                     continue;
                 }
                 if (err == error.ConnectionResetByPeer or err == error.ConnectionClosed) {
-                    std.debug.print("[relay/tcp] 远程关闭 conn_id={d}\n", .{conn_id});
+                    if (self.logger) |l| { l.info("[relay/tcp] 远程关闭 conn_id={d}\n", .{{conn_id}}) };
                 } else {
-                    std.debug.print("[relay/tcp] 读取错误 conn_id={d}: {}\n", .{conn_id, err});
+                    if (self.logger) |l| { l.info("[relay/tcp] 读取错误 conn_id={d}: {}\n", .{{conn_id, err}}) };
                 }
                 break;
             };
             if (n == 0) {
-                std.debug.print("[relay/tcp] 远程关闭(EOF) conn_id={d}\n", .{conn_id});
+                if (self.logger) |l| { l.info("[relay/tcp] 远程关闭(EOF) conn_id={d}\n", .{{conn_id}}) };
                 break;
             }
 
@@ -728,7 +731,7 @@ pub const RelayServer = struct {
             if (write_len > 0) @memcpy(frame[9..][0..write_len], buf[0..write_len]);
 
             _ = posix.write(relay_fd, frame[0 .. 9 + write_len]) catch |err| {
-                std.debug.print("[relay/tcp] 写回 relay 失败 conn_id={d}: {}\n", .{conn_id, err});
+                if (self.logger) |l| { l.info("[relay/tcp] 写回 relay 失败 conn_id={d}: {}\n", .{{conn_id, err}}) };
                 break;
             };
         }
@@ -751,7 +754,7 @@ pub const RelayServer = struct {
         self.tcp_tunnel_mutex.unlock();
 
         _ = posix.write(target_fd, data) catch |err| {
-            std.debug.print("[relay/tcp] 写入目标失败 conn_id={d}: {}\n", .{conn_id, err});
+            if (self.logger) |l| { l.info("[relay/tcp] 写入目标失败 conn_id={d}: {}\n", .{{conn_id, err}}) };
         };
     }
 
@@ -764,7 +767,7 @@ pub const RelayServer = struct {
             closeSocket(tunnel.target_fd);
             self.alloc.destroy(tunnel);
             _ = self.tcp_tunnels.remove(conn_id);
-            std.debug.print("[relay/tcp] 隧道关闭 conn_id={d}\n", .{conn_id});
+            if (self.logger) |l| { l.info("[relay/tcp] 隧道关闭 conn_id={d}\n", .{{conn_id}}) };
         }
     }
 
@@ -774,7 +777,7 @@ pub const RelayServer = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             break :blk self.routing.get(requester_key) orelse {
-                std.debug.print("[relay] sendReply: 请求者已断开: {s}\n", .{requester_key});
+                if (self.logger) |l| { l.info("[relay] sendReply: 请求者已断开: {s}\n", .{{requester_key}}) };
                 return;
             };
         };
@@ -785,7 +788,7 @@ pub const RelayServer = struct {
         std.mem.writeInt(u32, reply_buf[5..9], @as(u32, @intCast(payload.len)), .big);
         if (payload.len > 0) @memcpy(reply_buf[9..][0..payload.len], payload);
         writeFrame(requester_conn.fd, reply_buf[0 .. 9 + payload.len]) catch |err| {
-            std.debug.print("[relay] sendReply 失败 {s}: {}\n", .{ requester_key, err });
+            if (self.logger) |l| { l.info("[relay] sendReply 失败 {s}: {}\n", .{{ requester_key, err }}) };
         };
     }
 };
@@ -811,6 +814,8 @@ pub const RelayClient = struct {
     remote_host: []const u8,
     remote_port: u16,
     ws_path: []const u8,
+    /// Logger instance
+    logger: ?*logging.Logger,
 
     /// TCP 隧道回调（由 SOCKS5 代理注册）
     /// data != null → TCP 数据；data == null → 连接关闭
@@ -818,6 +823,8 @@ pub const RelayClient = struct {
 
     /// 上次收到数据的时间戳（用于心跳保活）
     last_recv_ms: i64 = 0,
+    /// Logger instance
+    logger: ?*logging.Logger,
 
     const PendingEntry = struct {
         event: std.Thread.ResetEvent,
@@ -865,6 +872,7 @@ pub const RelayClient = struct {
             .remote_host = try alloc.dupe(u8, remote_host),
             .remote_port = remote_port,
             .ws_path = try alloc.dupe(u8, ws_path),
+            .logger = null,
         };
 
         // 创建 UDP socket 用于转发到本地 wasi-host
@@ -893,7 +901,7 @@ pub const RelayClient = struct {
             _ = posix.write(client.fd, &ping) catch {};
         }
 
-        std.debug.print("[relay/conn] 连接到 relay {s}:{d} (本机 {s}:{d})\n", .{ remote_host, remote_port, local_host, local_port });
+        if (self.logger) |l| { l.info("[relay/conn] 连接到 relay {s}:{d} (本机 {s}:{d})\n", .{{ remote_host, remote_port, local_host, local_port }}) };
         return client;
     }
 
@@ -1019,7 +1027,7 @@ pub const RelayClient = struct {
         while (retries < max_retries) {
             retries += 1;
             const wait_s = retries * 5; // 指数退避: 5s, 10s, 15s, ...
-            std.debug.print("[relay/reader] 重连 ({d}/{d}), {d}s...\n", .{ retries, max_retries, wait_s });
+            if (self.logger) |l| { l.info("[relay/reader] 重连 ({d}/{d}), {d}s...\n", .{{ retries, max_retries, wait_s }}) };
             var elapsed: u32 = 0;
             while (elapsed < wait_s) {
                 if (!self.running) return false;
@@ -1067,7 +1075,7 @@ pub const RelayClient = struct {
             }
 
 
-            std.debug.print("[relay/reader] 重连成功\n", .{});
+            if (self.logger) |l| { l.info("[relay/reader] 重连成功\n", .{{}}) };
             setRecvTimeout(self.fd, 3000);
             return true;
         }
@@ -1079,7 +1087,7 @@ pub const RelayClient = struct {
     pub fn readerLoop(self: *RelayClient) void {
         const target_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, self.own_udp_port);
 
-        std.debug.print("[relay/reader] 启动 reader 线程\n", .{});
+        if (self.logger) |l| { l.info("[relay/reader] 启动 reader 线程\n", .{{}}) };
 
         // 外层循环：连接断开后自动重连
         while (self.running) {
@@ -1103,10 +1111,10 @@ pub const RelayClient = struct {
                         continue;
                     }
                     if (err == error.ConnectionClosed or err == error.WouldBlock) {
-                        std.debug.print("[relay/reader] 连接断开\n", .{});
+                        if (self.logger) |l| { l.info("[relay/reader] 连接断开\n", .{{}}) };
                         break;
                     }
-                    std.debug.print("[relay/reader] 读取错误: {}\n", .{err});
+                    if (self.logger) |l| { l.info("[relay/reader] 读取错误: {}\n", .{{err}}) };
                     break;
                 };
                 _ = frame_n;
@@ -1121,20 +1129,20 @@ pub const RelayClient = struct {
 
                         // ── 每个 FRAME_FORWARD 使用临时 UDP socket，避免响应串扰 ──
                         const tmp_udp = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP) catch |err| {
-                            std.debug.print("[relay/reader] 创建临时 UDP socket 失败: {}\n", .{err});
+                            if (self.logger) |l| { l.info("[relay/reader] 创建临时 UDP socket 失败: {}\n", .{{err}}) };
                             continue;
                         };
                         defer posix.close(tmp_udp);
 
                         const tmp_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
                         posix.bind(tmp_udp, &tmp_bind.any, tmp_bind.getOsSockLen()) catch |err| {
-                            std.debug.print("[relay/reader] 绑定临时 UDP socket 失败: {}\n", .{err});
+                            if (self.logger) |l| { l.info("[relay/reader] 绑定临时 UDP socket 失败: {}\n", .{{err}}) };
                             continue;
                         };
 
                         // 转发到本地 wasi-host UDP
                         _ = posix.sendto(tmp_udp, payload, 0, &target_addr.any, @sizeOf(posix.sockaddr.in)) catch |err| {
-                            std.debug.print("[relay/reader] UDP 转发错误: {}\n", .{err});
+                            if (self.logger) |l| { l.info("[relay/reader] UDP 转发错误: {}\n", .{{err}}) };
                             continue;
                         };
 
@@ -1148,7 +1156,7 @@ pub const RelayClient = struct {
                                 // 无响应（如 notify 等单向消息）
                                 continue;
                             }
-                            std.debug.print("[relay/reader] UDP recv 错误: {}\n", .{err});
+                            if (self.logger) |l| { l.info("[relay/reader] UDP recv 错误: {}\n", .{{err}}) };
                             continue;
                         };
                         // 发送响应回 relay server
@@ -1202,7 +1210,7 @@ pub const RelayClient = struct {
                         entry.event.set();
                     },
                     else => {
-                        std.debug.print("[relay/reader] 未知帧类型 {}\n", .{buf[0]});
+                        if (self.logger) |l| { l.info("[relay/reader] 未知帧类型 {}\n", .{{buf[0]}}) };
                         continue;
                     },
                 }
@@ -1210,15 +1218,15 @@ pub const RelayClient = struct {
 
             // 连接断开后尝试自动重连
             if (!self.running) break;
-            std.debug.print("[relay/reader] 连接断开, 尝试重连...\n", .{});
+            if (self.logger) |l| { l.info("[relay/reader] 连接断开, 尝试重连...\n", .{{}}) };
             if (self.reconnect()) {
                 continue; // 重连成功，回到外层循环继续
             }
-            std.debug.print("[relay/reader] 重连失败, reader 退出\n", .{});
+            if (self.logger) |l| { l.info("[relay/reader] 重连失败, reader 退出\n", .{{}}) };
             break;
         }
         self.running = false;
-        std.debug.print("[relay/reader] reader 线程退出\n", .{});
+        if (self.logger) |l| { l.info("[relay/reader] reader 线程退出\n", .{{}}) };
     }
 };
 

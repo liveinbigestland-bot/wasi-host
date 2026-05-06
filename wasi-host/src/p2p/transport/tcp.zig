@@ -3,6 +3,8 @@
 /// 使用长度前缀帧格式: [payload_len: u32 BE][payload]
 const std = @import("std");
 const posix = std.posix;
+const logging = @import("logging");
+const log = logging.log;
 
 pub const BUF_SIZE = 65536;
 
@@ -82,7 +84,7 @@ pub const TcpTransport = struct {
             .kernel_backlog = 16,
         });
         const actual_port = server.listen_address.getPort();
-        std.debug.print("[tcp] TCP 监听 {s}:{d}\n", .{ host, actual_port });
+        log.info("[tcp] TCP 监听 {s}:{d}", .{ host, actual_port });
         return TcpTransport{
             .listener = server,
             .port = actual_port,
@@ -128,16 +130,16 @@ pub const TcpTransport = struct {
 
     /// Accept 循环：接收 TCP 连接 → 帧解码 → UDP 注入本地 Chord → TCP 回复
     pub fn acceptLoop(self: *TcpTransport, udp_port: u16) void {
-        std.debug.print("[tcp] accept 循环启动, UDP 目标 127.0.0.1:{d}\n", .{udp_port});
+        log.info("[tcp] accept 循环启动, UDP 目标 127.0.0.1:{d}", .{udp_port});
         while (self.running) {
             const conn = self.listener.accept() catch |err| {
                 if (!self.running) break;
-                std.debug.print("[tcp] accept 错误: {}\n", .{err});
+                log.info("[tcp] accept 错误: {}", .{err});
                 continue;
             };
-            std.debug.print("[tcp] 接受连接: {}\n", .{conn.address});
+            log.info("[tcp] 接受连接: {}", .{conn.address});
             self.handleConnection(conn, udp_port);
-            std.debug.print("[tcp] 连接处理完成: {}\n", .{conn.address});
+            log.info("[tcp] 连接处理完成: {}", .{conn.address});
         }
     }
 
@@ -149,20 +151,20 @@ pub const TcpTransport = struct {
         // ── 1. 读取帧长度 ──
         const n = conn.stream.readAll(buf[0..4]) catch |err| {
             if (err != error.ConnectionReset and err != error.EndOfStream) {
-                std.debug.print("[tcp] 读长度失败: {}\n", .{err});
+                log.info("[tcp] 读长度失败: {}", .{err});
             }
             return;
         };
         if (n < 4) return;
         const msg_len = std.mem.readInt(u32, buf[0..4], .big);
         if (msg_len > BUF_SIZE) {
-            std.debug.print("[tcp] 消息过大: {d} > {d}\n", .{ msg_len, BUF_SIZE });
+            log.info("[tcp] 消息过大: {d} > {d}", .{ msg_len, BUF_SIZE });
             return;
         }
 
         // ── 2. 读取消息 payload ──
         const m = conn.stream.readAll(buf[0..msg_len]) catch |err| {
-            std.debug.print("[tcp] 读消息失败: {}\n", .{err});
+            log.info("[tcp] 读消息失败: {}", .{err});
             return;
         };
         if (m < msg_len) return;
@@ -179,13 +181,13 @@ pub const TcpTransport = struct {
             .zero = .{0} ** 8,
         };
         posix.connect(udp_fd, @as(*const posix.sockaddr, @ptrCast(&target)), @sizeOf(posix.sockaddr.in)) catch |err| {
-            std.debug.print("[tcp] UDP connect 127.0.0.1:{d} 失败: {}\n", .{ udp_port, err });
+            log.info("[tcp] UDP connect 127.0.0.1:{d} 失败: {}", .{ udp_port, err });
             return;
         };
 
         // 注入消息到本地 Chord
         _ = posix.send(udp_fd, buf[0..msg_len], 0) catch |err| {
-            std.debug.print("[tcp] UDP 注入失败: {}\n", .{err});
+            log.info("[tcp] UDP 注入失败: {}", .{err});
             return;
         };
 
@@ -202,9 +204,9 @@ pub const TcpTransport = struct {
 
         const r = posix.recv(udp_fd, &recv_buf, 0) catch |err| {
             if (err == error.WouldBlock) {
-                std.debug.print("[tcp] UDP 回复超时\n", .{});
+                log.info("[tcp] UDP 回复超时", .{});
             } else {
-                std.debug.print("[tcp] UDP 接收错误: {}\n", .{err});
+                log.info("[tcp] UDP 接收错误: {}", .{err});
             }
             return;
         };
@@ -215,7 +217,7 @@ pub const TcpTransport = struct {
         std.mem.writeInt(u32, &resp_header, @intCast(resp_len), .big);
         conn.stream.writeAll(&resp_header) catch return;
         conn.stream.writeAll(recv_buf[0..resp_len]) catch |err| {
-            std.debug.print("[tcp] TCP 回复失败: {}\n", .{err});
+            log.info("[tcp] TCP 回复失败: {}", .{err});
         };
     }
 };

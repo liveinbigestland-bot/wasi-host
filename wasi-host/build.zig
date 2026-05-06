@@ -75,6 +75,12 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path("wasm3/source"));
 
+    // Add logging module
+    const logging_module = b.createModule(.{
+        .root_source_file = b.path("src/logging/index.zig"),
+    });
+    exe.root_module.addImport("logging", logging_module);
+
     exe.step.dependOn(plugin_step);
 
     b.installArtifact(exe);
@@ -88,6 +94,7 @@ pub fn build(b: *std.Build) void {
         .strip = optimize != .Debug,
     });
     relay_server.linkLibC();
+    relay_server.root_module.addImport("logging", logging_module);
     b.installArtifact(relay_server);
 
     // ── wasi-hostd 守护进程 ──
@@ -99,6 +106,7 @@ pub fn build(b: *std.Build) void {
         .strip = optimize != .Debug,
     });
     daemon.linkLibC();
+    daemon.root_module.addImport("logging", logging_module);
 
     const version_str = getGitDescribe(b) orelse "0.0.0";
     const daemon_opts = b.addOptions();

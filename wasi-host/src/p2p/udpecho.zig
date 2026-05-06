@@ -2,6 +2,8 @@
 /// 监听指定 UDP 端口，收到数据后打印日志并原样回复
 const std = @import("std");
 const posix = std.posix;
+const logging = @import("logging");
+const log = logging.log;
 
 const BUF_SIZE = 65536;
 
@@ -15,7 +17,7 @@ pub const UdpEchoServer = struct {
         const opt: c_int = 1;
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(opt));
 
-        // 使用 std.net.Address.initIp4 (与 transport/udp.zig 相同方式)
+        // 使用 std.net.Address.initIp4 (�?transport/udp.zig 相同方式)
         const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
         try posix.bind(fd, &addr.any, @sizeOf(posix.sockaddr.in));
 
@@ -30,13 +32,13 @@ pub const UdpEchoServer = struct {
     pub fn run(self: *UdpEchoServer) void {
         var buf: [BUF_SIZE]u8 = undefined;
         var src_addr: posix.sockaddr = undefined;
-        std.debug.print("[udpecho] 监听 UDP :{d}\n", .{self.port});
+        log.info("[udpecho] 监听 UDP :{d}", .{self.port});
 
         while (self.running) {
             var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
             const n = posix.recvfrom(self.fd, &buf, 0, &src_addr, &addr_len) catch |err| {
                 if (err == error.WouldBlock or err == error.Timeout) continue;
-                std.debug.print("[udpecho] recv 错误: {}\n", .{err});
+                log.info("[udpecho] recv 错误: {}", .{err});
                 break;
             };
             if (n == 0) continue;
@@ -52,8 +54,9 @@ pub const UdpEchoServer = struct {
 
             // 原样回复
             _ = posix.sendto(self.fd, buf[0..n], 0, &src_addr, @sizeOf(posix.sockaddr.in)) catch |err| {
-                std.debug.print("[udpecho] 回复失败: {}\n", .{err});
+                log.info("[udpecho] 回复失败: {}", .{err});
             };
         }
     }
 };
+

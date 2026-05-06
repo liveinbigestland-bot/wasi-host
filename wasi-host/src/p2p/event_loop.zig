@@ -1,12 +1,13 @@
-/// 跨平台事件循环 — 基于 poll()
+﻿/// 跨平台事件循�?�?基于 poll()
 ///
-/// 单线程非阻塞 I/O 驱动：fd 事件注册 + 定时器调度
+/// 单线程非阻塞 I/O 驱动：fd 事件注册 + 定时器调�?
 /// 支持跨线程唤醒和任务队列 (initWakeup / execute)
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const logging = @import("logging");
 
-/// Handler 虚表 — 事件回调接口
+/// Handler 虚表 �?事件回调接口
 pub const HandlerVTable = struct {
     onReadable: ?*const fn (ctx: *anyopaque, fd: posix.socket_t, loop: *EventLoop) void = null,
     onWritable: ?*const fn (ctx: *anyopaque, fd: posix.socket_t, loop: *EventLoop) void = null,
@@ -43,7 +44,7 @@ pub const EventLoop = struct {
     timers: std.ArrayList(TimerEntry),
     running: bool,
 
-    /// 多线程支持：跨线程唤醒 TCP loopback pair
+    /// 多线程支持：跨线程唤�?TCP loopback pair
     has_wakeup: bool,
     wakeup_read: posix.socket_t,
     wakeup_write: posix.socket_t,
@@ -78,7 +79,7 @@ pub const EventLoop = struct {
         self.job_queue.deinit();
     }
 
-    /// 初始化跨线程唤醒（TCP loopback pair）
+    /// 初始化跨线程唤醒（TCP loopback pair�?
     pub fn initWakeup(self: *EventLoop) !void {
         const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer closeSocket(listen_fd);
@@ -120,7 +121,7 @@ pub const EventLoop = struct {
         }
     }
 
-    /// 从其他线程唤醒事件循环（写入 wakeup pipe）
+    /// 从其他线程唤醒事件循环（写入 wakeup pipe�?
     pub fn wakeup(self: *EventLoop) void {
         if (!self.has_wakeup) return;
         const byte: [1]u8 = .{0};
@@ -135,7 +136,7 @@ pub const EventLoop = struct {
         self.wakeup();
     }
 
-    /// 处理唤醒数据和排队工作
+    /// 处理唤醒数据和排队工�?
     fn processJobs(self: *EventLoop) void {
         var dummy: [64]u8 = undefined;
         _ = posix.read(self.wakeup_read, &dummy) catch {};
@@ -185,7 +186,7 @@ pub const EventLoop = struct {
 
             const ready = posix.poll(self.poll_fds.items, timeout_ms) catch |err| {
                 if (err == error.Interrupted) continue;
-                std.debug.print("[event_loop] poll 错误: {}\n", .{err});
+                if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[event_loop] poll 错误: {}", .{err}); } else |_| {}
                 break;
             };
 
@@ -193,7 +194,7 @@ pub const EventLoop = struct {
                 for (self.poll_fds.items) |pfd| {
                     if (pfd.revents == 0) continue;
 
-                    // 唤醒 fd — 处理跨线程任务队列
+                    // 唤醒 fd �?处理跨线程任务队�?
                     if (self.has_wakeup and pfd.fd == self.wakeup_read) {
                         self.processJobs();
                         continue;
@@ -277,7 +278,7 @@ pub const EventLoop = struct {
     }
 };
 
-/// 将 fd 设为非阻塞模式
+/// �?fd 设为非阻塞模�?
 pub fn setNonblocking(fd: posix.socket_t) !void {
     if (builtin.os.tag == .windows) {
         var mode: u32 = 1;
@@ -300,3 +301,5 @@ comptime {
     _ = HandlerVTable;
     _ = EventLoop;
 }
+
+

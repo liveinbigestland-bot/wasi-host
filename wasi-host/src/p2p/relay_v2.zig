@@ -1,19 +1,20 @@
-/// 事件驱动 TCP Relay — 非阻塞 + EventLoop + 多线程
+﻿/// 事件驱动 TCP Relay �?非阻�?+ EventLoop + 多线�?
 ///
-/// 协议格式与 relay.zig 完全兼容：
-///   [0x00][len: u8]["host:port"]     — 注册 (Client→Server)
-///   [0x01][target_ip 4BE][target_port 2BE][seq 4LE][payload_len 4BE][payload]  — 请求 (Client→Server)
-///   [0x02][req_id 4LE][payload_len 4BE][payload]  — 响应 (Client→Server)
-///   [0x03][req_id 4LE][payload_len 4BE][payload]  — 转发 (Server→Client)
-///   [0x04][seq 4LE][payload_len 4BE][payload]  — 回复 (Server→Client)
-///   [0x05][conn_id 4LE][host_len 1][host][port 2BE] — TCP 隧道连接请求
-///   [0x06][conn_id 4LE][data_len 4BE][data] — TCP 隧道数据
-///   [0x07][conn_id 4LE] — TCP 隧道关闭
-///   [0x08] — PING 心跳
-///   [0x09] — PONG 心跳回复
+/// 协议格式�?relay.zig 完全兼容�?
+///   [0x00][len: u8]["host:port"]     �?注册 (Client→Server)
+///   [0x01][target_ip 4BE][target_port 2BE][seq 4LE][payload_len 4BE][payload]  �?请求 (Client→Server)
+///   [0x02][req_id 4LE][payload_len 4BE][payload]  �?响应 (Client→Server)
+///   [0x03][req_id 4LE][payload_len 4BE][payload]  �?转发 (Server→Client)
+///   [0x04][seq 4LE][payload_len 4BE][payload]  �?回复 (Server→Client)
+///   [0x05][conn_id 4LE][host_len 1][host][port 2BE] �?TCP 隧道连接请求
+///   [0x06][conn_id 4LE][data_len 4BE][data] �?TCP 隧道数据
+///   [0x07][conn_id 4LE] �?TCP 隧道关闭
+///   [0x08] �?PING 心跳
+///   [0x09] �?PONG 心跳回复
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const logging = @import("logging");
 const event_loop = @import("event_loop.zig");
 const EventLoop = event_loop.EventLoop;
 const HandlerVTable = event_loop.HandlerVTable;
@@ -43,7 +44,7 @@ fn closeSocket(fd: posix.socket_t) void {
     _ = posix.system.close(fd);
 }
 
-/// 写完整 buf 到 fd（非阻塞，可能部分写入）
+/// 写完�?buf �?fd（非阻塞，可能部分写入）
 fn writeAll(fd: posix.socket_t, buf: []const u8) !usize {
     var off: usize = 0;
     while (off < buf.len) {
@@ -57,7 +58,7 @@ fn writeAll(fd: posix.socket_t, buf: []const u8) !usize {
     return off;
 }
 
-/// 增量帧解析 — 纯函数
+/// 增量帧解�?�?纯函�?
 fn tryCompleteFrame(buf: []const u8) ?usize {
     if (buf.len == 0) return null;
     const frame_type = buf[0];
@@ -97,7 +98,7 @@ fn tryCompleteFrame(buf: []const u8) ?usize {
     return null;
 }
 
-// ── 速率限制器 ──
+// ── 速率限制�?──
 
 const RateLimiter = struct {
     alloc: std.mem.Allocator,
@@ -223,6 +224,7 @@ pub const RelayServer = struct {
     num_workers: usize,
     upstream_client: ?*anyopaque = null,
     mutex: std.Thread.Mutex = .{},
+    logger: ?*logging.Logger = null,
 
     client_vtbl: HandlerVTable,
     tunnel_vtbl: HandlerVTable,
@@ -285,7 +287,7 @@ pub const RelayServer = struct {
         self.alloc.destroy(data);
     }
 
-    pub fn init(alloc: std.mem.Allocator, listen_host: []const u8, port: u16, max_connections: u32, max_per_user: u32, num_workers: u32) !RelayServer {
+    pub fn init(alloc: std.mem.Allocator, listen_host: []const u8, port: u16, max_connections: u32, max_per_user: u32, num_workers: u32, logger: ?*logging.Logger) !RelayServer {
         const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer closeSocket(listen_fd);
 
@@ -317,6 +319,7 @@ pub const RelayServer = struct {
             .running = false,
             .limiter = RateLimiter.init(alloc, max_connections, max_per_user),
             .num_workers = nw,
+            .logger = logger,
             .client_vtbl = undefined,
             .tunnel_vtbl = undefined,
             .accept_vtbl = undefined,
@@ -347,22 +350,22 @@ pub const RelayServer = struct {
 
     pub fn run(self: *RelayServer) void {
         self.running = true;
-        std.debug.print("[relay/v2] TCP relay server 已启动 :{d} ({} workers)\n", .{ self.port, self.num_workers });
+        if (self.logger) |l| { l.info("[relay/v2] TCP relay server 已启动 :{d} ({} workers)", .{ self.port, self.num_workers }); }
 
-        // Worker 0 负责 accept 和心跳
+        // Worker 0 负责 accept 和心�?
         const w0 = self.pool.getLoop(0);
         w0.addFd(self.listen_fd, posix.POLL.IN, self, &self.accept_vtbl);
         w0.addTimer(5000, self, &self.accept_vtbl);
 
-        // 启动所有 worker 线程
+        // 启动所�?worker 线程
         self.pool.start();
 
-        // 主线程等待所有 worker 退出
+        // 主线程等待所�?worker 退�?
         self.pool.wait();
-        std.debug.print("[relay/v2] 事件循环退出\n", .{});
+        if (self.logger) |l| { l.info("[relay/v2] 事件循环退出", .{}); }
     }
 
-    // ── 辅助：跨工作者写入 ──
+    // ── 辅助：跨工作者写�?──
 
     fn writeToHandler(self: *RelayServer, th: *ClientHandler, data: []const u8, current_worker: usize, current_loop: *EventLoop) void {
         if (th.worker_id == current_worker) {
@@ -386,15 +389,15 @@ pub const RelayServer = struct {
             return;
         };
         // Need to check if handler is still valid after unlock
-        // We use the handler pointer here — if cleanup removes it concurrently:
+        // We use the handler pointer here �?if cleanup removes it concurrently:
         // - cleanup runs on the handler's worker EventLoop (same thread)
-        // - if cleanup already happened, handler was removed from map → would not be found
-        // - if cleanup hasn't happened, handler is alive and we're on the correct worker → safe
+        // - if cleanup already happened, handler was removed from map �?would not be found
+        // - if cleanup hasn't happened, handler is alive and we're on the correct worker �?safe
         const w_id = handler.worker_id;
         self.handler_mutex.unlock();
 
         if (w_id == current_worker) {
-            // Handler is on current worker — re-lookup for safety
+            // Handler is on current worker �?re-lookup for safety
             self.handler_mutex.lock();
             const h2 = self.handlers.get(fd) orelse {
                 self.handler_mutex.unlock();
@@ -425,7 +428,7 @@ pub const RelayServer = struct {
             const client_fd = posix.accept(fd, &client_addr.any, &addr_len, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch |err| {
                 if (err == error.WouldBlock) break;
                 if (self.running) {
-                    std.debug.print("[relay/v2] accept 错误: {}\n", .{err});
+                    if (self.logger) |l| { l.info("[relay/v2] accept 错误: {}", .{err}); }
                 }
                 break;
             };
@@ -433,7 +436,7 @@ pub const RelayServer = struct {
         }
     }
 
-    /// 将新客户端指派给 worker（round-robin）
+    /// 将新客户端指派给 worker（round-robin�?
     fn dispatchClient(self: *RelayServer, fd: posix.socket_t, addr: std.net.Address) void {
         setKeepalive(fd);
         const handler = self.alloc.create(ClientHandler) catch {
@@ -462,7 +465,7 @@ pub const RelayServer = struct {
         handler.user_key_len = user_key.len;
 
         if (self.limiter.acquire(user_key)) |reason| {
-            std.debug.print("[relay/v2] 拒绝连接 (来自 {}): {s}\n", .{ addr, reason });
+            if (self.logger) |l| { l.info("[relay/v2] 拒绝连接 (来自 {}): {s}", .{ addr, reason }); }
             self.alloc.destroy(handler);
             closeSocket(fd);
             return;
@@ -470,13 +473,13 @@ pub const RelayServer = struct {
 
         const target_loop = self.pool.getLoop(worker_id);
         if (worker_id == 0) {
-            // Worker 0（与 accept 同线程）— 直接注册
+            // Worker 0（与 accept 同线程）�?直接注册
             target_loop.addFd(fd, posix.POLL.IN, handler, &self.client_vtbl);
             self.handler_mutex.lock();
             self.handlers.put(fd, handler) catch {};
             self.handler_mutex.unlock();
         } else {
-            // 跨工作者注册
+            // 跨工作者注�?
             const data = self.alloc.create(RegisterClientData) catch {
                 self.limiter.release(user_key);
                 self.alloc.destroy(handler);
@@ -501,7 +504,7 @@ pub const RelayServer = struct {
                 clientCleanup(handler, loop);
                 return;
             }
-            std.debug.print("[relay/v2] 读取错误: {}\n", .{err});
+            if (self.logger) |l| { l.info("[relay/v2] 读取错误: {}", .{err}); }
             clientCleanup(handler, loop);
             return;
         };
@@ -522,7 +525,7 @@ pub const RelayServer = struct {
             switch (handler.state) {
                 .waiting_register => {
                     if (frame[0] != FRAME_REGISTER) {
-                        std.debug.print("[relay/v2] 期望注册帧, 收到 type={}\n", .{frame[0]});
+                        if (self.logger) |l| { l.info("[relay/v2] 期望注册帧，收到 type={}", .{frame[0]}); }
                         clientCleanup(handler, loop);
                         return;
                     }
@@ -544,8 +547,8 @@ pub const RelayServer = struct {
                         self.mutex.lock();
                         defer self.mutex.unlock();
                         if (self.routing.get(node_key)) |old_conn| {
-                            // 不立即 closeSocket — cleanupFdJobFn 会在旧 loop 中
-                            // 先 removeFd 再 close，防止竞态
+                            // 不立�?closeSocket �?cleanupFdJobFn 会在�?loop �?
+                            // �?removeFd �?close，防止竞�?
                             const old_loop = self.pool.getLoop(old_conn.worker_id);
                             if (self.alloc.create(CleanupFdData)) |cup| {
                                 cup.* = .{ .server = self, .fd = old_conn.fd };
@@ -558,7 +561,7 @@ pub const RelayServer = struct {
                     }
 
                     handler.state = .active;
-                    std.debug.print("[relay/v2] 节点已注册: {s} ({})\n", .{ node_key, handler.addr });
+                    if (self.logger) |l| { l.info("[relay/v2] 节点已注册: {s} ({})", .{ node_key, handler.addr }); }
                 },
                 .active => {
                     self.handleFrame(handler, frame, loop);
@@ -581,7 +584,7 @@ pub const RelayServer = struct {
     fn clientCleanup(handler: *ClientHandler, loop: *EventLoop) void {
         const self = handler.server;
 
-        // 检查此 handler 是否仍为其 fd 的当前所有者（防止 fd 重用竞争）
+        // 检查此 handler 是否仍为�?fd 的当前所有者（防止 fd 重用竞争�?
         self.handler_mutex.lock();
         const is_current = (self.handlers.get(handler.fd) == handler);
         if (is_current) {
@@ -594,7 +597,7 @@ pub const RelayServer = struct {
             closeSocket(handler.fd);
         }
 
-        // 路由表清理（总是执行）
+        // 路由表清理（总是执行�?
         if (handler.conn) |conn| {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -614,12 +617,12 @@ pub const RelayServer = struct {
         self.alloc.destroy(handler);
     }
 
-    // ── 写缓冲 ──
+    // ── 写缓�?──
 
     pub fn writeOrBuffer(handler: *ClientHandler, data: []const u8, loop: *EventLoop) void {
         if (handler.write_len > handler.write_sent) {
             if (handler.write_len + data.len > handler.write_buf.len) {
-                std.debug.print("[relay/v2] 写缓冲满, 断开\n", .{});
+                if (handler.server.logger) |l| { l.info("[relay/v2] 写缓冲满, 断开", .{}); }
                 clientCleanup(handler, loop);
                 return;
             }
@@ -677,7 +680,7 @@ pub const RelayServer = struct {
         }
     }
 
-    // ── 帧处理 ──
+    // ── 帧处�?──
 
     fn handleFrame(self: *RelayServer, handler: *ClientHandler, frame: []const u8, loop: *EventLoop) void {
         switch (frame[0]) {
@@ -714,13 +717,13 @@ pub const RelayServer = struct {
             },
             FRAME_PING => {
                 const from = if (handler.node_key.len > 0) handler.node_key else handler.user_key_buf[0..handler.user_key_len];
-                std.debug.print("[relay/v2] PING from {s}\n", .{from});
+                if (self.logger) |l| { l.info("[relay/v2] PING from {s}", .{from}); }
                 const pong: [1]u8 = .{FRAME_PONG};
                 writeOrBuffer(handler, &pong, loop);
             },
             FRAME_PONG => {},
             else => {
-                std.debug.print("[relay/v2] 未知帧类型 {} 来自 {s}\n", .{ frame[0], handler.node_key });
+                if (self.logger) |l| { l.info("[relay/v2] 未知帧类型 {} 来自 {s}", .{ frame[0], handler.node_key }); }
                 clientCleanup(handler, loop);
             },
         }
@@ -734,7 +737,7 @@ pub const RelayServer = struct {
         const key = std.fmt.bufPrint(&key_buf, "{d}.{d}.{d}.{d}:{d}", .{
             ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], target_port,
         }) catch {
-            std.debug.print("[relay/v2] ROUTEKEY_FAIL\n", .{});
+            if (self.logger) |l| { l.info("[relay/v2] ROUTEKEY_FAIL", .{}); }
             return;
         };
 
@@ -762,7 +765,7 @@ pub const RelayServer = struct {
             // 写转发数据到目标（可能跨工作者）
             self.writeByFd(conn.fd, frame_data, handler.worker_id, loop);
         } else {
-            std.debug.print("[relay/v2] 目标未注册: {s}\n", .{key});
+            if (self.logger) |l| { l.info("[relay/v2] 目标未注册: {s}", .{key}); }
         }
     }
 
@@ -796,7 +799,7 @@ pub const RelayServer = struct {
     fn handleTcpConnect(self: *RelayServer, handler: *ClientHandler, conn_id: u32, host: []const u8, port: u16, loop: *EventLoop) void {
         _ = loop;
         const addr_list = std.net.getAddressList(self.alloc, host, port) catch |err| {
-            std.debug.print("[relay/v2/tcp] DNS 解析失败 {s}:{d}: {}\n", .{ host, port, err });
+            if (self.logger) |l| { l.info("[relay/v2/tcp] DNS 解析失败 {s}:{d}: {}", .{ host, port, err }); }
             return;
         };
         defer addr_list.deinit();
@@ -804,7 +807,7 @@ pub const RelayServer = struct {
         if (addr_list.addrs.len == 0) return;
 
         const target_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |err| {
-            std.debug.print("[relay/v2/tcp] 创建 socket 失败: {}\n", .{err});
+            if (self.logger) |l| { l.info("[relay/v2/tcp] 创建 socket 失败: {}", .{err}); }
             return;
         };
         errdefer closeSocket(target_fd);
@@ -813,7 +816,7 @@ pub const RelayServer = struct {
         for (addr_list.addrs) |addr| {
             if (addr.any.family != posix.AF.INET) continue;
             posix.connect(target_fd, &addr.any, addr.getOsSockLen()) catch |err| {
-                std.debug.print("[relay/v2/tcp] 连接地址 {} 失败: {}\n", .{ addr, err });
+                if (self.logger) |l| { l.info("[relay/v2/tcp] 连接地址 {} 失败: {}", .{ addr, err }); }
                 continue;
             };
             connected = true;
@@ -837,7 +840,7 @@ pub const RelayServer = struct {
             self.tunnel_mutex.lock();
             defer self.tunnel_mutex.unlock();
             if (self.tcp_tunnels.get(conn_id)) |old| {
-                // 旧隧道 fd 在事件循环中，由 cleanupTunnelJob 安全移除
+                // 旧隧�?fd 在事件循环中，由 cleanupTunnelJob 安全移除
                 if (self.alloc.create(CleanupFdData)) |cup| {
                     cup.* = .{ .server = self, .fd = old.target_fd };
                     const worker_loop2 = self.pool.getLoop(handler.worker_id);
@@ -850,10 +853,10 @@ pub const RelayServer = struct {
             self.tcp_tunnels.put(conn_id, tunnel) catch {};
         }
 
-        // TCP 隧道 fd 注册到 handler 所在的工作者
+        // TCP 隧道 fd 注册�?handler 所在的工作�?
         const worker_loop = self.pool.getLoop(handler.worker_id);
         worker_loop.addFd(target_fd, posix.POLL.IN, tunnel, &self.tunnel_vtbl);
-        std.debug.print("[relay/v2/tcp] 隧道建立 conn_id={d} → {s}:{d} (worker {d})\n", .{ conn_id, host, port, handler.worker_id });
+        if (self.logger) |l| { l.info("[relay/v2/tcp] 隧道建立 conn_id={d} to {s}:{d} (worker {d})", .{ conn_id, host, port, handler.worker_id }); }
     }
 
     fn handleTcpData(self: *RelayServer, conn_id: u32, data: []const u8) void {
@@ -902,7 +905,7 @@ pub const RelayServer = struct {
         std.mem.writeInt(u32, frame[5..9], @as(u32, @intCast(n)), .big);
         if (n > 0) @memcpy(frame[9..][0..n], buf[0..n]);
 
-        // 转发数据到 relay client — 可能跨工作者
+        // 转发数据�?relay client �?可能跨工作�?
         self.writeByFd(tunnel.relay_fd, frame[0 .. 9 + n], tunnel.worker_id, loop);
     }
 
@@ -969,7 +972,7 @@ pub const RelayClient = struct {
     running: bool,
     registered: bool,
     ws_mode: bool,
-    /// 被禁用标记 — true 时 readerLoop 停止重连并退出
+    /// 被禁用标�?�?true �?readerLoop 停止重连并退�?
     disabled: bool = false,
 
     write_buf: [BUF_SIZE]u8,
@@ -991,6 +994,7 @@ pub const RelayClient = struct {
 
     fd_vtbl: HandlerVTable,
     udp_vtbl: HandlerVTable,
+    logger: ?*logging.Logger = null,
 
     pub fn init(alloc: std.mem.Allocator, remote_host: []const u8, remote_port: u16, local_host: []const u8, local_port: u16, udp_port: u16) !RelayClient {
         return initWithOpts(alloc, remote_host, remote_port, local_host, local_port, udp_port, false, "");
@@ -1048,6 +1052,7 @@ pub const RelayClient = struct {
             .next_seq = 1,
             .fd_vtbl = undefined,
             .udp_vtbl = undefined,
+            .logger = null,
         };
         client.fd_vtbl = HandlerVTable{ .onReadable = clientOnReadable, .onWritable = clientOnWritable, .onHup = clientOnHup, .onTimer = clientOnHeartbeat };
         client.udp_vtbl = HandlerVTable{ .onReadable = clientUdpOnReadable };
@@ -1067,7 +1072,7 @@ pub const RelayClient = struct {
         const ping: [1]u8 = .{FRAME_PING};
         _ = posix.write(fd, &ping) catch {};
 
-        std.debug.print("[relay/v2/conn] 连接到 {s}:{d} (本机 {s}:{d})\n", .{ remote_host, remote_port, local_host, local_port });
+        if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/conn] 连接到 {s}:{d} (本机 {s}:{d})", .{ remote_host, remote_port, local_host, local_port }); } else |_| {}
         return client;
     }
 
@@ -1083,8 +1088,8 @@ pub const RelayClient = struct {
         if (self.ws_path.len > 0) self.alloc.free(self.ws_path);
     }
 
-    /// 禁用 native relay 客户端 — 关闭连接、停止 readerLoop 线程
-    /// 由中继服务获批后调用，防止双客户端冲突
+    /// 禁用 native relay 客户�?�?关闭连接、停�?readerLoop 线程
+    /// 由中继服务获批后调用，防止双客户端冲�?
     pub fn disable(self: *RelayClient) void {
         self.disabled = true;
         self.running = false;
@@ -1188,10 +1193,10 @@ pub const RelayClient = struct {
         self.loop.addFd(self.fd, posix.POLL.IN, self, &self.fd_vtbl);
         self.loop.addTimer(5000, self, &self.fd_vtbl);
 
-        std.debug.print("[relay/v2/reader] 启动 reader 线程\n", .{});
+        if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 启动 reader 线程", .{}); } else |_| {}
         self.loop.run();
         self.running = false;
-        std.debug.print("[relay/v2/reader] reader 线程退出\n", .{});
+        if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] reader 线程退出", .{}); } else |_| {}
     }
 
     fn reconnect(self: *RelayClient) bool {
@@ -1209,7 +1214,7 @@ pub const RelayClient = struct {
         while (retries < max_retries) {
             retries += 1;
             const wait_s = retries * 5;
-            std.debug.print("[relay/v2/reader] 重连 ({d}/{d}), {d}s...\n", .{ retries, max_retries, wait_s });
+            if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 重连 ({d}/{d}), {d}s...", .{ retries, max_retries, wait_s }); } else |_| {}
             var elapsed: u32 = 0;
             while (elapsed < wait_s) {
                 if (!self.running) return false;
@@ -1230,7 +1235,7 @@ pub const RelayClient = struct {
 
             self.fd = fd;
 
-            // 设置 TCP keepalive — 防止 NAT 超时断开空闲连接
+            // 设置 TCP keepalive �?防止 NAT 超时断开空闲连接
             setKeepalive(fd);
 
             self.udp_fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP) catch continue;
@@ -1253,7 +1258,7 @@ pub const RelayClient = struct {
                 _ = posix.write(self.fd, &ping) catch {};
             }
 
-            std.debug.print("[relay/v2/reader] 重连成功\n", .{});
+            if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 重连成功", .{}); } else |_| {}
             return true;
         }
         return false;
@@ -1270,7 +1275,7 @@ pub const RelayClient = struct {
                 clientReaderCleanup(self, loop);
                 return;
             }
-            std.debug.print("[relay/v2/reader] 读取错误: {}\n", .{err});
+            if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 读取错误: {}", .{err}); } else |_| {}
             clientReaderCleanup(self, loop);
             return;
         };
@@ -1280,7 +1285,7 @@ pub const RelayClient = struct {
         }
         self.read_len += n;
         self.last_recv_ms = std.time.milliTimestamp();
-        std.debug.print("[relay/v2/reader] 收到 {d} 字节\n", .{n});
+        if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 收到 {d} 字节", .{n}); } else |_| {}
 
         while (tryCompleteFrame(self.read_buf[0..self.read_len])) |frame_len| {
             const frame = self.read_buf[0..frame_len];
@@ -1329,21 +1334,21 @@ pub const RelayClient = struct {
         }
         const now = std.time.milliTimestamp();
 
-        // 超过 15s 未收到任何数据 → 连接已断开（NAT 超时 / 对端崩溃）
+        // 超过 15s 未收到任何数�?�?连接已断开（NAT 超时 / 对端崩溃�?
         if (now - self.last_recv_ms > 15_000) {
-            std.debug.print("[relay/v2] 连接空闲超时 (last_recv={d}ms), 重连\n", .{now - self.last_recv_ms});
+            if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2] 连接空闲超时 (last_recv={d}ms), 重连", .{now - self.last_recv_ms}); } else |_| {}
             clientReaderCleanup(self, loop);
             return;
         }
 
-        // 5s 无数据则发 PING 保活（不修改 last_recv_ms — 仅由 clientOnReadable 更新）
+        // 5s 无数据则�?PING 保活（不修改 last_recv_ms �?仅由 clientOnReadable 更新�?
         if (now - self.last_recv_ms > 5_000) {
             const ping: [1]u8 = .{FRAME_PING};
             _ = posix.write(self.fd, &ping) catch {
                 clientReaderCleanup(self, loop);
                 return;
             };
-            std.debug.print("[relay/v2] 发送 PING (idle={d}ms)\n", .{now - self.last_recv_ms});
+            if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2] 发送 PING (idle={d}ms)", .{now - self.last_recv_ms}); } else |_| {}
         }
 
         loop.addTimer(5000, self, &self.fd_vtbl);
@@ -1357,20 +1362,20 @@ pub const RelayClient = struct {
             loop.stop();
             return;
         }
-        std.debug.print("[relay/v2/reader] 连接断开, 尝试重连...\n", .{});
+        if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 连接断开, 尝试重连...", .{}); } else |_| {}
         if (self.reconnect()) {
             self.loop.addFd(self.fd, posix.POLL.IN, self, &self.fd_vtbl);
             self.last_recv_ms = std.time.milliTimestamp();
             loop.addTimer(5000, self, &self.fd_vtbl);
         } else {
-            std.debug.print("[relay/v2/reader] 重连失败, reader 退出\n", .{});
+            if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 重连失败, reader 退出", .{}); } else |_| {}
             self.running = false;
             loop.stop();
         }
     }
 
     fn clientUdpOnReadable(_: *anyopaque, _: posix.socket_t, _: *EventLoop) void {
-        // 共享 UDP socket — 用于 FRAME_FORWARD 响应路由
+        // 共享 UDP socket �?用于 FRAME_FORWARD 响应路由
         // TODO: 匹配 pending forwards
     }
 
@@ -1440,15 +1445,15 @@ pub const RelayClient = struct {
                 entry.event.set();
             },
             FRAME_PING => {
-                std.debug.print("[relay/v2/reader] 收到 PING, 回复 PONG\n", .{});
+                if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 收到 PING, 回复 PONG", .{}); } else |_| {}
                 const pong: [1]u8 = .{FRAME_PONG};
                 _ = posix.write(self.fd, &pong) catch {};
             },
             FRAME_PONG => {
-                std.debug.print("[relay/v2/reader] 收到 PONG\n", .{});
+                if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 收到 PONG", .{}); } else |_| {}
             },
             else => {
-                std.debug.print("[relay/v2/reader] 未知帧类型 {}\n", .{frame[0]});
+                if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[relay/v2/reader] 未知帧类型: {}", .{frame[0]}); } else |_| {}
             },
         }
     }
@@ -1459,7 +1464,7 @@ pub fn sendViaRelay(client: *RelayClient, target_ip_be: u32, target_port: u16, d
     return client.sendRequest(target_ip_be, target_port, data, recv_buf, timeout_ms);
 }
 
-/// 设置 TCP keepalive（所有平台 SO_KEEPALIVE，Linux 额外细粒度参数）
+/// 设置 TCP keepalive（所有平�?SO_KEEPALIVE，Linux 额外细粒度参数）
 fn setKeepalive(fd: posix.socket_t) void {
     const keepalive: u32 = 1;
     _ = posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(keepalive)) catch {};
@@ -1479,3 +1484,5 @@ comptime {
     _ = sendViaRelay;
     _ = setKeepalive;
 }
+
+

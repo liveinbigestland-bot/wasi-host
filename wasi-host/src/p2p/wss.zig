@@ -1,15 +1,17 @@
-/// WebSocket Secure 服务器 — 原生 WS/WSS 端点
+/// WebSocket Secure 服务�?�?原生 WS/WSS 端点
 ///
 /// 架构:
 ///   Client --wss://host/path--> WssServer --UDP--> ChordNode(:udp_port)
 ///
-/// 支持的传输:
+/// 支持的传�?
 ///   - WSS: TLS (OpenSSL) + WebSocket (Linux only)
-///   - WS:  纯 WebSocket (无 TLS, 跨平台)
+///   - WS:  �?WebSocket (�?TLS, 跨平�?
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const logging = @import("logging");
+const log = logging.log;
 
 const build_options = @import("build_options");
 
@@ -112,7 +114,7 @@ const tls_impl = if (tls_supported) struct {
     pub fn ctxFree(_: *anyopaque) void {}
 };
 
-// ── WSS 服务器 ────────────────────────────────────────────────────
+// ── WSS 服务�?────────────────────────────────────────────────────
 
 const BUF_SIZE = 65536;
 
@@ -149,7 +151,7 @@ pub const WssServer = struct {
             const key_z = try std.mem.concat(alloc, u8, &.{ key_file, "\x00" });
             defer alloc.free(key_z);
             ssl_ctx = tls_impl.createCtx(cert_z[0 .. cert_z.len - 1 :0], key_z[0 .. key_z.len - 1 :0]) catch |err| blk: {
-                std.debug.print("[wss] TLS 不可用 ({}), 降级为纯 WS\n", .{err});
+                log.info("[wss] TLS 不可用 ({}), 降级为纯 WS", .{err});
                 break :blk null;
             };
         }
@@ -167,7 +169,7 @@ pub const WssServer = struct {
         };
     }
 
-    /// 初始化 WS↔TCP relay 桥模式
+    /// 初始�?WS↔TCP relay 桥模�?
     pub fn initRelayBridge(alloc: std.mem.Allocator, listen_host: []const u8, port: u16, ws_path: []const u8, cert_file: []const u8, key_file: []const u8, tcp_host: []const u8, tcp_port: u16) !WssServer {
         var server = try init(alloc, listen_host, port, ws_path, cert_file, key_file, 0);
         alloc.free(server.ws_path);
@@ -188,16 +190,16 @@ pub const WssServer = struct {
         self.running = true;
         const transport = if (self.ssl_ctx != null) "WSS" else "WS";
         if (self.tcp_port > 0) {
-            std.debug.print("[wss] {s} TCP relay 桥已启动 :{d}{s} → TCP {s}:{d}\n", .{ transport, self.port, self.ws_path, self.tcp_host, self.tcp_port });
+            log.info("[wss] {s} TCP relay �������� :{d}{s} �� TCP {s}:{d}", .{ transport, self.port, self.ws_path, self.tcp_host, self.tcp_port });
         } else {
-            std.debug.print("[wss] {s} 服务器已启动 :{d}{s} → UDP :{d}\n", .{ transport, self.port, self.ws_path, self.udp_port });
+            log.info("[wss] {s} ������������ :{d}{s} �� UDP :{d}", .{ transport, self.port, self.ws_path, self.udp_port });
         }
 
         while (self.running) {
             var client_addr: std.net.Address = undefined;
             var addr_len: posix.socklen_t = @sizeOf(std.net.Address);
             const fd = posix.accept(self.listen_fd, &client_addr.any, &addr_len, 0) catch |err| {
-                if (self.running) std.debug.print("[wss] accept 错误: {}\n", .{err});
+                if (self.running) log.info("[wss] accept 错误: {}", .{err});
                 continue;
             };
 
@@ -205,7 +207,7 @@ pub const WssServer = struct {
                 const thread = std.Thread.spawn(.{}, handleTcpBridgeConnection, .{
                     fd, self.ssl_ctx, self.tcp_host, self.tcp_port,
                 }) catch |err| {
-                    std.debug.print("[wss] 线程创建失败: {}\n", .{err});
+                    log.info("[wss] 线程创建失败: {}", .{err});
                     closeSocket(fd);
                     continue;
                 };
@@ -214,7 +216,7 @@ pub const WssServer = struct {
                 const thread = std.Thread.spawn(.{}, handleConnection, .{
                     fd, self.ssl_ctx, self.udp_port,
                 }) catch |err| {
-                    std.debug.print("[wss] 线程创建失败: {}\n", .{err});
+                    log.info("[wss] 线程创建失败: {}", .{err});
                     closeSocket(fd);
                     continue;
                 };
@@ -237,7 +239,7 @@ fn handleConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, udp_port: u16) voi
     // TLS handshake
     const ssl = if (ssl_ctx) |ctx| blk: {
         break :blk tls_impl.sslNew(ctx, fd) catch |err| {
-            std.debug.print("[wss] TLS 握手失败: {}\n", .{err});
+            log.info("[wss] TLS 握手失败: {}", .{err});
             return;
         };
     } else null;
@@ -247,14 +249,14 @@ fn handleConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, udp_port: u16) voi
     var http_buf: [4096]u8 = undefined;
     const http_n = readHttpRequest(ssl, fd, &http_buf) catch |err| {
         if (err != error.ConnectionClosed) {
-            std.debug.print("[wss] HTTP 请求读取失败: {}\n", .{err});
+            log.info("[wss] HTTP 请求读取失败: {}", .{err});
         }
         return;
     };
 
     // 检查是否为 WebSocket 升级请求
     if (std.mem.indexOf(u8, http_buf[0..http_n], "Upgrade: websocket") == null) {
-        // 非 WS 请求（如健康检查），回应 200 OK
+        // �?WS 请求（如健康检查），回�?200 OK
         const resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK";
         _ = wsWriteAll(ssl, fd, resp) catch {};
         return;
@@ -262,7 +264,7 @@ fn handleConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, udp_port: u16) voi
 
     // WebSocket 升级握手
     sendWSUpgrade(ssl, fd, http_buf[0..http_n]) catch |err| {
-        std.debug.print("[wss] WebSocket 升级失败: {}\n", .{err});
+        log.info("[wss] WebSocket 升级失败: {}", .{err});
         return;
     };
 
@@ -274,45 +276,45 @@ fn handleConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, udp_port: u16) voi
     var frame_buf: [BUF_SIZE]u8 = undefined;
     var resp_buf: [BUF_SIZE]u8 = undefined;
 
-    std.debug.print("[wss] 客户端已连接\n", .{});
+    log.info("[wss] 客户端已连接", .{});
 
-    // WS ↔ UDP 桥接循环
+    // WS �?UDP 桥接循环
     while (true) {
         const n = wsRecvFrame(ssl, fd, &frame_buf) catch |err| {
             if (err != error.ConnectionClosed and err != error.Timeout) {
-                std.debug.print("[wss] WS 接收错误: {}\n", .{err});
+                log.info("[wss] WS 接收错误: {}", .{err});
             }
             return;
         };
 
-        // UDP 转发到本地 Chord
+        // UDP 转发到本�?Chord
         _ = posix.sendto(udp_fd, frame_buf[0..n], 0, &target_addr.any, target_addr.getOsSockLen()) catch |err| {
-            std.debug.print("[wss] UDP 转发错误: {}\n", .{err});
+            log.info("[wss] UDP 转发错误: {}", .{err});
             return;
         };
 
-        // 等待 UDP 响应（5s 超时）
+        // 等待 UDP 响应�?s 超时�?
         setRecvTimeout(udp_fd, 5000);
         var resp_addr: std.net.Address = undefined;
         var resp_addr_len: posix.socklen_t = @sizeOf(std.net.Address);
         const resp_n = posix.recvfrom(udp_fd, &resp_buf, 0, &resp_addr.any, &resp_addr_len) catch |err| {
             if (err == error.WouldBlock or err == error.Timeout) {
-                // 无响应（notify 等单向消息），继续读取下一帧
+                // 无响应（notify 等单向消息），继续读取下一�?
                 continue;
             }
-            std.debug.print("[wss] UDP recv 错误: {}\n", .{err});
+            log.info("[wss] UDP recv 错误: {}", .{err});
             return;
         };
 
         // WS 响应回写
         wsSendFrame(ssl, fd, resp_buf[0..resp_n]) catch |err| {
-            std.debug.print("[wss] WS 发送错误: {}\n", .{err});
+            log.info("[wss] WS 发送错误: {}", .{err});
             return;
         };
     }
 }
 
-// ── TCP Relay Bridge (WS ↔ TCP) ──────────────────────────────────
+// ── TCP Relay Bridge (WS �?TCP) ──────────────────────────────────
 
 fn handleTcpBridgeConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, tcp_host: []const u8, tcp_port: u16) void {
     defer closeSocket(fd);
@@ -320,7 +322,7 @@ fn handleTcpBridgeConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, tcp_host:
     // TLS handshake
     const ssl = if (ssl_ctx) |ctx| blk: {
         break :blk tls_impl.sslNew(ctx, fd) catch |err| {
-            std.debug.print("[wss] TLS 握手失败: {}\n", .{err});
+            log.info("[wss] TLS 握手失败: {}", .{err});
             return;
         };
     } else null;
@@ -330,14 +332,14 @@ fn handleTcpBridgeConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, tcp_host:
     var http_buf: [4096]u8 = undefined;
     const http_n = readHttpRequest(ssl, fd, &http_buf) catch |err| {
         if (err != error.ConnectionClosed) {
-            std.debug.print("[wss] HTTP 请求读取失败: {}\n", .{err});
+            log.info("[wss] HTTP 请求读取失败: {}", .{err});
         }
         return;
     };
 
     // WebSocket upgrade
     sendWSUpgrade(ssl, fd, http_buf[0..http_n]) catch |err| {
-        std.debug.print("[wss] WebSocket 升级失败: {}\n", .{err});
+        log.info("[wss] WebSocket 升级失败: {}", .{err});
         return;
     };
 
@@ -347,13 +349,13 @@ fn handleTcpBridgeConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, tcp_host:
 
     const relay_addr = std.net.Address.parseIp(tcp_host, tcp_port) catch return;
     posix.connect(relay_fd, &relay_addr.any, relay_addr.getOsSockLen()) catch |err| {
-        std.debug.print("[wss] TCP relay 连接失败: {}\n", .{err});
+        log.info("[wss] TCP relay 连接失败: {}", .{err});
         return;
     };
 
-    std.debug.print("[wss] WS↔TCP 桥已建立 → {s}:{d}\n", .{ tcp_host, tcp_port });
+    log.info("[wss] WS↔TCP 桥已建立 at {s}:{d}", .{ tcp_host, tcp_port });
 
-    // 双向转发: WS ↔ TCP
+    // 双向转发: WS �?TCP
     var running = std.atomic.Value(bool).init(true);
 
     const t1 = std.Thread.spawn(.{}, bridgeWsToTcp, .{ ssl, fd, relay_fd, &running }) catch return;
@@ -364,7 +366,7 @@ fn handleTcpBridgeConnection(fd: posix.socket_t, ssl_ctx: ?*anyopaque, tcp_host:
 
     t1.join();
     t2.join();
-    std.debug.print("[wss] WS↔TCP 桥已关闭\n", .{});
+    log.info("[wss] WS↔TCP 桥已关闭", .{});
 }
 
 fn bridgeWsToTcp(ws_ssl: ?*anyopaque, ws_fd: posix.socket_t, tcp_fd: posix.socket_t, running: *std.atomic.Value(bool)) void {
@@ -391,7 +393,7 @@ fn bridgeTcpToWs(tcp_fd: posix.socket_t, ws_ssl: ?*anyopaque, ws_fd: posix.socke
 // ── HTTP Upgrade ──────────────────────────────────────────────────
 
 fn sendWSUpgrade(ssl: ?*anyopaque, fd: posix.socket_t, request: []const u8) !void {
-    // 找 Sec-WebSocket-Key
+    // �?Sec-WebSocket-Key
     const key_hdr = "Sec-WebSocket-Key: ";
     const key_start = std.mem.indexOf(u8, request, key_hdr) orelse return error.BadRequest;
     const key_start_idx = key_start + key_hdr.len;
@@ -423,7 +425,7 @@ fn sendWSUpgrade(ssl: ?*anyopaque, fd: posix.socket_t, request: []const u8) !voi
 
 // ── WebSocket 帧（服务器端）───────────────────────────────────────
 
-/// 接收客户端 WS 帧（CLIENT→SERVER: 必须掩码）
+/// 接收客户�?WS 帧（CLIENT→SERVER: 必须掩码�?
 fn wsRecvFrame(ssl: ?*anyopaque, fd: posix.socket_t, buf: []u8) !usize {
     var first: [2]u8 = undefined;
     try wsReadExact(ssl, fd, &first);
@@ -444,7 +446,7 @@ fn wsRecvFrame(ssl: ?*anyopaque, fd: posix.socket_t, buf: []u8) !usize {
 
     if (payload_len > buf.len) return error.MessageTooBig;
 
-    // 先读取 payload（控制帧也需要读取，RFC 6455 §5.5）
+    // 先读�?payload（控制帧也需要读取，RFC 6455 §5.5�?
     if (masked) {
         var mk: [4]u8 = undefined;
         try wsReadExact(ssl, fd, &mk);
@@ -467,7 +469,7 @@ fn wsRecvFrame(ssl: ?*anyopaque, fd: posix.socket_t, buf: []u8) !usize {
     // Close
     if (opcode == 0x8) return error.ConnectionClosed;
 
-    // 跳过非 Binary/Text 帧
+    // 跳过�?Binary/Text �?
     if (opcode != 0x2 and opcode != 0x1) {
         return wsRecvFrame(ssl, fd, buf);
     }
@@ -475,7 +477,7 @@ fn wsRecvFrame(ssl: ?*anyopaque, fd: posix.socket_t, buf: []u8) !usize {
     return payload_len;
 }
 
-/// 发送 WS 帧到客户端（SERVER→CLIENT: 不掩码）
+/// 发�?WS 帧到客户端（SERVER→CLIENT: 不掩码）
 fn wsSendFrame(ssl: ?*anyopaque, fd: posix.socket_t, data: []const u8) !void {
     var hdr: [10]u8 = undefined;
     var hdr_len: usize = 0;
@@ -498,7 +500,7 @@ fn wsSendFrame(ssl: ?*anyopaque, fd: posix.socket_t, data: []const u8) !void {
     if (data.len > 0) _ = try wsWriteAll(ssl, fd, data);
 }
 
-// ── I/O 辅助（统一 TLS / 裸 TCP）──────────────────────────────────
+// ── I/O 辅助（统一 TLS / �?TCP）──────────────────────────────────
 
 fn wsRead(ssl: ?*anyopaque, fd: posix.socket_t, buf: []u8) !usize {
     if (ssl) |s| return tls_impl.sslRead(s, buf);
@@ -565,3 +567,4 @@ fn setRecvTimeout(fd: posix.socket_t, timeout_ms: u64) void {
         _ = posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(tv)) catch {};
     }
 }
+

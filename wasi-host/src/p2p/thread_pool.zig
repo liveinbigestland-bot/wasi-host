@@ -3,6 +3,7 @@
 /// 每个 Worker 运行一个独立的 EventLoop，支持跨线程任务队列和唤醒。
 /// 用于 RelayServer 多线程事件驱动 I/O。
 const std = @import("std");
+const logging = @import("logging");
 const EventLoop = @import("event_loop.zig").EventLoop;
 
 const Worker = struct {
@@ -11,9 +12,9 @@ const Worker = struct {
     thread: ?std.Thread,
 
     fn run(worker: *Worker) void {
-        std.debug.print("[thread_pool] Worker {d} 启动\n", .{worker.id});
+        if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[thread_pool] Worker {d} 启动", .{worker.id}); } else |_| {}
         worker.loop.run();
-        std.debug.print("[thread_pool] Worker {d} 退出\n", .{worker.id});
+        if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[thread_pool] Worker {d} 退出", .{worker.id}); } else |_| {}
     }
 };
 
@@ -34,7 +35,7 @@ pub const ThreadPool = struct {
                 .thread = null,
             };
             worker.loop.initWakeup() catch |err| {
-                std.debug.print("[thread_pool] worker {d} wakeup 初始化失败: {}\n", .{ i, err });
+                if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[thread_pool] worker {d} wakeup 初始化失败: {}", .{ i, err }); } else |_| {}
             };
         }
 
@@ -52,7 +53,7 @@ pub const ThreadPool = struct {
     pub fn start(self: *ThreadPool) void {
         for (self.workers) |*worker| {
             worker.thread = std.Thread.spawn(.{}, Worker.run, .{worker}) catch |err| blk: {
-                std.debug.print("[thread_pool] worker {d} 启动失败: {}\n", .{ worker.id, err });
+                if (logging.getLogger("p2p.@basename")) |logger| { logger.info("[thread_pool] worker {d} 启动失败: {}", .{ worker.id, err }); } else |_| {}
                 break :blk null;
             };
         }

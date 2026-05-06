@@ -1,31 +1,33 @@
-/// 网络能力与端口可达性自动检测
+/// 网络能力与端口可达性自动检�?
 /// 启动时检测当前节点的网络受限等级，自动选择传输模式
 ///
-/// 检测原理:
+/// 检测原�?
 ///   1. 本地监听 TCP 测试端口
-///   2. 获取公网出口 IP（api.ipify.org）
+///   2. 获取公网出口 IP（api.ipify.org�?
 ///   3. 调用公网探测服务回连本机（验证端口公网可达性）
 ///   4. 本地环回探测（验证端口本地可用性）
 ///   5. 综合判定等级
 ///
 /// 等级映射:
-///   full_public  → dual 模式（种子节点/超级节点）
-///   lan_only     → udp 模式（内网互通，外网走中继）
-///   strict_limit → tcp 模式（仅出站 TCP，强制中继）
+///   full_public  �?dual 模式（种子节�?超级节点�?
+///   lan_only     �?udp 模式（内网互通，外网走中继）
+///   strict_limit �?tcp 模式（仅出站 TCP，强制中继）
 const std = @import("std");
 const posix = std.posix;
+const logging = @import("logging");
+const log = logging.log;
 
 /// 网络能力受限等级
 pub const NetLimitLevel = enum {
-    /// 公网端口完全可达，可被外部主动连接
+    /// 公网端口完全可达，可被外部主动连�?
     full_public,
     /// 仅内网可达，外网无法入站
     lan_only,
-    /// 严格受限：NAT/容器/防火墙，完全无法被外部访问
+    /// 严格受限：NAT/容器/防火墙，完全无法被外部访�?
     strict_limit,
 };
 
-/// 端口外网可达性检测结果
+/// 端口外网可达性检测结�?
 pub const PortReachResult = struct {
     public_ip: ?[]const u8,
     test_port: u16,
@@ -34,13 +36,13 @@ pub const PortReachResult = struct {
     level: NetLimitLevel,
 };
 
-/// 执行全套网络能力检测
-/// 使用 TCP 监听 + 公网探测服务验证端口可达性
-/// test_port: 用于检测的端口号（通常使用 listen_port）
-/// listen_host: 配置的监听地址（用于判断是否为内网 IP）
-/// prefer_ipv4: 如果为 true，获取公网 IP 时优先使用 IPv4（relay 协议不支持 IPv6）
+/// 执行全套网络能力检�?
+/// 使用 TCP 监听 + 公网探测服务验证端口可达�?
+/// test_port: 用于检测的端口号（通常使用 listen_port�?
+/// listen_host: 配置的监听地址（用于判断是否为内网 IP�?
+/// prefer_ipv4: 如果�?true，获取公�?IP 时优先使�?IPv4（relay 协议不支�?IPv6�?
 pub fn fullNetDetect(alloc: std.mem.Allocator, test_port: u16, listen_host: []const u8, prefer_ipv4: bool) !PortReachResult {
-    // ── 1. 创建 TCP 监听（尝试端口、+1、+2） ──
+    // ── 1. 创建 TCP 监听（尝试端口�?1�?2�?──
     var actual_port: u16 = test_port;
     const fd = blk: {
         for ([_]u16{ test_port, test_port + 1, test_port + 2 }) |try_port| {
@@ -71,9 +73,9 @@ pub fn fullNetDetect(alloc: std.mem.Allocator, test_port: u16, listen_host: []co
     // ── 2. 获取公网出口 IP ──
     const pub_ip = getPublicIP(alloc, prefer_ipv4) catch null;
     if (pub_ip) |ip| {
-        std.debug.print("[net_detect] 公网 IP: {s}\n", .{ip});
+        log.info("[net_detect] 公网 IP: {s}", .{ip});
     } else {
-        std.debug.print("[net_detect] 无法获取公网 IP（可能无外网连接）\n", .{});
+        log.info("[net_detect] 无法获取公网 IP（可能无外网连接）");
     }
 
     // ── 3. 并发执行外网/内网探测 ──
@@ -86,47 +88,47 @@ pub fn fullNetDetect(alloc: std.mem.Allocator, test_port: u16, listen_host: []co
     const thread_lan = try std.Thread.spawn(.{}, lanProbe, .{ actual_port, &lan_ok });
     errdefer thread_lan.join();
 
-    // ── 4. 触发公网探测服务（在独立线程中运行，避免服务不可用阻塞 detection） ──
+    // ── 4. 触发公网探测服务（在独立线程中运行，避免服务不可用阻�?detection�?──
     if (pub_ip) |ip| {
         const ip_copy = alloc.dupe(u8, ip) catch null;
         if (ip_copy) |ipc| {
             if (std.Thread.spawn(.{}, probeBg, .{ alloc, ipc, actual_port })) |pt| {
                 pt.detach();
             } else |_| {
-                alloc.free(ipc); // 线程创建失败时释放
+                alloc.free(ipc); // 线程创建失败时释�?
             }
         }
     }
 
-    // ── 5. 等待检测完成（lanProbe 很快完成；ext 等待 7s） ──
+    // ── 5. 等待检测完成（lanProbe 很快完成；ext 等待 7s�?──
     thread_lan.join();
-    // waitConn 内部会忽略 lanProbe 的环回连接，继续等待真正的外网连接
+    // waitConn 内部会忽�?lanProbe 的环回连接，继续等待真正的外网连�?
     thread_ext.join();
     posix.close(fd);
 
     // ── 6. 判定网络等级 ──
-    //    full_public: 外网回连成功 → 公网可达
-    //    full_public: listen_host == 公网 IP → VPS（如 外2 listen_host=192.140.185.171）
-    //    strict_limit: 有公网 IP 但不匹配 listen_host → NAT/防火墙（如 ext on alwaysdata）
-    //    lan_only:    监听私网 IP → 内网节点（如 59/60）
-    //    strict_limit: 0.0.0.0 + 无公网 IP → 无法判定，保守受限
+    //    full_public: 外网回连成功 �?公网可达
+    //    full_public: listen_host == 公网 IP �?VPS（如 �? listen_host=192.140.185.171�?
+    //    strict_limit: 有公�?IP 但不匹配 listen_host �?NAT/防火墙（�?ext on alwaysdata�?
+    //    lan_only:    监听私网 IP �?内网节点（如 59/60�?
+    //    strict_limit: 0.0.0.0 + 无公�?IP �?无法判定，保守受�?
     const is_private = isPrivateIP(listen_host);
     const pub_ip_matches_listen = if (pub_ip) |ip| std.mem.eql(u8, ip, listen_host) else false;
     const level: NetLimitLevel = if (ext_ok)
         .full_public
     else if (pub_ip_matches_listen)
-        .full_public // listen_host 与公网 IP 一致 → VPS，端口开放
+        .full_public // listen_host 与公�?IP 一�?�?VPS，端口开�?
     else if (is_private)
-        .lan_only // 监听私网 IP → 内网节点
+        .lan_only // 监听私网 IP �?内网节点
     else if (pub_ip != null)
-        .strict_limit // 有公网 IP 但 inbound 被屏蔽
+        .strict_limit // 有公�?IP �?inbound 被屏�?
     else if (lan_ok)
-        .strict_limit // 监听 0.0.0.0，无公网 IP → 严格受限
+        .strict_limit // 监听 0.0.0.0，无公网 IP �?严格受限
     else
         .strict_limit;
 
-    // 打印检测结果
-    std.debug.print("[net_detect] 检测完成: port={d} ext={} lan={} level={s}\n", .{
+    // 打印检测结�?
+    std.debug.print("[net_detect] 检测完�? port={d} ext={} lan={} level={s}\n", .{
         actual_port, ext_ok, lan_ok, @tagName(level),
     });
 
@@ -139,7 +141,7 @@ pub fn fullNetDetect(alloc: std.mem.Allocator, test_port: u16, listen_host: []co
     };
 }
 
-/// 等待外部入站连接（忽略环回连接，避免 lanProbe 干扰）
+/// 等待外部入站连接（忽略环回连接，避免 lanProbe 干扰�?
 /// 使用 poll 实现超时控制
 fn waitConn(fd: posix.socket_t, ok: *bool, timeout_ms: u64) void {
     var poll_fds = [1]posix.pollfd{
@@ -161,9 +163,9 @@ fn waitConn(fd: posix.socket_t, ok: *bool, timeout_ms: u64) void {
             return;
         };
 
-        if (ready == 0) continue; // poll 超时，继续循环
+        if (ready == 0) continue; // poll 超时，继续循�?
 
-        // 有连接到达，accept 并检查来源
+        // 有连接到达，accept 并检查来�?
         var addr: posix.sockaddr = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
         const client_fd = posix.accept(fd, &addr, &addr_len, 0) catch {
@@ -172,19 +174,19 @@ fn waitConn(fd: posix.socket_t, ok: *bool, timeout_ms: u64) void {
         };
         posix.close(client_fd);
 
-        // 检查是否来自 127.0.0.1（lanProbe）：忽略并继续等待
+        // 检查是否来�?127.0.0.1（lanProbe）：忽略并继续等�?
         const addr_in = @as(*const posix.sockaddr.in, @alignCast(@ptrCast(&addr)));
         if (addr_in.addr == std.mem.nativeToBig(u32, 0x7f000001)) continue;
 
-        ok.* = true; // 收到非环回连接 → 外网可达
+        ok.* = true; // 收到非环回连�?�?外网可达
         return;
     }
 }
 
 /// 尝试通过 IPv4-only 连接获取公网 IP
-/// 当 prefer_ipv4 时，手动将 hostname 解析为 IPv4 地址并连接
+/// �?prefer_ipv4 时，手动�?hostname 解析�?IPv4 地址并连�?
 fn getPublicIPViaIPv4(alloc: std.mem.Allocator, hostname: []const u8, port: u16) !?[]const u8 {
-    // 解析 hostname 的 DNS 记录
+    // 解析 hostname �?DNS 记录
     const addr_list = try std.net.getAddressList(alloc, hostname, port);
     defer addr_list.deinit();
 
@@ -213,19 +215,19 @@ fn getPublicIPViaIPv4(alloc: std.mem.Allocator, hostname: []const u8, port: u16)
 }
 
 /// 获取公网出口 IP
-/// 使用原始 TCP 连接（避免 std.http.Client 在某些平台上的断言 bug）
-/// 注: api.ipify.org 被 Cloudflare 保护，部分 VPS 连接受阻，改用 icanhazip.com
-/// prefer_ipv4: 如果为 true，强制使用 IPv4 连接（返回 IPv4 地址）
+/// 使用原始 TCP 连接（避�?std.http.Client 在某些平台上的断言 bug�?
+/// �? api.ipify.org �?Cloudflare 保护，部�?VPS 连接受阻，改�?icanhazip.com
+/// prefer_ipv4: 如果�?true，强制使�?IPv4 连接（返�?IPv4 地址�?
 pub fn getPublicIP(alloc: std.mem.Allocator, prefer_ipv4: bool) !?[]const u8 {
     // 优先使用 IPv4 连接
     if (prefer_ipv4) {
         if (try getPublicIPViaIPv4(alloc, "icanhazip.com", 80)) |ip| {
             return ip;
         }
-        std.debug.print("[net_detect] IPv4 连接失败，回退到默认 DNS 解析\n", .{});
+        log.info("[net_detect] IPv4 连接失败，回退到默认 DNS 解析", .{});
     }
 
-    // 默认：使用系统 DNS 解析
+    // 默认：使用系�?DNS 解析
     var stream = std.net.tcpConnectToHost(alloc, "icanhazip.com", 80) catch return null;
     defer stream.close();
 
@@ -245,7 +247,7 @@ pub fn getPublicIP(alloc: std.mem.Allocator, prefer_ipv4: bool) !?[]const u8 {
 }
 
 /// 请求外网探测服务主动回拨本机端口
-/// 使用原始 TCP 请求（避免 std.http.Client 断言 bug）
+/// 使用原始 TCP 请求（避�?std.http.Client 断言 bug�?
 fn probeExternalConnect(alloc: std.mem.Allocator, pub_ip: []const u8, port: u16) !bool {
     var stream = std.net.tcpConnectToHost(alloc, "portcheck.tcpiputils.com", 80) catch return false;
     defer stream.close();
@@ -262,12 +264,12 @@ fn probeExternalConnect(alloc: std.mem.Allocator, pub_ip: []const u8, port: u16)
 /// 后台运行 probeExternalConnect（用于独立线程，避免阻塞主检测流程）
 fn probeBg(alloc: std.mem.Allocator, pub_ip: []const u8, port: u16) void {
     _ = probeExternalConnect(alloc, pub_ip, port) catch {
-        // 探测服务不可用不影响主流程
+        // 探测服务不可用不影响主流�?
     };
     alloc.free(pub_ip);
 }
 
-/// 内网自探测：判断端口是否能本地连通
+/// 内网自探测：判断端口是否能本地连�?
 fn lanProbe(port: u16, ok: *bool) void {
     const addr = std.net.Address.parseIp("127.0.0.1", port) catch {
         ok.* = false;
@@ -281,8 +283,8 @@ fn lanProbe(port: u16, ok: *bool) void {
     ok.* = true;
 }
 
-/// 判断是否为私有 IP 地址（RFC 1918）
-/// 用于区分内网节点（59/60）与公网受限节点（ext 监听 0.0.0.0）
+/// 判断是否为私�?IP 地址（RFC 1918�?
+/// 用于区分内网节点�?9/60）与公网受限节点（ext 监听 0.0.0.0�?
 fn isPrivateIP(host: []const u8) bool {
     // 10.0.0.0/8
     if (std.mem.startsWith(u8, host, "10.")) return true;
@@ -293,7 +295,7 @@ fn isPrivateIP(host: []const u8) bool {
     }
     // 192.168.0.0/16
     if (std.mem.startsWith(u8, host, "192.168.")) return true;
-    // 127.0.0.0/8（环回地址）
+    // 127.0.0.0/8（环回地址�?
     if (std.mem.startsWith(u8, host, "127.")) return true;
     return false;
 }
@@ -305,3 +307,4 @@ pub fn hasInternet() bool {
     sock.close();
     return true;
 }
+

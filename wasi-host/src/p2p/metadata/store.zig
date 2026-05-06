@@ -1,6 +1,8 @@
 /// DHT KV 存储：内存 HashMap + 文件持久化
 
 const std = @import("std");
+const logging = @import("logging");
+const log = logging.log;
 const meta_types = @import("types.zig");
 const DHTEntry = meta_types.DHTEntry;
 const Permission = meta_types.Permission;
@@ -63,7 +65,7 @@ pub const KVStore = struct {
                 self.next_version = entry.version + 1;
             }
         }
-        std.debug.print("[store] 已加载 {d} 条记录\n", .{snapshot.entries.len});
+        log.info("[store] 已加载 {d} 条记录", .{snapshot.entries.len});
     }
 
     /// 持久化到磁盘
@@ -102,7 +104,7 @@ pub const KVStore = struct {
         try file.sync();
 
         std.fs.cwd().rename(tmp_path, path) catch |err| {
-            std.debug.print("[store] 重命名持久化文件失败: {}\n", .{err});
+            log.info("[store] 重命名持久化文件失败: {}", .{err});
         };
     }
 

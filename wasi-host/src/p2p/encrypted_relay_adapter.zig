@@ -1,18 +1,20 @@
-/// Encrypted Relay Adapter — 单 reader 架构
+/// Encrypted Relay Adapter �?�?reader 架构
 ///
 /// 包装 relay/client.RelayClient，为 ChordNode.sendAndWait() 提供
-/// 同步请求/响应模式。
+/// 同步请求/响应模式�?
 ///
-/// ## 单 Reader 架构
+/// ## �?Reader 架构
 ///
-/// readerLoop 是唯一读取 TCP fd 的线程，消除了 readerLoop 与 sendRequest
-/// 之间的 fd 竞争（原 ~30% 超时率）。sendRequest 写入请求后轮询共享响应缓冲。
+/// readerLoop 是唯一读取 TCP fd 的线程，消除�?readerLoop �?sendRequest
+/// 之间�?fd 竞争（原 ~30% 超时率）。sendRequest 写入请求后轮询共享响应缓冲�?
 ///
 /// 转发数据（其他节点的入站消息）通过 readerLoop 注入本地 UDP 端口
-/// （127.0.0.1:listen_port），由 Chord 节点的消息处理管线处理。
+/// �?27.0.0.1:listen_port），�?Chord 节点的消息处理管线处理�?
 const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
+const logging = @import("logging");
+const log = logging.log;
 
 const relay_client = @import("../relay/client.zig");
 const NodeID = @import("../relay/registry.zig").NodeID;
@@ -28,7 +30,7 @@ pub const EncryptedRelayConfig = struct {
     listen_port: u16 = 20808,
 };
 
-/// 单请求挂起状态 — readerLoop 与 sendRequest 之间的共享通信区
+/// 单请求挂起状�?�?readerLoop �?sendRequest 之间的共享通信�?
 const PendingResponse = struct {
     active: bool = false,
     ready: bool = false,
@@ -51,9 +53,9 @@ pub const EncryptedRelayAdapter = struct {
     /// 当前退避截止时间戳（毫秒）
     last_backoff_end_ms: i64 = 0,
 
-    /// 当前中继索引（relay switching）
+    /// 当前中继索引（relay switching�?
     relay_index: usize = 0,
-    /// 当前中继的连续尝试次数
+    /// 当前中继的连续尝试次�?
     attempts_on_relay: u32 = 0,
     /// 每个中继最大尝试次数后切换
     relay_switch_threshold: u32 = 3,
@@ -62,7 +64,7 @@ pub const EncryptedRelayAdapter = struct {
 
     read_buf: [65536]u8,
 
-    /// 单 reader 共享响应区 — 无锁，仅两个原子 bool
+    /// �?reader 共享响应�?�?无锁，仅两个原子 bool
     pending: PendingResponse,
 
     pub fn init(alloc: std.mem.Allocator, config: EncryptedRelayConfig, node_id: [20]u8, secret_key: [32]u8, public_key: [32]u8) !EncryptedRelayAdapter {
@@ -100,7 +102,7 @@ pub const EncryptedRelayAdapter = struct {
         self.attempts_on_relay = 0;
         self.consecutive_failures = 0;
         self.connected = false;
-        std.debug.print("[encrypted_relay] 已重置 exhausted 状态\n", .{});
+        log.info("[encrypted_relay] 已重置 exhausted 状态", .{});
     }
 
     pub fn connect(self: *EncryptedRelayAdapter) !void {
@@ -110,11 +112,11 @@ pub const EncryptedRelayAdapter = struct {
         self.consecutive_failures = 0;
     }
 
-    /// 同步发送请求并等待响应 — 不读取 fd，由 readerLoop 负责填充响应
+    /// 同步发送请求并等待响应 �?不读�?fd，由 readerLoop 负责填充响应
     pub fn sendRequest(self: *EncryptedRelayAdapter, target_id: [20]u8, data: []const u8, resp_buf: []u8, timeout_ms: u64) !usize {
         try self.ensureConnected();
 
-        // 注册等待 — readerLoop 会将下一条 CMD_DATA 存入 pending
+        // 注册等待 �?readerLoop 会将下一�?CMD_DATA 存入 pending
         self.pending.active = true;
         self.pending.ready = false;
         defer self.pending.active = false;
@@ -134,7 +136,7 @@ pub const EncryptedRelayAdapter = struct {
             std.time.sleep(1 * std.time.ns_per_ms);
         }
 
-        // 超时 — 不主动重连，readerLoop 已独立处理实际断线重连
+        // 超时 �?不主动重连，readerLoop 已独立处理实际断线重�?
         // sendRequest 超时通常意味着目标节点暂时不可达，而非本节点连接断开
         // 若在此处重连会踢掉当前会话，导致其他节点对本节点的转发也失败（级联效应）
         self.consecutive_failures += 1;
@@ -152,7 +154,7 @@ pub const EncryptedRelayAdapter = struct {
 
         while (true) {
             if (adapter.relays_exhausted) {
-                std.debug.print("[encrypted_relay/reader] 所有中继不可用, reader 退出\n", .{});
+                log.info("[encrypted_relay/reader] 所有中继不可用, reader 退出", .{});
                 return;
             }
 
@@ -165,30 +167,30 @@ pub const EncryptedRelayAdapter = struct {
                     continue;
                 }
 
-                // 连接断开 — 指数退避重连
+                // 连接断开 �?指数退避重�?
                 consecutive_fails += 1;
                 adapter.connected = false;
 
                 if (adapter.relays_exhausted) return;
 
-                // 连续失败达到阈值 → 切换中继
+                // 连续失败达到阈�?�?切换中继
                 adapter.attempts_on_relay += 1;
                 if (adapter.attempts_on_relay >= adapter.relay_switch_threshold) {
                     adapter.relay_index += 1;
                     adapter.attempts_on_relay = 0;
                     if (adapter.relay_index >= adapter.config.relays.len) {
                         adapter.relays_exhausted = true;
-                        std.debug.print("[encrypted_relay/reader] 所有 {d} 个中继均不可用, 标记 exhausted\n", .{adapter.config.relays.len});
+                        log.info("[encrypted_relay/reader] 所有 {} 个中继均不可用，标记 exhausted", .{adapter.config.relays.len});
                         return;
                     }
-                    std.debug.print("[encrypted_relay/reader] 切换到中继[{d}]\n", .{adapter.relay_index});
+                    log.info("[encrypted_relay/reader] 切换到中继[{}]", .{adapter.relay_index});
                 }
 
                 const backoff_ms = @min(
                     @as(u64, 1000) * (@as(u64, 1) << @min(consecutive_fails, @as(u32, 6))),
                     @as(u64, 60000),
                 );
-                std.debug.print("[encrypted_relay/reader] 断开, {d}ms 后重连(#{d}, 中继[{d}])\n", .{ backoff_ms, consecutive_fails, adapter.relay_index });
+                log.info("[encrypted_relay/reader] 断开, {}ms 后重试#{}, 中继[{}])", .{ backoff_ms, consecutive_fails, adapter.relay_index });
                 std.time.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
 
                 if (adapter.relays_exhausted) return;
@@ -197,7 +199,7 @@ pub const EncryptedRelayAdapter = struct {
                 adapter.client.register() catch continue;
                 adapter.connected = true;
                 consecutive_fails = 0;
-                std.debug.print("[encrypted_relay/reader] 重连成功\n", .{});
+                log.info("[encrypted_relay/reader] 重连成功", .{});
                 continue;
             };
             if (n == 0) {
@@ -211,7 +213,7 @@ pub const EncryptedRelayAdapter = struct {
                     adapter.attempts_on_relay = 0;
                     if (adapter.relay_index >= adapter.config.relays.len) {
                         adapter.relays_exhausted = true;
-                        std.debug.print("[encrypted_relay/reader] 所有 {d} 个中继均不可用, 标记 exhausted\n", .{adapter.config.relays.len});
+                        log.info("[encrypted_relay/reader] 所有 {} 个中继均不可用，标记 exhausted", .{adapter.config.relays.len});
                         return;
                     }
                 }
@@ -238,7 +240,7 @@ pub const EncryptedRelayAdapter = struct {
 
             if (buf[0] != relay_client.CMD_DATA) continue;
 
-            // sendRequest 挂起中 → 存为响应
+            // sendRequest 挂起�?�?存为响应
             if (adapter.pending.active) {
                 if (n > 21) {
                     adapter.pending.len = n - 21;
@@ -248,7 +250,7 @@ pub const EncryptedRelayAdapter = struct {
                 continue;
             }
 
-            // 转发数据：包含 [sender_id(20)][payload]，通过本地 UDP 注入 Chord 节点
+            // 转发数据：包�?[sender_id(20)][payload]，通过本地 UDP 注入 Chord 节点
             if (n > 21) {
                 const sender_id = buf[1..21];
                 const payload = buf[21..n];
@@ -310,3 +312,4 @@ fn setRecvTimeout(fd: posix.socket_t, timeout_ms: u64) void {
         @as(u32, @intCast(@sizeOf(posix.timeval))),
     );
 }
+

@@ -11,6 +11,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const logging = @import("logging");
+const log = logging.log;
 
 fn closeSocket(fd: posix.socket_t) void {
     if (builtin.os.tag == .windows) {
