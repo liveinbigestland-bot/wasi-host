@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "claudework",
-  "project_id": "48d05fca-fa62-4de7-a5ee-3fc27e10327e"
-}
