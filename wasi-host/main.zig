@@ -433,6 +433,7 @@ fn initP2PIdentity(cfg: ?p2p_config_mod.P2PConfig) !p2p_identity.Identity {
 }
 
 /// Chord 事件循环（在后台线程中运行）
+/// 处理 Chord 网络事件，同时处理 Lua 事件队列
 fn chordEventLoop(node: *chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
     std.debug.print("[chord] 事件循环已启动\n", .{});
     node.running = true;
@@ -450,6 +451,49 @@ fn chordEventLoop(node: *chord_node.ChordNode, lua_manager: ?*lua_state_manager_
     }
     std.debug.print("[chord] 事件循环已停止\n", .{});
 }
+
+/// Lua 集成说明
+///
+/// wasi-host 支持通过 Lua 脚本控制 WASM 插件生命周期和监控事件。
+///
+/// ## Lua 主函数
+///
+/// 当加载 Lua 脚本时，脚本以全局 Lua 状态执行。脚本可以:
+/// - 注册回调函数监听 WASM 插件事件
+/// - 调用 WASM 控制函数启动/停止/暂停/恢复插件
+/// - 访问连接特定状态进行多用户管理
+///
+/// ## WASM 事件回调
+///
+/// 脚本可以注册以下事件类型的回调:
+/// - `plugin_start`: 插件启动事件
+/// - `plugin_complete`: 插件完成事件
+/// - `plugin_error`: 插件错误事件
+/// - `plugin_timeout`: 插件超时事件
+/// - `chord_node_join`: Chord 节点加入事件
+/// - `chord_successor_change`: 后继节点变化事件
+/// - `dht_put`: DHT 数据写入事件
+///
+/// ## 配置选项
+///
+/// 在 `config.json` 中配置:
+/// ```json
+/// {
+///   "lua_script": "path/to/script.lua",
+///   "lua_events_enabled": true,
+///   "lua_p2p_events_enabled": true
+/// }
+/// ```
+///
+/// ## 示例脚本
+///
+/// 参见 `examples/lua/` 目录:
+/// - `plugin_monitor.lua`: 监控插件执行状态
+/// - `orchestrator.lua`: 管理多个插件
+/// - `p2p_monitor.lua`: 监控 P2P 网络事件
+//
+// 注意: Lua 脚本会作为单线程全局状态执行，不支持跨连接隔离
+// 多用户场景下应使用连接特定状态 (getConnectionState)
 
 pub fn main() !void {
     initOsNameBuf();
