@@ -134,43 +134,11 @@ pub const EncryptedRelayAdapter = struct {
             std.time.sleep(1 * std.time.ns_per_ms);
         }
 
-        // 超时 — 指数退避 + 中继切换
-        self.connected = false;
+        // 超时 — 不主动重连，readerLoop 已独立处理实际断线重连
+        // sendRequest 超时通常意味着目标节点暂时不可达，而非本节点连接断开
+        // 若在此处重连会踢掉当前会话，导致其他节点对本节点的转发也失败（级联效应）
         self.consecutive_failures += 1;
         self.attempts_on_relay += 1;
-
-        // 当前中继尝试次数达到阈值 → 切换下一个中继
-        if (self.attempts_on_relay >= self.relay_switch_threshold) {
-            self.relay_index += 1;
-            self.attempts_on_relay = 0;
-            if (self.relay_index >= self.config.relays.len) {
-                self.relays_exhausted = true;
-                std.debug.print("[encrypted_relay] 所有 {d} 个中继均不可用, 标记 exhausted\n", .{self.config.relays.len});
-            }
-        }
-
-        // 指数退避
-        const backoff_ms = @min(
-            @as(u64, 1000) * (@as(u64, 1) << @min(self.consecutive_failures, @as(u32, 6))),
-            @as(u64, 60000),
-        );
-        self.last_backoff_end_ms = std.time.milliTimestamp() + @as(i64, @intCast(backoff_ms));
-        std.debug.print("[encrypted_relay] 超时退避 {d}ms (连续失败#{d}, 中继[{d}])\n", .{ backoff_ms, self.consecutive_failures, self.relay_index });
-        std.time.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
-
-        // 重连 — 如果 relays_exhausted 则跳过
-        if (!self.relays_exhausted) {
-            self.client.connectTo(self.relay_index) catch {
-                self.connected = false;
-                return error.Timeout;
-            };
-            self.client.register() catch {
-                self.connected = false;
-                return error.Timeout;
-            };
-            self.connected = true;
-            std.debug.print("[encrypted_relay] 重连成功: 中继[{d}]\n", .{self.relay_index});
-        }
         return error.Timeout;
     }
 
@@ -203,11 +171,24 @@ pub const EncryptedRelayAdapter = struct {
 
                 if (adapter.relays_exhausted) return;
 
+                // 连续失败达到阈值 → 切换中继
+                adapter.attempts_on_relay += 1;
+                if (adapter.attempts_on_relay >= adapter.relay_switch_threshold) {
+                    adapter.relay_index += 1;
+                    adapter.attempts_on_relay = 0;
+                    if (adapter.relay_index >= adapter.config.relays.len) {
+                        adapter.relays_exhausted = true;
+                        std.debug.print("[encrypted_relay/reader] 所有 {d} 个中继均不可用, 标记 exhausted\n", .{adapter.config.relays.len});
+                        return;
+                    }
+                    std.debug.print("[encrypted_relay/reader] 切换到中继[{d}]\n", .{adapter.relay_index});
+                }
+
                 const backoff_ms = @min(
                     @as(u64, 1000) * (@as(u64, 1) << @min(consecutive_fails, @as(u32, 6))),
                     @as(u64, 60000),
                 );
-                std.debug.print("[encrypted_relay/reader] 断开, {d}ms 后重连(#{d})\n", .{ backoff_ms, consecutive_fails });
+                std.debug.print("[encrypted_relay/reader] 断开, {d}ms 后重连(#{d}, 中继[{d}])\n", .{ backoff_ms, consecutive_fails, adapter.relay_index });
                 std.time.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
 
                 if (adapter.relays_exhausted) return;
@@ -223,6 +204,18 @@ pub const EncryptedRelayAdapter = struct {
                 consecutive_fails += 1;
                 adapter.connected = false;
                 if (adapter.relays_exhausted) return;
+
+                adapter.attempts_on_relay += 1;
+                if (adapter.attempts_on_relay >= adapter.relay_switch_threshold) {
+                    adapter.relay_index += 1;
+                    adapter.attempts_on_relay = 0;
+                    if (adapter.relay_index >= adapter.config.relays.len) {
+                        adapter.relays_exhausted = true;
+                        std.debug.print("[encrypted_relay/reader] 所有 {d} 个中继均不可用, 标记 exhausted\n", .{adapter.config.relays.len});
+                        return;
+                    }
+                }
+
                 const backoff_ms = @min(@as(u64, 1000) * (@as(u64, 1) << @min(consecutive_fails, 6)), 60000);
                 std.time.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
                 adapter.client.connectTo(adapter.relay_index) catch continue;
@@ -291,7 +284,8 @@ pub const EncryptedRelayAdapter = struct {
     fn ensureConnected(self: *EncryptedRelayAdapter) !void {
         if (!self.connected) {
             if (self.relays_exhausted) return error.NotConnected;
-            try self.client.connectAndRegister();
+            try self.client.connectTo(self.relay_index);
+            try self.client.register();
             self.connected = true;
             self.consecutive_failures = 0;
         }

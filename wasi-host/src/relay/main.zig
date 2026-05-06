@@ -255,8 +255,8 @@ pub const RelayServer = struct {
                 var pubkey: [32]u8 = undefined;
                 @memcpy(&pubkey, ctrl_data[20..52]);
 
-                // 创建会话（pending_challenge）
-                _ = self.registry.register(node_id, .udp, from_addr, pubkey) catch |err| {
+                // 创建会话（pending_challenge），UDP 无 fd
+                _ = self.registry.register(node_id, .udp, from_addr, pubkey, null) catch |err| {
                     std.debug.print("[relay2] 注册失败: {}\n", .{err});
                     self.sendControlUDP(from_addr, CTRL_ERROR, &.{@as(u8, @intCast(@intFromError(err)))});
                     return;
@@ -387,14 +387,11 @@ pub const RelayServer = struct {
         var pubkey: [32]u8 = undefined;
         @memcpy(&pubkey, reg_payload[20..52]);
 
-        // 注册（pending_challenge），绑定 TCP fd
-        _ = self.registry.register(node_id, .tcp, addr, pubkey) catch |err| {
+        // 注册（pending_challenge），在 mutex 内原子化设置 fd 防止旧线程误删
+        _ = self.registry.register(node_id, .tcp, addr, pubkey, fd) catch |err| {
             std.debug.print("[relay2/tcp] 注册失败: {}\n", .{err});
             return;
         };
-        if (self.registry.get(node_id)) |session| {
-            session.tcp_fd = fd;
-        } else return;
 
         // 发送挑战
         var challenge = Auth.generateChallenge();
@@ -478,6 +475,8 @@ pub const RelayServer = struct {
                     continue;
                 }
                 if (err == error.ConnectionClosed or err == error.ConnectionResetByPeer) break;
+                // NotOpenForReading 通常发生在并发注册替换旧连接时 — 旧 fd 被关闭属于正常情况
+                if (err == error.NotOpenForReading) break;
                 std.debug.print("[relay2/tcp] 读取错误: {}\n", .{err});
                 break;
             };
@@ -653,7 +652,7 @@ test "registry: register and activate session" {
     const pk = makePubKey(42);
     const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
 
-    _ = try reg.register(node_id, .udp, addr, pk);
+    _ = try reg.register(node_id, .udp, addr, pk, null);
     try testing.expectEqual(@as(u32, 1), reg.count());
 
     const s = reg.get(node_id) orelse return error.TestFailed;
@@ -672,7 +671,7 @@ test "registry: heartbeat updates timestamp" {
     const pk = makePubKey(42);
     const addr = try std.net.Address.parseIp("127.0.0.1", 12346);
 
-    _ = try reg.register(node_id, .tcp, addr, pk);
+    _ = try reg.register(node_id, .tcp, addr, pk, null);
     const before = reg.get(node_id).?.last_heartbeat_ms;
 
     std.time.sleep(2 * std.time.ns_per_ms);
@@ -691,7 +690,7 @@ test "registry: unregister removes session" {
     const pk = makePubKey(42);
     const addr = try std.net.Address.parseIp("127.0.0.1", 12347);
 
-    _ = try reg.register(node_id, .udp, addr, pk);
+    _ = try reg.register(node_id, .udp, addr, pk, null);
     try testing.expectEqual(@as(u32, 1), reg.count());
 
     reg.unregister(node_id);
@@ -711,7 +710,7 @@ test "registry: reap expired sessions" {
     const pk = makePubKey(42);
     const addr = try std.net.Address.parseIp("127.0.0.1", 12348);
 
-    _ = try reg.register(node_id, .udp, addr, pk);
+    _ = try reg.register(node_id, .udp, addr, pk, null);
     std.time.sleep(150 * std.time.ns_per_ms);
     reg.reapExpired();
 
@@ -731,11 +730,11 @@ test "registry: session limit enforced" {
     const addr2 = try std.net.Address.parseIp("127.0.0.1", 10002);
     const addr3 = try std.net.Address.parseIp("127.0.0.1", 10003);
 
-    _ = try reg.register(makeNodeID(10), .udp, addr1, pk);
-    _ = try reg.register(makeNodeID(11), .udp, addr2, pk);
+    _ = try reg.register(makeNodeID(10), .udp, addr1, pk, null);
+    _ = try reg.register(makeNodeID(11), .udp, addr2, pk, null);
     try testing.expectEqual(@as(u32, 2), reg.count());
 
-    try testing.expectError(error.SessionLimitReached, reg.register(makeNodeID(12), .udp, addr3, pk));
+    try testing.expectError(error.SessionLimitReached, reg.register(makeNodeID(12), .udp, addr3, pk, null));
 }
 
 test "registry: duplicate node replaces session" {
@@ -749,10 +748,10 @@ test "registry: duplicate node replaces session" {
     const addr1 = try std.net.Address.parseIp("127.0.0.1", 20001);
     const addr2 = try std.net.Address.parseIp("127.0.0.1", 20002);
 
-    _ = try reg.register(node_id, .udp, addr1, pk1);
+    _ = try reg.register(node_id, .udp, addr1, pk1, null);
     try testing.expectEqual(@as(u32, 1), reg.count());
 
-    _ = try reg.register(node_id, .udp, addr2, pk2);
+    _ = try reg.register(node_id, .udp, addr2, pk2, null);
     try testing.expectEqual(@as(u32, 1), reg.count());
 
     const s = reg.get(node_id) orelse return error.TestFailed;

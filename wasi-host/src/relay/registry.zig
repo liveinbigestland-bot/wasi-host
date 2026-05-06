@@ -81,7 +81,8 @@ pub const Registry = struct {
     }
 
     /// 创建或替换会话（进入 pending_challenge 状态）
-    pub fn register(self: *Registry, node_id: NodeID, protocol: Protocol, addr: std.net.Address, public_key: [32]u8) !*Session {
+    /// 注意：fd 同时作为旧会话踢除依据和本会话标识，必须在 mutex 内原子化设置
+    pub fn register(self: *Registry, node_id: NodeID, protocol: Protocol, addr: std.net.Address, public_key: [32]u8, fd: ?std.posix.socket_t) !*Session {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -92,14 +93,16 @@ pub const Registry = struct {
         const now = std.time.milliTimestamp();
 
         if (self.sessions.get(node_id)) |existing| {
+            // 关闭旧会话 fd（这样旧线程的 read() 会返回错误/断开）
             self.closeSessionFd(existing);
+            // 重置会话为新状态，同时设置 tcp_fd — 防止旧线程的 unregisterIfFdMatches 误删新会话
             existing.* = .{
                 .node_id = node_id,
                 .protocol = protocol,
                 .state = .pending_challenge,
                 .addr = addr,
                 .udp_addr = if (protocol == .udp) addr else null,
-                .tcp_fd = null,
+                .tcp_fd = fd,
                 .public_key = public_key,
                 .last_heartbeat_ms = now,
                 .registered_at_ms = now,
@@ -115,7 +118,7 @@ pub const Registry = struct {
             .state = .pending_challenge,
             .addr = addr,
             .udp_addr = if (protocol == .udp) addr else null,
-            .tcp_fd = null,
+            .tcp_fd = fd,
             .public_key = public_key,
             .last_heartbeat_ms = now,
             .registered_at_ms = now,

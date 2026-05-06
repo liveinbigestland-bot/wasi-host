@@ -262,6 +262,7 @@ pub const RelayServer = struct {
     fn cleanupFdJobFn(ctx: *anyopaque, loop: *EventLoop) void {
         const data = @as(*CleanupFdData, @ptrCast(@alignCast(ctx)));
         loop.removeFd(data.fd);
+        closeSocket(data.fd);
         data.server.alloc.destroy(data);
     }
 
@@ -543,13 +544,15 @@ pub const RelayServer = struct {
                         self.mutex.lock();
                         defer self.mutex.unlock();
                         if (self.routing.get(node_key)) |old_conn| {
-                            closeSocket(old_conn.fd);
-                            // 从旧工作者的 EventLoop 移除 stale fd 条目
+                            // 不立即 closeSocket — cleanupFdJobFn 会在旧 loop 中
+                            // 先 removeFd 再 close，防止竞态
                             const old_loop = self.pool.getLoop(old_conn.worker_id);
                             if (self.alloc.create(CleanupFdData)) |cup| {
                                 cup.* = .{ .server = self, .fd = old_conn.fd };
                                 old_loop.execute(cup, cleanupFdJobFn);
-                            } else |_| {}
+                            } else |_| {
+                                closeSocket(old_conn.fd);
+                            }
                         }
                         self.routing.put(node_key, conn) catch {};
                     }
@@ -834,7 +837,14 @@ pub const RelayServer = struct {
             self.tunnel_mutex.lock();
             defer self.tunnel_mutex.unlock();
             if (self.tcp_tunnels.get(conn_id)) |old| {
-                closeSocket(old.target_fd);
+                // 旧隧道 fd 在事件循环中，由 cleanupTunnelJob 安全移除
+                if (self.alloc.create(CleanupFdData)) |cup| {
+                    cup.* = .{ .server = self, .fd = old.target_fd };
+                    const worker_loop2 = self.pool.getLoop(handler.worker_id);
+                    worker_loop2.execute(cup, cleanupFdJobFn);
+                } else |_| {
+                    closeSocket(old.target_fd);
+                }
                 self.alloc.destroy(old);
             }
             self.tcp_tunnels.put(conn_id, tunnel) catch {};
@@ -1219,6 +1229,9 @@ pub const RelayClient = struct {
             event_loop.setNonblocking(fd) catch {};
 
             self.fd = fd;
+
+            // 设置 TCP keepalive — 防止 NAT 超时断开空闲连接
+            setKeepalive(fd);
 
             self.udp_fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP) catch continue;
             const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);

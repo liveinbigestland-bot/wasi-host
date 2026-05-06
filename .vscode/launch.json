@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Remote: node59 (lldb-server)",
+            "type": "lldb",
+            "request": "custom",
+            "initCommands": [
+                "gdb-remote 192.168.2.59:20809"
+            ],
+            "targetCreateCommands": [
+                "target create ${command:pickProcess}"
+            ],
+            "processCreateCommands": [],
+            "sourceMap": {
+                "D:\\claudework": "/root"
+            }
+        },
+        {
+            "name": "Remote: node59 (SSH attach)",
+            "type": "lldb",
+            "request": "attach",
+            "pid": "${command:pickRemotePid}",
+            "sourceMap": {
+                "D:\\claudework": "/root"
+            },
+            "initCommands": [
+                "platform select remote-linux",
+                "platform connect connect://192.168.2.59:20809"
+            ]
+        }
+    ]
+}
