@@ -401,6 +401,7 @@ pub fn main() !void {
     var maybe_relay_client: ?*relay.RelayClient = null;
     var relay_reader_thread: ?std.Thread = null;
     var maybe_encrypted_relay: ?*encrypted_relay_mod.EncryptedRelayAdapter = null;
+    var erc_reader_thread: ?std.Thread = null;
     var maybe_wss_server: ?*wss.WssServer = null;
     var wss_server_thread: ?std.Thread = null;
 
@@ -521,6 +522,7 @@ pub fn main() !void {
                         .use_tcp = cfg.encrypted_relay.use_tcp,
                         .heartbeat_interval_ms = cfg.encrypted_relay.heartbeat_interval_ms,
                         .timeout_ms = cfg.encrypted_relay.timeout_ms,
+                        .listen_port = cfg.listen_port,
                     },
                     identity.chordId(),
                     identity.seed(),
@@ -581,6 +583,14 @@ pub fn main() !void {
                 boot_addrs,
             );
             maybe_chord = &chord;
+
+            // 启动加密中继 readerLoop（接收其他节点转发来的数据）
+            if (maybe_encrypted_relay) |erc| {
+                erc_reader_thread = erc.startReaderLoop() catch |err| blk: {
+                    std.debug.print("[encrypted_relay] readerLoop 启动失败: {}\n", .{err});
+                    break :blk null;
+                };
+            }
 
             // 启动 TCP 监听器（transport_mode == tcp 或 dual 时）
             if (cfg.transport_mode != .udp) {

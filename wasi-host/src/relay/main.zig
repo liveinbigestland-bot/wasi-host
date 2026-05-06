@@ -19,6 +19,21 @@ const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
 
+/// posix.close() can call unreachable in Zig 0.14 for unexpected errno values.
+/// This safe wrapper uses the raw Linux syscall to avoid that.
+fn safeClose(fd: posix.socket_t) void {
+    if (builtin.os.tag == .linux) {
+        const close_fd: usize = @intCast(@as(isize, @intCast(fd)));
+        _ = std.os.linux.syscall3(.close, close_fd, 0, 0);
+    } else if (builtin.os.tag == .windows) {
+        // Windows: use std.os.closesocket
+        _ = std.os.windows.closesocket(@ptrFromInt(@as(usize, @intCast(fd))));
+    } else {
+        // On non-Linux, use os.close which returns a void (no unreachable)
+        std.os.close(fd);
+    }
+}
+
 const Registry = @import("registry.zig").Registry;
 const RegistryOptions = @import("registry.zig").RegistryOptions;
 const NodeID = @import("registry.zig").NodeID;
@@ -90,7 +105,7 @@ pub const RelayServer = struct {
     pub fn init(alloc: std.mem.Allocator, config: RelayConfig) !RelayServer {
         // UDP socket
         const udp_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
-        errdefer posix.close(udp_fd);
+        errdefer safeClose(udp_fd);
 
         const reuse: u32 = 1;
         _ = posix.setsockopt(udp_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(reuse)) catch {};
@@ -177,8 +192,8 @@ pub const RelayServer = struct {
             // shutdown 先中断阻塞中的 recvfrom/accept，再 close
             posix.shutdown(self.udp_fd, .both) catch {};
             posix.shutdown(self.tcp_listen_fd, .both) catch {};
-            posix.close(self.udp_fd);
-            posix.close(self.tcp_listen_fd);
+            safeClose(self.udp_fd);
+            safeClose(self.tcp_listen_fd);
         }
     }
 
@@ -334,7 +349,7 @@ pub const RelayServer = struct {
             };
             const thread = std.Thread.spawn(.{}, handleTCPConnection, .{ self, fd, client_addr }) catch |err| {
                 std.debug.print("[relay2/tcp] 线程创建失败: {}\n", .{err});
-                posix.close(fd);
+                safeClose(fd);
                 continue;
             };
             thread.detach();
@@ -342,7 +357,7 @@ pub const RelayServer = struct {
     }
 
     fn handleTCPConnection(self: *RelayServer, fd: posix.socket_t, addr: std.net.Address) void {
-        defer posix.close(fd);
+        defer safeClose(fd);
 
         // 设置超时
         setRecvTimeout(fd, 5000);
@@ -441,17 +456,25 @@ pub const RelayServer = struct {
         std.debug.print("[relay2/tcp] TCP 鉴权成功 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
 
         // 第三步：进入数据转发循环（接收 → 查表 → 转发）
+        // 使用本地心跳跟踪，避免持有 *Session 带来的 use-after-free 竞争
+        var local_heartbeat_ms = std.time.milliTimestamp();
+        var last_registry_heartbeat_ms = local_heartbeat_ms;
         setRecvTimeout(fd, 3000);
         while (self.running) {
             const nr = posix.read(fd, &buf) catch |err| {
                 if (err == error.WouldBlock or err == error.Timeout) {
-                    // 心跳检查
+                    // 心跳检查（使用本地时间，避免 session 指针悬空）
                     const now = std.time.milliTimestamp();
-                    if (now - session.last_heartbeat_ms > @as(i64, @intCast(self.config.heartbeat_timeout_ms))) {
+                    if (now - local_heartbeat_ms > @as(i64, @intCast(self.config.heartbeat_timeout_ms))) {
                         break;
                     }
                     // 发送 PING 保活
                     self.sendTCPControl(fd, CTRL_PING, &node_id);
+                    // 定期更新 registry 心跳（防止 reap() 误删）
+                    if (now - last_registry_heartbeat_ms > 10_000) {
+                        self.registry.heartbeat(node_id) catch {};
+                        last_registry_heartbeat_ms = now;
+                    }
                     continue;
                 }
                 if (err == error.ConnectionClosed or err == error.ConnectionResetByPeer) break;
@@ -459,7 +482,11 @@ pub const RelayServer = struct {
                 break;
             };
             if (nr == 0) break;
-            session.last_heartbeat_ms = std.time.milliTimestamp();
+            local_heartbeat_ms = std.time.milliTimestamp();
+            if (local_heartbeat_ms - last_registry_heartbeat_ms > 10_000) {
+                self.registry.heartbeat(node_id) catch {};
+                last_registry_heartbeat_ms = local_heartbeat_ms;
+            }
 
             if (buf[0] == CMD_CTRL) {
                 // 控制消息（PING 等）
@@ -482,7 +509,7 @@ pub const RelayServer = struct {
 
         // 清理
         std.debug.print("[relay2/tcp] 连接断开 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
-        self.registry.unregister(node_id);
+        self.registry.unregisterIfFdMatches(node_id, fd);
     }
 
     fn sendTCPControl(self: *RelayServer, fd: posix.socket_t, ctrl_type: u8, data: []const u8) void {

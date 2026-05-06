@@ -25,6 +25,13 @@
         "key_file": "p2p_key_ext2.bin",
         "stabilize_interval_ms": 30000,
         "run_duration_s": 86400,
+        "encrypted_relay": {
+            "enabled": true,
+            "relays": [{"host": "127.0.0.1", "port": 20809}],
+            "use_tcp": true,
+            "heartbeat_interval_ms": 25000,
+            "timeout_ms": 5000
+        },
         "proxy": {
             "enabled": true,
             "mode": "server",

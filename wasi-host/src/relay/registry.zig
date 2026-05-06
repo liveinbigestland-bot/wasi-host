@@ -152,6 +152,20 @@ pub const Registry = struct {
         }
     }
 
+    /// 仅当会话的 TCP fd 匹配时才删除（避免竞争：旧线程误删新注册的会话）
+    pub fn unregisterIfFdMatches(self: *Registry, node_id: NodeID, expected_fd: std.posix.socket_t) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.sessions.get(node_id)) |session| {
+            if (session.tcp_fd) |fd| {
+                if (fd != expected_fd) return;
+            }
+            self.closeSessionFd(session);
+            _ = self.sessions.remove(node_id);
+            self.alloc.destroy(session);
+        }
+    }
+
     /// 获取会话（线程安全）
     pub fn get(self: *Registry, node_id: NodeID) ?*Session {
         self.mutex.lock();

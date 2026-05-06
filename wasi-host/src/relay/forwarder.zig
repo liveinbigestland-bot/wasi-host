@@ -8,6 +8,9 @@ const NodeID = @import("registry.zig").NodeID;
 
 pub const HEADER_LEN: usize = 20;
 
+/// 协议常量（与 main.zig / client.zig 一致）
+const CMD_DATA: u8 = 0x01;
+
 pub const ForwarderOptions = struct {
     max_packet_size: usize = 1400,
 };
@@ -52,9 +55,9 @@ pub const Forwarder = struct {
     }
 
     /// 转发 TCP 数据帧
-    /// target_fd: 目标节点的 TCP 连接 fd
+    /// fd: 发送方的 TCP fd（用于查 sender_id）
     /// data: [target NodeID 20] + [加密负载]
-    pub fn forwardTCP(self: *Forwarder, registry: *Registry, target_fd: posix.socket_t, data: []const u8) !void {
+    pub fn forwardTCP(self: *Forwarder, registry: *Registry, fd: posix.socket_t, data: []const u8) !void {
         if (data.len < HEADER_LEN) return error.PacketTooShort;
         if (data.len > self.max_packet_size) return error.PacketTooLarge;
 
@@ -64,7 +67,16 @@ pub const Forwarder = struct {
         const target = registry.get(target_id) orelse return error.TargetOffline;
         if (target.state != .active) return error.TargetOffline;
 
-        // 原样字节拷贝转发
-        _ = try posix.write(target_fd, data[HEADER_LEN..]);
+        // 查找发送方 NodeID，用于响应路由
+        const sender = registry.getByTcpFd(fd) orelse return error.SenderNotRegistered;
+
+        // 使用目标节点的 TCP fd 转发，附加 [CMD_DATA][sender_id][payload]
+        const dst_fd = target.tcp_fd orelse return error.TargetOffline;
+        const payload = data[HEADER_LEN..];
+        var framed: [1 + 20 + 65536]u8 = undefined;
+        framed[0] = CMD_DATA;
+        @memcpy(framed[1..][0..20], &sender.node_id);
+        @memcpy(framed[21..][0..payload.len], payload);
+        _ = try posix.write(dst_fd, framed[0 .. 21 + payload.len]);
     }
 };
