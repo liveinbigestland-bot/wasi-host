@@ -1,0 +1,20 @@
+This is a test file for NATS file transfer example.
+
+It contains multiple lines of text to demonstrate
+chunked file transfer over NATS message queue.
+
+Line 1: Hello from Lua!
+Line 2: File transfer via NATS
+Line 3: Chunked message processing
+Line 4: Receiver reconstructs file
+Line 5: Success!
+
+The file will be split into 64KB chunks and sent
+via NATS messages. The receiver will reconstruct
+the original file from the chunks.
+
+This demonstrates:
+- NATS pub/sub messaging
+- Chunked file transfer
+- JSON message encoding
+- Lua scripting capabilities
