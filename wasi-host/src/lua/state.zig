@@ -3,6 +3,21 @@ const lua = @import("api.zig");
 const events = @import("events.zig");
 const host_functions = @import("host_functions.zig").HostFunctions;
 
+/// Error codes for Lua operations
+pub const LuaError = error{
+    ScriptCompilationError,
+    ScriptExecutionError,
+    MemoryLimitExceeded,
+    ExecutionTimeout,
+    CallStackOverflow,
+    AccessDenied,
+    InvalidParameter,
+    NotInitialized,
+    NoConnection,
+};
+
+pub const ErrorCallback = fn (message: []const u8, source: ?[]const u8, line: i32) void;
+
 /// Embedded Lua script for runtime configuration
 pub const EmbeddedLuaScript = struct {
     name: []const u8,
@@ -18,8 +33,27 @@ pub const LuaStateManager = struct {
     next_plugin_handle: std.atomic.Value(u64),
     connection_plugins: std.AutoHashMap(u64, std.ArrayList(u64)), // connection_id -> list of plugin_handles
 
+    // Error handling
+    error_callback: ?lua.ErrorCallback,
+    error_stack_depth: u32,
+    execution_timeout_ns: u64,
+    max_call_depth: u32,
+
+    // Memory management
+    mem_limit_kb: u64,
+    max_mem_usage_kb: u64,
+    track_mem_usage: bool,
+    mem_tracker: ?lua.MemTracker,
+
+    // Sandbox configuration
+    sandbox_config: lua.SandboxConfig,
+    sandboxed_connections: std.AutoHashMap(u64, bool),
+
     pub fn init(allocator: std.mem.Allocator) !LuaStateManager {
         const global_state = try lua.LuaState.init();
+
+        const sandbox_config = lua.SandboxConfig.init(allocator);
+
         const manager = LuaStateManager{
             .global_state = global_state,
             .connection_states = std.AutoHashMap(u64, lua.LuaState).init(allocator),
@@ -28,9 +62,30 @@ pub const LuaStateManager = struct {
             .allocator = allocator,
             .callbacks = std.StringHashMap(lua.LuaState).init(allocator),
             .next_plugin_handle = std.atomic.Value(u64).init(1),
+            .error_callback = null,
+            .error_stack_depth = 100,
+            .execution_timeout_ns = 30 * std.time.ns_per_sec,
+            .max_call_depth = 100,
+            .mem_limit_kb = 512,
+            .max_mem_usage_kb = 0,
+            .track_mem_usage = true,
+            .mem_tracker = null,
+            .sandbox_config = sandbox_config,
+            .sandboxed_connections = std.AutoHashMap(u64, bool).init(allocator),
         };
+
         // Register host functions to global state
         host_functions.register(&manager.global_state);
+
+        // Initialize memory tracker
+        if (manager.track_mem_usage) {
+            try lua.initMemTracker(manager.global_state);
+            manager.mem_tracker = lua.getMemTracker();
+        }
+
+        // Initialize sandbox environment for global state
+        try manager.createSandboxForState(&manager.global_state);
+
         return manager;
     }
 
@@ -124,6 +179,17 @@ pub const LuaStateManager = struct {
             entry.value_ptr.deinit();
         }
         self.callbacks.deinit();
+
+        self.sandbox_config.deinit();
+        var sandboxed_it = self.sandboxed_connections.iterator();
+        while (sandboxed_it.next()) |entry| {
+            _ = entry;
+        }
+        self.sandboxed_connections.deinit();
+
+        if (self.mem_tracker) |tracker| {
+            tracker.deinit();
+        }
     }
 
     pub fn getGlobalState(self: *LuaStateManager) *lua.LuaState {

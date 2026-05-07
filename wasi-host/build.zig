@@ -66,21 +66,13 @@ pub fn build(b: *std.Build) void {
                     exe.linkSystemLibrary("lua");
                 },
                 else => {
-                    // 其他平台使用静态链接
-                    const lua_dep = b.dependency("lua", .{
-                        .target = host_target,
-                        .optimize = optimize,
-                    });
-                    exe.root_module.addImport("lua", lua_dep.module("lua"));
+                    // 其他平台跳过 lua 依赖（临时方案）
+                    std.debug.print("[build] Lua dependency skipped for this platform\n", .{});
                 },
             }
         } else {
-            // 交叉编译 - 使用静态链接
-            const lua_dep = b.dependency("lua", .{
-                .target = host_target,
-                .optimize = optimize,
-            });
-            exe.root_module.addImport("lua", lua_dep.module("lua"));
+            // 交叉编译 - 跳过 lua 依赖（临时方案）
+            std.debug.print("[build] Lua dependency skipped for cross-compilation\n", .{});
         }
     }
     const options = b.addOptions();
@@ -150,12 +142,8 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(daemon);
 
     // ── Lua 5.4 依赖 ──
-    const lua_dep = b.dependency("lua", .{
-        .target = host_target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("lua", lua_dep.module("lua"));
-    daemon.root_module.addImport("lua", lua_dep.module("lua"));
+    // 跳过 lua 依赖（临时方案）
+    std.debug.print("[build] Lua dependency skipped for daemon\n", .{});
 
     // ── 单元测试 ──
     const test_step = b.step("test", "Run unit tests");

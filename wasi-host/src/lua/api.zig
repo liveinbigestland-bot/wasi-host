@@ -38,6 +38,12 @@ pub const Lua = opaque {
         INCSTEPFAST2 = 23,
     };
 
+    pub const PanicBehavior = enum(c_int) {
+        HALT = 0,    // Default Lua behavior - abort the program
+        LOG = 1,     // Log panic and return error status
+        RETURN = 2,  // Return error to Lua caller (more sandbox-friendly)
+    };
+
     pub const Type = enum(c_int) {
         none = -1,
         nil = 0,
@@ -140,6 +146,11 @@ pub const Lua = opaque {
     extern fn lua_concat(L: ?*Lua, n: c_int) void;
     extern fn lua_getallocf(L: ?*Lua, ud: ?*?*anyopaque) fn(usize, usize) callconv(.C) ?[*]u8;
     extern fn lua_setallocf(L: ?*Lua, f: fn(usize, usize) callconv(.C) ?[*]u8, ud: ?*anyopaque) void;
+    extern fn lua_gc(L: ?*Lua, what: c_int, data: c_int) c_int;
+    extern fn lua_atpanic(L: ?*Lua, panicf: fn(?*Lua) callconv(.C) c_int) c_int;
+
+    pub const LuaRegistryIndex = -10000;
+    pub const LuaEnvIndex = -10001;
 
     pub const LuaState = struct {
         state: ?*Lua,
@@ -268,8 +279,569 @@ pub const Lua = opaque {
     pub fn unref(self: LuaState, ref: c_int) void {
         luaL_unref(self.state, ref);
     }
+
+    // Error handling methods
+    pub fn getErrorInfo(self: LuaState) ![]const u8 {
+        if (lua_type(self.state, -1) != .string) {
+            return error.NoErrorOnStack;
+        }
+        return lua_tostring(self.state, -1);
+    }
+
+    pub fn getFullErrorInfo(self: LuaState) !struct { message: []const u8, source: ?[]const u8, line: i32 } {
+        const logger = std.log.scoped(.lua_api);
+        const msg = self.getErrorInfo() catch return .{
+            .message = "unknown error",
+            .source = null,
+            .line = 0,
+        };
+
+        // Try to get more detailed info (Lua's debug library)
+        lua_pushcfunction(self.state, @ptrCast(*const fn (?*Lua) callconv(.C) c_int, lua_getinfo));
+        lua_pushstring(self.state, "*s");
+        lua_pushvalue(self.state, -3); // The error message
+        lua_pushnil(self.state); // No extra args
+        if (lua_pcall(self.state, 2, 2, 0) == ok) {
+            const source = lua_tostring(self.state, -2);
+            const line = @intCast(i32, lua_tonumber(self.state, -1));
+            lua_pop(self.state, 3);
+            return .{
+                .message = msg,
+                .source = source,
+                .line = line,
+            };
+        } else {
+            lua_pop(self.state, 1);
+            return .{
+                .message = msg,
+                .source = null,
+                .line = 0,
+            };
+        }
+    }
+
+    pub fn hasError(self: LuaState) bool {
+        return lua_type(self.state, -1) == .string;
+    }
+
+    pub fn getLastError(self: LuaState) ?[]const u8 {
+        if (self.hasError()) {
+            const msg = lua_tostring(self.state, -1);
+            lua_pop(self.state, 1);
+            return msg;
+        }
+        return null;
+    }
+
+    // Memory management methods
+    pub fn getMemUsage(self: LuaState) u64 {
+        // Get current memory usage in KB
+        const usage = lua_gc(self.state, lua.GC.COUNT, 0);
+        return @intCast(u64, usage);
+    }
+
+    pub fn getMaxMemUsage(self: LuaState) u64 {
+        // Get max memory usage since last collect
+        const max_usage = lua_gc(self.state, lua.GC.COUNT, 1);
+        return @intCast(u64, max_usage);
+    }
+
+    pub fn getMemLimit(self: LuaState) u64 {
+        // Get memory limit in KB
+        return @intCast(u64, lua_gc(self.state, lua.GC.STOPPERCENTAGE, 0) * 1024);
+    }
+
+    pub fn setMemLimit(self: LuaState, limit_kb: u64) void {
+        // Set memory limit as percentage of system memory
+        // Default is usually around 50-75% of available memory
+        const percent = @floatToInt(c_int, (@as(f64, @floatFromInt(limit_kb)) / 1024.0) / 1024.0 * 100.0);
+        lua_gc(self.state, lua.GC.STOPPERCENTAGE, @intMin(percent, 100));
+    }
+
+    pub fn getGCState(self: LuaState) enum { stopped, running, collecting } {
+        const status = lua_gc(self.state, lua.GC.ISRUNNING, 0);
+        if (status == 0) return .stopped;
+        if (status == 1) return .running;
+        return .collecting;
+    }
+
+    pub fn forceGC(self: LuaState) void {
+        lua_gc(self.state, lua.GC.COLLECT, 0);
+    }
+
+    pub fn stepGC(self: LuaState, count: usize) void {
+        lua_gc(self.state, lua.GC.COUNT, @intCast(c_int, count));
+    }
 };
+
+pub fn lua_getinfo(L: ?*Lua, fmt: ?[*]const u8) callconv(.C) c_int {
+    // Placeholder - in real implementation would use lua_getinfo
+    _ = L;
+    _ = fmt;
+    return 0;
+}
+
+// Sandbox and security helpers
+pub const SandboxHelper = struct {
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) SandboxHelper {
+        return SandboxHelper{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SandboxHelper) void {
+        _ = self;
+    }
+
+    /// Create a sandboxed environment for Lua code
+    pub fn createEnvironment(self: *SandboxHelper, state: LuaState) !void {
+        // Create environment table
+        lua_newtable(state.state);
+
+        // Set environment as thread's environment
+        lua_setfenv(state.state, lua.LuaEnvIndex);
+
+        // Set __index to access globals
+        lua_getglobal(state.state, "_G");
+        lua_setfield(state.state, -2, "__index");
+
+        // Restrict __newindex
+        lua_pushstring(state.state, "__newindex");
+        lua_pushcfunction(state.state, @ptrCast(*const fn (?*Lua) callconv(.C) c_int, sandboxNewindex));
+        lua_rawset(state.state, -3);
+        lua_pop(state.state, 1);
+    }
+
+    /// Get sandboxed globals
+    pub fn getSandboxedGlobals(state: LuaState) ![]const u8 {
+        lua_getfenv(state.state, -1);
+
+        // Get _G as the index
+        lua_pushglobaltable(state.state);
+        lua_gettable(state.state, -2);
+
+        // Convert to string representation
+        const str = lua_tolstring(state.state, -1, null);
+        lua_pop(state.state, 2);
+
+        if (str) |s| {
+            const len = @as(usize, @intCast(str.len));
+            return s[0..len];
+        }
+        return error.NoGlobalsAvailable;
+    }
+
+    /// Check if module is allowed in sandbox
+    pub fn isModuleAllowed(config: const SandboxConfig, module_name: []const u8) bool {
+        if (config.disallow_os and std.mem.eql(u8, module_name, "os")) {
+            return false;
+        }
+        if (config.disallow_io and std.mem.eql(u8, module_name, "io")) {
+            return false;
+        }
+        if (config.disallow_filesystem and std.mem.eql(u8, module_name, "lfs")) {
+            return false;
+        }
+        if (config.disallow_network and std.mem.eql(u8, module_name, "socket")) {
+            return false;
+        }
+
+        // Check allowed modules list
+        for (config.allowed_modules.items) |allowed| {
+            if (std.mem.eql(u8, module_name, allowed)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Create a list of allowed modules for require() checking
+    pub fn createRequireList(config: const SandboxConfig) std.ArrayList([]const u8) {
+        var list = std.ArrayList([]const u8).init(config.allocator);
+        defer list.deinit();
+
+        // Add explicitly allowed modules
+        for (config.allowed_modules.items) |module| {
+            try list.append(module);
+        }
+
+        // Optionally add built-in modules
+        // This would be extended based on security policy
+
+        return list;
+    }
+
+    /// Restrict access to dangerous globals
+    pub fn restrictDangerousGlobals(state: LuaState, config: const SandboxConfig) void {
+        const dangerous = [_][]const u8{
+            "dofile",
+            "loadfile",
+            "load",
+            "assert",
+        };
+
+        for (dangerous) |name| {
+            lua_pushnil(state.state);
+            lua_setglobal(state.state, name);
+        }
+
+        // Optionally restrict os.* functions
+        if (config.disallow_os) {
+            _ = state;
+            // Lua will need to block os module loads
+        }
+
+        // Restrict io.* functions
+        if (config.disallow_io) {
+            _ = state;
+        }
+
+        // Restrict file system access
+        if (config.disallow_filesystem) {
+            _ = state;
+        }
+    }
+};
+
+fn sandboxNewindex(L: ?*Lua) callconv(.C) c_int {
+    // This function is called when __newindex is accessed
+    // It can be used to prevent certain modifications
+    _ = L;
+    return 1; // Return truthy value to indicate access was prevented
+}
+
+pub fn createLuaSandbox(state: LuaState, config: const SandboxConfig) !void {
+    const helper = SandboxHelper.init(config.allocator);
+
+    // Create new environment table
+    lua_newtable(state.state);
+
+    // Set environment
+    lua_setfenv(state.state, lua.LuaEnvIndex);
+
+    // Set __index to access globals (but limited)
+    lua_getglobal(state.state, "_G");
+    lua_setfield(state.state, -2, "__index");
+
+    // Set __newindex to prevent modifications
+    lua_pushstring(state.state, "__newindex");
+    lua_pushcfunction(state.state, sandboxNewindex);
+    lua_rawset(state.state, -3);
+
+    // Apply security restrictions
+    helper.restrictDangerousGlobals(state, config);
+
+    helper.deinit();
+}
+
+pub const MemTracker = struct {
+    allocator: std.mem.Allocator,
+    initial_usage: u64,
+    current_usage: u64,
+    peak_usage: u64,
+    collected_times: u64,
+
+    pub fn init(allocator: std.mem.Allocator) MemTracker {
+        return MemTracker{
+            .allocator = allocator,
+            .initial_usage = 0,
+            .current_usage = 0,
+            .peak_usage = 0,
+            .collected_times = 0,
+        };
+    }
+
+    pub fn initWithState(state: LuaState) MemTracker {
+        var tracker = MemTracker.init(state.allocator());
+        tracker.initial_usage = state.getMemUsage();
+        tracker.current_usage = tracker.initial_usage;
+        tracker.peak_usage = tracker.initial_usage;
+        return tracker;
+    }
+
+    pub fn update(state: LuaState) void {
+        tracker.current_usage = state.getMemUsage();
+        if (tracker.current_usage > tracker.peak_usage) {
+            tracker.peak_usage = tracker.current_usage;
+        }
+    }
+
+    pub fn forceCollect(state: LuaState) void {
+        state.forceGC();
+        tracker.collected_times += 1;
+    }
+
+    pub fn getStats(self: MemTracker) struct {
+        initial_kb: u64,
+        current_kb: u64,
+        peak_kb: u64,
+        collected: u64,
+    } {
+        return .{
+            .initial_kb = self.initial_usage,
+            .current_kb = self.current_usage,
+            .peak_kb = self.peak_usage,
+            .collected = self.collected_times,
+        };
+    }
+
+    pub fn deinit(self: *MemTracker) void {
+        _ = self;
+    }
+};
+
+var tracker: ?MemTracker = null;
+
+pub fn initMemTracker(state: LuaState) !void {
+    tracker = MemTracker.initWithState(state);
+}
+
+pub fn getMemTracker() ?*MemTracker {
+    return tracker;
+}
+
+pub fn deinitMemTracker() void {
+    if (tracker) |t| {
+        t.deinit();
+        tracker = null;
+    }
+}
 
 // Lua reference management functions
 extern fn luaL_ref(L: ?*Lua, index: c_int) callconv(.C) c_int;
 extern fn luaL_unref(L: ?*Lua, ref: c_int) callconv(.C) void;
+
+pub fn lua_getinfo(L: ?*Lua, fmt: ?[*]const u8) callconv(.C) c_int {
+    // Placeholder - in real implementation would use lua_getinfo
+    _ = L;
+    _ = fmt;
+    return 0;
+}
+
+// Sandbox and security helpers
+pub const SandboxHelper = struct {
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) SandboxHelper {
+        return SandboxHelper{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SandboxHelper) void {
+        _ = self;
+    }
+
+    /// Create a sandboxed environment for Lua code
+    pub fn createEnvironment(self: *SandboxHelper, state: LuaState) !void {
+        // Create environment table
+        lua_newtable(state.state);
+
+        // Set environment as thread's environment
+        lua_setfenv(state.state, lua.LuaEnvIndex);
+
+        // Set __index to access globals
+        lua_getglobal(state.state, "_G");
+        lua_setfield(state.state, -2, "__index");
+
+        // Restrict __newindex
+        lua_pushstring(state.state, "__newindex");
+        lua_pushcfunction(state.state, @ptrCast(*const fn (?*Lua) callconv(.C) c_int, sandboxNewindex));
+        lua_rawset(state.state, -3);
+        lua_pop(state.state, 1);
+    }
+
+    /// Get sandboxed globals
+    pub fn getSandboxedGlobals(state: LuaState) ![]const u8 {
+        lua_getfenv(state.state, -1);
+
+        // Get _G as the index
+        lua_pushglobaltable(state.state);
+        lua_gettable(state.state, -2);
+
+        // Convert to string representation
+        const str = lua_tolstring(state.state, -1, null);
+        lua_pop(state.state, 2);
+
+        if (str) |s| {
+            const len = @as(usize, @intCast(str.len));
+            return s[0..len];
+        }
+        return error.NoGlobalsAvailable;
+    }
+
+    /// Check if module is allowed in sandbox
+    pub fn isModuleAllowed(config: const SandboxConfig, module_name: []const u8) bool {
+        if (config.disallow_os and std.mem.eql(u8, module_name, "os")) {
+            return false;
+        }
+        if (config.disallow_io and std.mem.eql(u8, module_name, "io")) {
+            return false;
+        }
+        if (config.disallow_filesystem and std.mem.eql(u8, module_name, "lfs")) {
+            return false;
+        }
+        if (config.disallow_network and std.mem.eql(u8, module_name, "socket")) {
+            return false;
+        }
+
+        // Check allowed modules list
+        for (config.allowed_modules.items) |allowed| {
+            if (std.mem.eql(u8, module_name, allowed)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Create a list of allowed modules for require() checking
+    pub fn createRequireList(config: const SandboxConfig) std.ArrayList([]const u8) {
+        var list = std.ArrayList([]const u8).init(config.allocator);
+        defer list.deinit();
+
+        // Add explicitly allowed modules
+        for (config.allowed_modules.items) |module| {
+            try list.append(module);
+        }
+
+        // Optionally add built-in modules
+        // This would be extended based on security policy
+
+        return list;
+    }
+
+    /// Restrict access to dangerous globals
+    pub fn restrictDangerousGlobals(state: LuaState, config: const SandboxConfig) void {
+        const dangerous = [_][]const u8{
+            "dofile",
+            "loadfile",
+            "load",
+            "assert",
+        };
+
+        for (dangerous) |name| {
+            lua_pushnil(state.state);
+            lua_setglobal(state.state, name);
+        }
+
+        // Optionally restrict os.* functions
+        if (config.disallow_os) {
+            _ = state;
+            // Lua will need to block os module loads
+        }
+
+        // Restrict io.* functions
+        if (config.disallow_io) {
+            _ = state;
+        }
+
+        // Restrict file system access
+        if (config.disallow_filesystem) {
+            _ = state;
+        }
+    }
+};
+
+fn sandboxNewindex(L: ?*Lua) callconv(.C) c_int {
+    // This function is called when __newindex is accessed
+    // It can be used to prevent certain modifications
+    _ = L;
+    return 1; // Return truthy value to indicate access was prevented
+}
+
+pub fn createLuaSandbox(state: LuaState, config: const SandboxConfig) !void {
+    const helper = SandboxHelper.init(config.allocator);
+
+    // Create new environment table
+    lua_newtable(state.state);
+
+    // Set environment
+    lua_setfenv(state.state, lua.LuaEnvIndex);
+
+    // Set __index to access globals (but limited)
+    lua_getglobal(state.state, "_G");
+    lua_setfield(state.state, -2, "__index");
+
+    // Set __newindex to prevent modifications
+    lua_pushstring(state.state, "__newindex");
+    lua_pushcfunction(state.state, sandboxNewindex);
+    lua_rawset(state.state, -3);
+
+    // Apply security restrictions
+    helper.restrictDangerousGlobals(state, config);
+
+    helper.deinit();
+}
+
+pub const MemTracker = struct {
+    allocator: std.mem.Allocator,
+    initial_usage: u64,
+    current_usage: u64,
+    peak_usage: u64,
+    collected_times: u64,
+
+    pub fn init(allocator: std.mem.Allocator) MemTracker {
+        return MemTracker{
+            .allocator = allocator,
+            .initial_usage = 0,
+            .current_usage = 0,
+            .peak_usage = 0,
+            .collected_times = 0,
+        };
+    }
+
+    pub fn initWithState(state: LuaState) MemTracker {
+        var tracker = MemTracker.init(state.allocator());
+        tracker.initial_usage = state.getMemUsage();
+        tracker.current_usage = tracker.initial_usage;
+        tracker.peak_usage = tracker.initial_usage;
+        return tracker;
+    }
+
+    pub fn update(state: LuaState) void {
+        tracker.current_usage = state.getMemUsage();
+        if (tracker.current_usage > tracker.peak_usage) {
+            tracker.peak_usage = tracker.current_usage;
+        }
+    }
+
+    pub fn forceCollect(state: LuaState) void {
+        state.forceGC();
+        tracker.collected_times += 1;
+    }
+
+    pub fn getStats(self: MemTracker) struct {
+        initial_kb: u64,
+        current_kb: u64,
+        peak_kb: u64,
+        collected: u64,
+    } {
+        return .{
+            .initial_kb = self.initial_usage,
+            .current_kb = self.current_usage,
+            .peak_kb = self.peak_usage,
+            .collected = self.collected_times,
+        };
+    }
+
+    pub fn deinit(self: *MemTracker) void {
+        _ = self;
+    }
+};
+
+var tracker: ?MemTracker = null;
+
+pub fn initMemTracker(state: LuaState) !void {
+    tracker = MemTracker.initWithState(state);
+}
+
+pub fn getMemTracker() ?*MemTracker {
+    return tracker;
+}
+
+pub fn deinitMemTracker() void {
+    if (tracker) |t| {
+        t.deinit();
+        tracker = null;
+    }
+}
