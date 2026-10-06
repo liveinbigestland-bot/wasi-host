@@ -1,5 +1,4 @@
 /// Chord 节点：加入网络、Stabilize、消息处理、事件循环
-
 const std = @import("std");
 const ring = @import("ring.zig");
 const types = @import("types.zig");
@@ -52,6 +51,13 @@ fn chordNodeBootstrapSend(ctx: *anyopaque, msg: types.Message, expected_type: ty
     const self: *ChordNode = @ptrCast(@alignCast(ctx));
     return self.sendAndWait(msg, expected_type, target, timeout_ms);
 }
+
+/// 本地控制处理器：解析 action + params，返回 JSON 响应字节（分配在 arena 中）
+pub const ControlHandler = *const fn (
+    action: []const u8,
+    params: std.json.Value,
+    arena: std.mem.Allocator,
+) ?[]u8;
 
 /// Chord DHT 节点
 pub const ChordNode = struct {
@@ -107,6 +113,12 @@ pub const ChordNode = struct {
     // Lua 集成
     lua_manager: ?*@import("../../../src/lua/state.zig").LuaStateManager = null,
     p2p_events_enabled: bool = true,
+
+    /// 本地控制通道处理器（由 main.zig 设置；仅接受 loopback 来源）
+    control_handler: ?ControlHandler = null,
+
+    /// 控制通道鉴权 token；null 表示不要求（仅 loopback）
+    control_token: ?[]const u8 = null,
 
     // 定时器状态
     last_stabilize: i64 = 0,
@@ -336,6 +348,14 @@ pub const ChordNode = struct {
                 break;
             };
             const data = buf[0..result.n];
+
+            // 本地控制通道：在 Chord 协议解码前拦截 {"control":{...}}
+            const trimmed = std.mem.trim(u8, data, " \t\r\n");
+            if (std.mem.startsWith(u8, trimmed, "{\"control\"")) {
+                self.handleControl(trimmed, result.addr);
+                continue;
+            }
+
             const msg = Message.decode(data, self.msg_arena.allocator()) catch |err| {
                 std.debug.print("[chord] 消息解码失败: {}\n", .{err});
                 continue;
@@ -396,6 +416,70 @@ pub const ChordNode = struct {
     // 消息处理
     // ═══════════════════════════════════════════════
 
+    /// 处理本地控制信封 {"control": {"action": params}}
+    fn handleControl(self: *ChordNode, data: []const u8, from: std.net.Address) void {
+        // 安全：控制通道只接受 loopback 来源，外部数据报静默丢弃
+        if (!isLocalhost(from)) {
+            std.debug.print("[control] 拒绝非 loopback 控制请求: {}\n", .{from});
+            return;
+        }
+
+        const handler = self.control_handler orelse {
+            self.socket.sendTo(from, "{\"ok\":false,\"error\":\"control disabled\"}") catch {};
+            return;
+        };
+
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var resp_bytes: []const u8 = "{\"ok\":false,\"error\":\"bad request\"}";
+
+        const parsed = std.json.parseFromSlice(std.json.Value, a, data, .{}) catch {
+            self.socket.sendTo(from, resp_bytes) catch {};
+            return;
+        };
+
+        const root = parsed.value;
+        if (root != .object) {
+            self.socket.sendTo(from, resp_bytes) catch {};
+            return;
+        }
+        // token 鉴权（如配置则必须匹配）
+        if (self.control_token) |expected| {
+            const provided_val = root.object.get("token");
+            const provided = if (provided_val) |pv| (if (pv == .string) pv.string else null) else null;
+            if (provided == null or !std.mem.eql(u8, provided.?, expected)) {
+                std.debug.print("[control] token 拒绝 from {}\n", .{from});
+                self.socket.sendTo(from, "{\"ok\":false,\"error\":\"unauthorized\"}") catch {};
+                return;
+            }
+        }
+
+        const control = root.object.get("control");
+        if (control == null or control.? != .object) {
+            self.socket.sendTo(from, resp_bytes) catch {};
+            return;
+        }
+
+        // control 对象应恰好含一个动作键
+        var it = control.?.object.iterator();
+        const entry = it.next() orelse {
+            self.socket.sendTo(from, resp_bytes) catch {};
+            return;
+        };
+
+        if (handler(entry.key_ptr.*, entry.value_ptr.*, a)) |out| {
+            resp_bytes = out;
+        } else {
+            resp_bytes = "{\"ok\":false,\"error\":\"handler failed\"}";
+        }
+
+        self.socket.sendTo(from, resp_bytes) catch |err| {
+            std.debug.print("[control] 响应发送失败: {}\n", .{err});
+        };
+    }
+
     fn handleMessage(self: *ChordNode, msg: Message, from: std.net.Address) void {
         switch (msg) {
             .ping => {
@@ -424,9 +508,8 @@ pub const ChordNode = struct {
             .notify => |body| {
                 const candidate = NodeAddr{ .id = body.node_id, .host = body.node_addr, .port = body.node_port, .tcp_port = body.node_tcp_port };
                 std.debug.print("[chord] ← notify from {} id={s} host={s}:{d} tcp={d}, my_pred={?s}:{?d}\n", .{
-                    from, ring.idToHex(body.node_id), candidate.host, candidate.port, candidate.tcp_port,
-                    if (self.routing.predecessor) |p| p.host else null,
-                    if (self.routing.predecessor) |p| p.port else null,
+                    from,                                               ring.idToHex(body.node_id),                         candidate.host, candidate.port, candidate.tcp_port,
+                    if (self.routing.predecessor) |p| p.host else null, if (self.routing.predecessor) |p| p.port else null,
                 });
                 const old_pred = self.routing.predecessor;
                 self.routing.notifyCandidate(candidate);
@@ -449,11 +532,13 @@ pub const ChordNode = struct {
                     ring.idToHex(body.node_id), body.node_addr, body.node_port,
                 });
                 // 自动审批（以后可扩展为审核队列）
-                const resp = self.reply(from, Message{ .relay_service_resp = .{
-                    .approved = true,
-                    .relay_host = "", // 中继地址由申请方自身配置决定
-                    .relay_port = 0,
-                } });
+                const resp = self.reply(from, Message{
+                    .relay_service_resp = .{
+                        .approved = true,
+                        .relay_host = "", // 中继地址由申请方自身配置决定
+                        .relay_port = 0,
+                    },
+                });
                 if (resp) |_| {
                     std.debug.print("[chord] → relay_service_resp(approved) to {s}\n", .{ring.idToHex(body.node_id)});
                 } else |err| {
@@ -525,8 +610,13 @@ pub const ChordNode = struct {
                     if (result != .allowed) {
                         std.debug.print("[store] dht_get 权限拒绝: {}\n", .{result});
                         self.reply(from, Message{ .dht_get_resp = .{
-                            .found = false, .key = body.key,
-                            .value = "", .owner = "", .permission = 0, .version = 0, .timestamp = 0,
+                            .found = false,
+                            .key = body.key,
+                            .value = "",
+                            .owner = "",
+                            .permission = 0,
+                            .version = 0,
+                            .timestamp = 0,
                         } }) catch {};
                         return;
                     }
@@ -541,8 +631,13 @@ pub const ChordNode = struct {
                     } }) catch {};
                 } else {
                     self.reply(from, Message{ .dht_get_resp = .{
-                        .found = false, .key = body.key,
-                        .value = "", .owner = "", .permission = 0, .version = 0, .timestamp = 0,
+                        .found = false,
+                        .key = body.key,
+                        .value = "",
+                        .owner = "",
+                        .permission = 0,
+                        .version = 0,
+                        .timestamp = 0,
                     } }) catch {};
                 }
             },
@@ -619,9 +714,14 @@ pub const ChordNode = struct {
                 _ = proxy.sendViaProxy(
                     self.alloc,
                     self.proxy_transport,
-                    self.proxy_remote_host, self.proxy_remote_port, self.proxy_remote_path,
-                    to.in.sa.addr, to.in.sa.port,
-                    data, &buf, 5000,
+                    self.proxy_remote_host,
+                    self.proxy_remote_port,
+                    self.proxy_remote_path,
+                    to.in.sa.addr,
+                    to.in.sa.port,
+                    data,
+                    &buf,
+                    5000,
                 ) catch {};
                 return;
             }
@@ -684,8 +784,13 @@ pub const ChordNode = struct {
                         } };
                     } else {
                         return Message{ .dht_get_resp = .{
-                            .found = false, .key = body.key,
-                            .value = "", .owner = "", .permission = 0, .version = 0, .timestamp = 0,
+                            .found = false,
+                            .key = body.key,
+                            .value = "",
+                            .owner = "",
+                            .permission = 0,
+                            .version = 0,
+                            .timestamp = 0,
                         } };
                     }
                 },
@@ -789,8 +894,11 @@ pub const ChordNode = struct {
                 };
                 var buf: [65536]u8 = undefined;
                 const resp_len = client.sendRequest(
-                    std.mem.nativeToBig(u32, target_addr.in.sa.addr), target.port,
-                    encoded, &buf, timeout_ms,
+                    std.mem.nativeToBig(u32, target_addr.in.sa.addr),
+                    target.port,
+                    encoded,
+                    &buf,
+                    timeout_ms,
                 ) catch |err| {
                     std.debug.print("[chord] relay send err: {}\n", .{err});
                     if (self.transport_mode == .tcp) return error.ProxyFailed;
@@ -851,9 +959,14 @@ pub const ChordNode = struct {
                 const resp_len = proxy.sendViaProxy(
                     self.alloc,
                     self.proxy_transport,
-                    self.proxy_remote_host, self.proxy_remote_port, self.proxy_remote_path,
-                    target_addr.in.sa.addr, target.port, // 网络字节序
-                    encoded, &buf, timeout_ms,
+                    self.proxy_remote_host,
+                    self.proxy_remote_port,
+                    self.proxy_remote_path,
+                    target_addr.in.sa.addr,
+                    target.port, // 网络字节序
+                    encoded,
+                    &buf,
+                    timeout_ms,
                 ) catch |err| {
                     std.debug.print("[chord] proxy send err: {}\n", .{err});
                     return error.ProxyFailed;
@@ -967,7 +1080,7 @@ pub const ChordNode = struct {
             return false;
         };
         // 全量重连：清空备份后继列表
-        self.routing.backup_successors = .{null, null};
+        self.routing.backup_successors = .{ null, null };
 
         // 自环检测：Bootstrap 返回了本机 ID，说明该节点的路由表仍指向我们
         // （如重启后残留的 finger 表项）。改用 Bootstrap 节点自身作为后继
@@ -1002,8 +1115,9 @@ pub const ChordNode = struct {
 
         self.routing.setSuccessor(result.successor);
         std.debug.print("[chord] tryBootstrap: 通过 {s}:{d} 找到后继 {s}:{d} tcp={d}\n", .{
-            result.used_addr.host, result.used_addr.port,
-            ring.idToHex(result.successor.id), result.successor.port, result.successor.tcp_port,
+            result.used_addr.host,             result.used_addr.port,
+            ring.idToHex(result.successor.id), result.successor.port,
+            result.successor.tcp_port,
         });
         // Post successor change event
         var zero_id: [20]u8 = undefined;
@@ -1128,6 +1242,43 @@ pub const ChordNode = struct {
                 else => {},
             }
         }
+    }
+
+    /// 迭代查找 key_id 的负责节点：从本地估计出发，逐跳逼近，
+    /// 直到被问节点给出权威应答（answer 满足 key_id ∈ (asked, answer]），最多 8 跳。
+    pub fn locateKey(self: *ChordNode, key_id: NodeId) !NodeAddr {
+        var current = self.routing.findSuccessor(key_id);
+        var hops: u32 = 0;
+        while (hops < 8) : (hops += 1) {
+            const resp = try self.sendAndWait(.{
+                .find_successor = .{ .target = key_id },
+            }, .find_successor_resp, current, 5_000);
+
+            const body = switch (resp) {
+                .find_successor_resp => |b| b,
+                else => return error.UnexpectedResponse,
+            };
+            const answer = NodeAddr{
+                .id = body.node_id,
+                .host = body.node_addr,
+                .port = body.node_port,
+                .tcp_port = body.node_tcp_port,
+            };
+
+            std.debug.print("[locate] hop={d} asked={s} answer={s}\n", .{
+                hops,
+                ring.idToHex(current.id)[0..8],
+                ring.idToHex(answer.id)[0..8],
+            });
+
+            // 权威终止：answer 就是 asked 的直接后继且 key 在其负责区间，
+            // 或 asked 自指（单节点环）
+            if (answer.id == current.id or ring.between(key_id, current.id, answer.id)) {
+                return answer;
+            }
+            current = answer;
+        }
+        return error.TooManyHops;
     }
 
     /// 修复 finger 表下一项

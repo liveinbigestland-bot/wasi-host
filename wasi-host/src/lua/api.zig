@@ -24,7 +24,7 @@ pub const SandboxConfig = struct {
     }
 };
 
-pub const LuaRegistryIndex = -10000;
+pub const LuaRegistryIndex = -1001000;
 pub const LuaEnvIndex = -10001;
 
 pub const Status = enum(c_int) {
@@ -91,6 +91,8 @@ pub const Lua = opaque {
 
 // External C API functions
 pub extern fn lua_newstate(alloc_fn: ?fn (usize, usize) callconv(.C) ?[*]u8, ud: ?*anyopaque) ?*Lua;
+pub extern fn luaL_newstate() ?*Lua;
+pub extern fn luaL_openlibs(L: ?*Lua) void;
 pub extern fn lua_close(L: ?*Lua) void;
 pub extern fn lua_atpanic(L: ?*Lua, panicf: fn (?*Lua) callconv(.C) c_int) c_int;
 pub extern fn lua_version(L: ?*Lua) f64;
@@ -156,8 +158,8 @@ pub inline fn lua_newtable(L: ?*Lua) void {
 }
 pub extern fn lua_pushvfstring(L: ?*Lua, fmt: ?[*]const u8, argp: ?*anyopaque) void;
 pub extern fn lua_pushfstring(L: ?*Lua, fmt: ?[*]const u8, ...) void;
-pub extern fn lua_pushcclosure(L: ?*Lua, f: ?fn (?*Lua) callconv(.C) c_int, n: c_int) void;
-pub inline fn lua_pushcfunction(L: ?*Lua, f: ?fn (?*Lua) callconv(.C) c_int) void {
+pub extern fn lua_pushcclosure(L: ?*Lua, f: ?*const fn (?*Lua) callconv(.C) c_int, n: c_int) void;
+pub inline fn lua_pushcfunction(L: ?*Lua, f: ?*const fn (?*Lua) callconv(.C) c_int) void {
     lua_pushcclosure(L, f, 0);
 }
 pub extern fn lua_pushthread(L: ?*Lua) void;
@@ -193,6 +195,8 @@ pub inline fn luaL_loadbuffer(L: ?*Lua, buff: ?[*]const u8, sz: usize, name: ?[*
     return luaL_loadbufferx(L, buff, sz, name, null);
 }
 pub extern fn lua_dump(L: ?*Lua, writer: ?fn (?*anyopaque, ?[*]const u8, usize) callconv(.C) c_int, dt: ?*anyopaque) c_int;
+pub extern fn luaL_ref(L: ?*Lua, t: c_int) c_int;
+pub extern fn luaL_unref(L: ?*Lua, t: c_int, r: c_int) void;
 pub extern fn lua_yieldk(L: ?*Lua, nresults: c_int, ctx: isize, k: ?*const anyopaque) c_int;
 pub inline fn lua_yield(L: ?*Lua, nresults: c_int) c_int {
     return lua_yieldk(L, nresults, 0, null);

@@ -35,6 +35,9 @@ pub const ApiServer = struct {
     backend: Backend,
     running: bool = false,
 
+    /// 本地控制 UDP 套接字（向 wasi-host 转发插件命令）
+    ctrl_fd: i32 = -1,
+
     // Unix Socket 路径
     pub const default_sock_path = "/tmp/wasi-hostd.sock";
 
@@ -137,10 +140,17 @@ pub const ApiServer = struct {
     /// 停止 API 服务器
     pub fn stop(self: *ApiServer) void {
         self.running = false;
-        if (builtin.os.tag == .linux and self.sock_fd >= 0) {
-            const fd: posix.socket_t = @intCast(self.sock_fd);
-            posix.close(fd);
-            _ = fs.deleteFileAbsolute(self.sock_path) catch {};
+        if (builtin.os.tag == .linux) {
+            if (self.sock_fd >= 0) {
+                const fd: posix.socket_t = @intCast(self.sock_fd);
+                posix.close(fd);
+                _ = fs.deleteFileAbsolute(self.sock_path) catch {};
+            }
+            if (self.ctrl_fd >= 0) {
+                const fd: posix.socket_t = @intCast(self.ctrl_fd);
+                posix.close(fd);
+                self.ctrl_fd = -1;
+            }
         }
     }
 
@@ -206,6 +216,9 @@ pub const ApiServer = struct {
         } else if (std.mem.eql(u8, command, "broadcast")) {
             const broadcast_cmd = args.next() orelse return error.MissingArg;
             try self.handleBroadcast(response, broadcast_cmd);
+        } else if (std.mem.eql(u8, command, "plugin")) {
+            const sub = args.next() orelse return error.MissingArg;
+            try self.handlePlugin(sub, &args, response);
         } else {
             try response.appendSlice("error: unknown command\n");
             try response.appendSlice("try: help\n");
@@ -445,6 +458,227 @@ pub const ApiServer = struct {
         try response.writer().print("broadcast to {d} nodes\n", .{count});
     }
 
+    // ═══════════════════════════════════════════════
+    // 插件控制（转发至 127.0.0.1:<wasi-host> 控制通道）
+    // ═══════════════════════════════════════════════
+
+    fn handlePlugin(
+        self: *ApiServer,
+        sub: []const u8,
+        args: *std.mem.SplitIterator(u8, .scalar),
+        response: *std.ArrayList(u8),
+    ) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const req_bytes = blk: {
+            if (std.mem.eql(u8, sub, "load")) {
+                const ref = args.next() orelse return error.MissingArg;
+                var mem_kb: ?u32 = null;
+                var timeout_ms: ?u32 = null;
+                if (args.next()) |v| mem_kb = std.fmt.parseInt(u32, v, 10) catch null;
+                if (args.next()) |v| timeout_ms = std.fmt.parseInt(u32, v, 10) catch null;
+                break :blk try std.json.stringifyAlloc(a, .{
+                    .control = .{ .plugin_load = .{
+                        .ref = ref,
+                        .config = .{ .mem_kb = mem_kb, .timeout_ms = timeout_ms },
+                    } },
+                }, .{});
+            } else if (std.mem.eql(u8, sub, "publish")) {
+                const ref = args.next() orelse return error.MissingArg;
+                break :blk try std.json.stringifyAlloc(a, .{
+                    .control = .{ .plugin_publish = .{ .ref = ref } },
+                }, .{});
+            } else if (std.mem.eql(u8, sub, "fetch")) {
+                const hash = args.next() orelse return error.MissingArg;
+                var mem_kb: ?u32 = null;
+                var timeout_ms: ?u32 = null;
+                if (args.next()) |v| mem_kb = std.fmt.parseInt(u32, v, 10) catch null;
+                if (args.next()) |v| timeout_ms = std.fmt.parseInt(u32, v, 10) catch null;
+                break :blk try std.json.stringifyAlloc(a, .{
+                    .control = .{ .plugin_fetch = .{
+                        .hash = hash,
+                        .load = true,
+                        .config = .{ .mem_kb = mem_kb, .timeout_ms = timeout_ms },
+                    } },
+                }, .{});
+            } else if (std.mem.eql(u8, sub, "unload")) {
+                const h_str = args.next() orelse return error.MissingArg;
+                const handle = std.fmt.parseInt(u64, h_str, 10) catch return error.InvalidArg;
+                break :blk try std.fmt.allocPrint(a, "{{\"control\":{{\"plugin_unload\":{{\"handle\":{d}}}}}}}", .{handle});
+            } else if (std.mem.eql(u8, sub, "update")) {
+                const h_str = args.next() orelse return error.MissingArg;
+                const handle = std.fmt.parseInt(u64, h_str, 10) catch return error.InvalidArg;
+                const hash = args.next() orelse return error.MissingArg;
+                break :blk try std.json.stringifyAlloc(a, .{
+                    .control = .{ .plugin_update = .{ .handle = handle, .hash = hash } },
+                }, .{});
+            } else if (std.mem.eql(u8, sub, "stop") or
+                std.mem.eql(u8, sub, "pause") or
+                std.mem.eql(u8, sub, "resume") or
+                std.mem.eql(u8, sub, "info"))
+            {
+                const h_str = args.next() orelse return error.MissingArg;
+                const handle = std.fmt.parseInt(u64, h_str, 10) catch return error.InvalidArg;
+                const tag: []const u8 = if (std.mem.eql(u8, sub, "stop"))
+                    "plugin_stop"
+                else if (std.mem.eql(u8, sub, "pause"))
+                    "plugin_pause"
+                else if (std.mem.eql(u8, sub, "resume"))
+                    "plugin_resume"
+                else
+                    "plugin_info";
+                // 动态动作名无法用静态结构表达，直接拼 JSON（handle 为数字，无需转义）
+                break :blk try std.fmt.allocPrint(a, "{{\"control\":{{\"{s}\":{{\"handle\":{d}}}}}}}", .{ tag, handle });
+            } else if (std.mem.eql(u8, sub, "list")) {
+                break :blk try a.dupe(u8, "{\"control\":{\"plugin_list\":{}}}");
+            } else if (std.mem.eql(u8, sub, "active")) {
+                break :blk try a.dupe(u8, "{\"control\":{\"plugin_active\":{}}}");
+            } else {
+                return error.InvalidArg;
+            }
+        };
+
+        // 若配置了 control_token，将其注入信封顶层 {"token":"...",...}
+        const final_req = if (self.backend.config.control_token) |tok|
+            try injectToken(a, req_bytes, tok)
+        else
+            req_bytes;
+
+        const resp_text = self.controlRoundtrip(final_req, a) catch |err| {
+            try response.writer().print("error: control request failed: {}\n", .{err});
+            return;
+        };
+
+        const parsed = std.json.parseFromSlice(std.json.Value, a, resp_text, .{}) catch {
+            try response.writer().print("error: bad response from wasi-host: {s}\n", .{resp_text});
+            return;
+        };
+
+        try self.writePluginText(sub, parsed.value, response);
+    }
+
+    /// 在 JSON 根对象中注入 token 字段：将末尾 '}' 替换为 ',"token":"xxx"}'
+    fn injectToken(a: std.mem.Allocator, req: []const u8, tok: []const u8) ![]u8 {
+        if (req.len < 2) return error.BadRequest;
+        return std.fmt.allocPrint(a, "{s},\"token\":\"{s}\"}}", .{ req[0 .. req.len - 1], tok });
+    }
+
+    /// 向本地 wasi-host 发送控制信封并等待响应（3s 超时）
+    fn controlRoundtrip(self: *ApiServer, req: []const u8, a: std.mem.Allocator) ![]u8 {
+        if (builtin.os.tag != .linux) return error.NotSupported;
+        try self.ensureCtrlFd();
+        const fd: posix.socket_t = @intCast(self.ctrl_fd);
+
+        const target = try std.net.Address.parseIp("127.0.0.1", self.backend.local_port);
+
+        const sent = try posix.sendto(fd, req, 0, &target.any, target.getOsSockLen());
+        if (sent != req.len) return error.SendFailed;
+
+        var buf: [65536]u8 = undefined;
+        const n = posix.read(fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => return error.Timeout,
+            else => return err,
+        };
+        return a.dupe(u8, buf[0..n]);
+    }
+
+    fn ensureCtrlFd(self: *ApiServer) !void {
+        if (builtin.os.tag != .linux) return error.NotSupported;
+        if (self.ctrl_fd >= 0) return;
+        const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+        _ = posix.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC) catch 0;
+
+        const tv = posix.timeval{ .sec = 3, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(tv)) catch {};
+
+        self.ctrl_fd = @intCast(fd);
+    }
+
+    /// JSON 响应 → 文本 key: value
+    fn writePluginText(
+        _: *ApiServer,
+        sub: []const u8,
+        val: std.json.Value,
+        response: *std.ArrayList(u8),
+    ) !void {
+        const w = response.writer();
+        if (val != .object) {
+            try w.print("error: malformed response\n", .{});
+            return;
+        }
+        const obj = val.object;
+        const ok = if (obj.get("ok")) |v| (v == .bool and v.bool) else false;
+        if (!ok) {
+            const msg = if (obj.get("error")) |v| (if (v == .string) v.string else "unknown") else "unknown";
+            try w.print("error: {s}\n", .{msg});
+            return;
+        }
+
+        if (std.mem.eql(u8, sub, "load")) {
+            try w.print("ok\n", .{});
+            if (obj.get("handle")) |h| try w.print("handle: {d}\n", .{h.integer});
+        } else if (std.mem.eql(u8, sub, "publish")) {
+            try w.print("ok\n", .{});
+            if (obj.get("hash")) |v| {
+                if (v == .string) try w.print("hash: {s}\n", .{v.string});
+            }
+            if (obj.get("size")) |v| try w.print("size: {d}\n", .{v.integer});
+        } else if (std.mem.eql(u8, sub, "fetch")) {
+            try w.print("ok\n", .{});
+            if (obj.get("hash")) |v| {
+                if (v == .string) try w.print("hash: {s}\n", .{v.string});
+            }
+            if (obj.get("source")) |v| {
+                if (v == .string) try w.print("source: {s}\n", .{v.string});
+            }
+            if (obj.get("size")) |v| try w.print("size: {d}\n", .{v.integer});
+            if (obj.get("handle")) |v| try w.print("handle: {d}\n", .{v.integer});
+        } else if (std.mem.eql(u8, sub, "stop") or
+            std.mem.eql(u8, sub, "pause") or
+            std.mem.eql(u8, sub, "resume"))
+        {
+            try w.print("ok\n", .{});
+        } else if (std.mem.eql(u8, sub, "unload")) {
+            try w.print("ok\n", .{});
+        } else if (std.mem.eql(u8, sub, "update")) {
+            try w.print("ok\n", .{});
+            if (obj.get("old_handle")) |v| try w.print("old_handle: {d}\n", .{v.integer});
+            if (obj.get("handle")) |v| try w.print("handle: {d}\n", .{v.integer});
+            if (obj.get("source")) |v| {
+                if (v == .string) try w.print("source: {s}\n", .{v.string});
+            }
+        } else if (std.mem.eql(u8, sub, "list")) {
+            const plugins = obj.get("plugins") orelse {
+                try w.print("error: missing plugins\n", .{});
+                return;
+            };
+            if (plugins == .array) {
+                for (plugins.array.items) |p| {
+                    if (p == .string) try w.print("{s}\n", .{p.string});
+                }
+            }
+        } else if (std.mem.eql(u8, sub, "active")) {
+            const active = obj.get("active") orelse {
+                try w.print("error: missing active\n", .{});
+                return;
+            };
+            if (active == .array) {
+                try w.print("active_count: {d}\n", .{active.array.items.len});
+                for (active.array.items) |info| {
+                    try writeInfoText(w, info);
+                }
+            }
+        } else if (std.mem.eql(u8, sub, "info")) {
+            const info = obj.get("info") orelse {
+                try w.print("error: missing info\n", .{});
+                return;
+            };
+            try writeInfoText(w, info);
+        }
+    }
+
     fn handleHelp(_: *ApiServer, response: *std.ArrayList(u8)) !void {
         try response.writer().print(
             \\命令列表:
@@ -466,6 +700,17 @@ pub const ApiServer = struct {
             \\  node <id>         查看某节点上报数据（控制器模式）
             \\  send-task <id> <cmd>  向节点下发任务（控制器模式）
             \\  broadcast <cmd>   广播任务到所有节点（控制器模式）
+            \\  plugin load <ref> [mem_kb] [timeout_ms]  运行时装载插件
+            \\  plugin publish <ref>  内容寻址发布到 DHT（返回 SHA256）
+            \\  plugin fetch <hash> [mem_kb] [timeout_ms]  按哈希拉取并装载
+            \\  plugin stop <handle>   取消插件
+            \\  plugin pause <handle>  暂停插件
+            \\  plugin resume <handle> 恢复插件
+            \\  plugin unload <handle>  卸载已完成实例记录
+            \\  plugin update <handle> <hash>  取消旧实例并装载新版本
+            \\  plugin list       列出 plug/ 下可用插件
+            \\  plugin active     列出所有实例及状态
+            \\  plugin info <handle>  查看实例详情
             \\  help              显示此帮助
             \\
         , .{});
@@ -481,4 +726,35 @@ fn healthName(h: monitor_mod.HealthStatus) []const u8 {
         .ping_timeout => "ping_timeout",
         .unknown => "unknown",
     };
+}
+
+/// 输出单个插件实例信息块
+fn writeInfoText(w: anytype, info_val: std.json.Value) !void {
+    if (info_val != .object) return;
+    const info = info_val.object;
+    try w.print("---\n", .{});
+    if (info.get("handle")) |v| try w.print("handle: {d}\n", .{v.integer});
+    if (info.get("name")) |v| {
+        if (v == .string) try w.print("name: {s}\n", .{v.string});
+    }
+    if (info.get("state")) |v| {
+        if (v == .string) try w.print("state: {s}\n", .{v.string});
+    }
+    if (info.get("duration_ms")) |v| try w.print("duration_ms: {d}\n", .{v.integer});
+    if (info.get("exit_code")) |v| try w.print("exit_code: {d}\n", .{v.integer});
+    if (info.get("error_message")) |v| {
+        if (v == .string and v.string.len > 0) try w.print("error_message: {s}\n", .{v.string});
+    }
+    if (info.get("config")) |cfg| {
+        if (cfg == .object) {
+            if (cfg.object.get("mem_kb")) |v| try w.print("mem_kb: {d}\n", .{v.integer});
+            if (cfg.object.get("timeout_ms")) |v| try w.print("timeout_ms: {d}\n", .{v.integer});
+            if (cfg.object.get("network")) |v| {
+                if (v == .bool) try w.print("network: {}\n", .{v.bool});
+            }
+            if (cfg.object.get("write")) |v| {
+                if (v == .bool) try w.print("write: {}\n", .{v.bool});
+            }
+        }
+    }
 }

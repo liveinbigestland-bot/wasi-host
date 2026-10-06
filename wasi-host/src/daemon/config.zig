@@ -47,6 +47,9 @@ pub const DaemonConfig = struct {
     // Web 管理 API（仅主节点，提供 REST API + 仪表盘）
     web_api_enable: bool = false,
     web_api_port: u16 = 20888,
+
+    // 控制通道鉴权 token（需与 wasi-host 配置的 control_token 一致）
+    control_token: ?[]const u8 = null,
 };
 
 /// 从 JSON 字符串解析守护进程配置

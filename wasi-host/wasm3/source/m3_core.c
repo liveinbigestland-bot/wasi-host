@@ -19,11 +19,10 @@ void m3_Abort(const char* message) {
     abort();
 }
 
-M3_WEAK
-M3Result m3_Yield ()
-{
-    return m3Err_none;
-}
+// m3_Yield and m3_ControlCheck are declared in wasm3.h and *defined by the
+// host executable* (see src/plugin/manager.zig). The interpreter invokes them
+// at function-call boundaries and loop back-edges to support cooperative
+// cancellation / pause (covering pure-CPU infinite loops as well).
 
 #if d_m3LogTimestamps
 

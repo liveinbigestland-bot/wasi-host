@@ -221,7 +221,7 @@ pub const EventQueue = struct {
     }
 
     /// Free heap-allocated strings in payload
-    fn freePayload(self: *Self, payload: EventPayload) void {
+    pub fn freePayload(self: *Self, payload: EventPayload) void {
         switch (payload) {
             .plugin_start => |e| {
                 self.allocator.free(e.plugin_name);

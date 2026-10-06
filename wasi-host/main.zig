@@ -25,6 +25,15 @@ const p2p_bindings = @import("src/host/p2p_bindings.zig");
 const posix = std.posix;
 const lua = @import("src/lua/api.zig");
 const lua_events = @import("src/lua/events.zig");
+const plugin_mod = @import("src/plugin/manager.zig");
+const content_mod = @import("src/plugin/content.zig");
+
+/// 进程级分配器（runPlugin 作为线程入口时无法通过参数获得）
+var g_alloc: std.mem.Allocator = undefined;
+/// 动态插件运行时管理器（worker 完成时回写结果）
+var g_plugin_manager: ?*plugin_mod.Manager = null;
+/// 当前 Chord 节点（动态插件 network=true 时使用）
+var g_chord: ?*chord_node.ChordNode = null;
 
 const plug_ai = @embedFile("plug/ai_plugin.wasm");
 const plug_api = @embedFile("plug/api_plugin.wasm");
@@ -58,6 +67,7 @@ const TopConfig = struct {
     lua_script: ?[]const u8 = null,
     lua_events_enabled: bool = true,
     lua_p2p_events_enabled: bool = true,
+    control_token: ?[]const u8 = null,
 };
 
 fn readCpuUsage() f32 {
@@ -227,118 +237,526 @@ const TimeoutGuard = struct {
 const lua_state_manager_type = @import("src/lua/state.zig").LuaStateManager;
 
 /// WASM 执行 worker 上下文。
-/// 主线程在 setup 阶段完成后，将 env/runtime/mod/entry_fn 所有权转移给 worker。
-/// worker 完成 m3_Call、事件上报和资源释放；若超时则被 detach（资源由
-/// worker 在最终完成或死循环时永久持有——可接受的资源泄漏，优于阻塞主线程）。
+/// launchPlugin 在堆上分配 work；worker 接管 env/runtime，完成 m3_Call、
+/// 事件上报、结果回写和资源释放。控制信号（取消/超时）通过 m3_Yield 与
+/// 循环回边钩子在指令边界生效，worker 因此总能正常退出并释放资源；
+/// 仅当卡在原生宿主调用（如阻塞 socket）时才由等待方 detach。
 const PluginCallWork = struct {
     cfg: PlugConfig,
     env: *wasm3.M3Environment,
     runtime: *wasm3.M3Runtime,
     entry_fn: *wasm3.M3Function,
     lua: ?*lua_state_manager_type,
+    mgr: ?*plugin_mod.Manager,
     plugin_handle: u64,
     start_time: i128,
+    control: *plugin_mod.ControlBlock,
+    /// 模块字节码（wasm3 不拷贝，worker 结束后释放）
+    owned_bytes: []const u8,
+    /// 动态模式 cfg.name 由 worker 释放
+    name_owned: bool,
+    /// 异步模式：worker 自行释放 work；同步模式由等待方 join 后释放
+    self_free: bool,
+    thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn durationMs(self: *PluginCallWork) u64 {
+        const duration_ns = std.time.nanoTimestamp() - self.start_time;
+        if (duration_ns >= 0) {
+            return @intCast(@divTrunc(@as(u128, @intCast(duration_ns)), @as(u128, std.time.ns_per_ms)));
+        }
+        return 0;
+    }
+
+    fn postComplete(self: *PluginCallWork, dur_ms: u64) void {
+        std.debug.print("=== [完成] {s} ===\n", .{self.cfg.name});
+        if (self.lua) |m| {
+            m.postEvent(.{ .plugin_complete = .{
+                .plugin_handle = self.plugin_handle,
+                .exit_code = 0,
+                .duration_ms = dur_ms,
+            } }) catch {};
+        }
+        if (self.mgr) |pm| pm.setResult(self.plugin_handle, .completed, 0, dur_ms, null);
+    }
 
     fn run(self: *PluginCallWork) void {
         defer self.done.store(true, .release);
-        const call_result = wasm3.m3_Call(self.entry_fn, 0, null);
-        const end_time = std.time.nanoTimestamp();
-        const duration_ns = end_time - self.start_time;
-        var duration_ms: u64 = 0;
-        if (duration_ns >= 0) {
-            duration_ms = @as(u64, @intCast(@divTrunc(@as(u128, @intCast(duration_ns)), @as(u128, std.time.ns_per_ms))));
-        }
+        plugin_mod.tls_control = self.control;
+        defer plugin_mod.tls_control = null;
 
-        if (call_result) |msg| {
+        const call_result = wasm3.m3_Call(self.entry_fn, 0, null);
+        const dur_ms = self.durationMs();
+        const sig = self.control.signal.load(.acquire);
+
+        if (sig == plugin_mod.sig_timeout) {
+            std.debug.print("[超时] {s}: 执行超时 {d}ms\n", .{ self.cfg.name, self.cfg.timeout_ms });
+            if (self.lua) |m| {
+                m.postEvent(.{ .plugin_timeout = .{
+                    .plugin_handle = self.plugin_handle,
+                    .timeout_ms = self.cfg.timeout_ms,
+                } }) catch {};
+            }
+            if (self.mgr) |pm| pm.setResult(self.plugin_handle, .timeout, -1, dur_ms, "execution timeout");
+        } else if (sig == plugin_mod.sig_cancel) {
+            std.debug.print("[取消] {s}: 已被请求终止\n", .{self.cfg.name});
+            if (self.lua) |m| {
+                m.postEvent(.{ .plugin_error = .{
+                    .plugin_handle = self.plugin_handle,
+                    .error_code = -7,
+                    .error_message = "cancelled",
+                } }) catch {};
+            }
+            if (self.mgr) |pm| pm.setResult(self.plugin_handle, .cancelled, -7, dur_ms, "cancelled");
+        } else if (call_result) |msg| {
             const slice = std.mem.sliceTo(msg, 0);
-            if (std.mem.indexOf(u8, slice, "exit") == null) {
+            if (std.mem.indexOf(u8, slice, "exit") != null) {
+                self.postComplete(dur_ms);
+            } else {
                 std.debug.print("[错误] {s}: 执行失败 ({s})\n", .{ self.cfg.name, slice });
                 if (self.lua) |m| {
-                    const payload = lua_events.EventPayload{
-                        .plugin_error = .{
-                            .plugin_handle = self.plugin_handle,
-                            .error_code = -5,
-                            .error_message = slice,
-                        },
-                    };
-                    m.postEvent(payload) catch {};
+                    m.postEvent(.{ .plugin_error = .{
+                        .plugin_handle = self.plugin_handle,
+                        .error_code = -5,
+                        .error_message = slice,
+                    } }) catch {};
                 }
-            } else {
-                std.debug.print("=== [完成] {s} ===\n", .{self.cfg.name});
-                if (self.lua) |m| {
-                    const payload = lua_events.EventPayload{
-                        .plugin_complete = .{
-                            .plugin_handle = self.plugin_handle,
-                            .exit_code = 0,
-                            .duration_ms = duration_ms,
-                        },
-                    };
-                    m.postEvent(payload) catch {};
-                }
+                if (self.mgr) |pm| pm.setResult(self.plugin_handle, .failed, -5, dur_ms, slice);
             }
         } else {
-            std.debug.print("=== [完成] {s} ===\n", .{self.cfg.name});
-            if (self.lua) |m| {
-                const payload = lua_events.EventPayload{
-                    .plugin_complete = .{
-                        .plugin_handle = self.plugin_handle,
-                        .exit_code = 0,
-                        .duration_ms = duration_ms,
-                    },
-                };
-                m.postEvent(payload) catch {};
-            }
+            self.postComplete(dur_ms);
         }
 
-        // 释放运行时与环境的归属权（worker 接管）
+        // 释放运行时与环境（worker 接管的所有权）
         wasm3.m3_FreeRuntime(self.runtime);
         wasm3.m3_FreeEnvironment(self.env);
+        g_alloc.free(self.owned_bytes);
+        if (self.name_owned) g_alloc.free(self.cfg.name);
+        if (self.self_free) g_alloc.destroy(self);
     }
 };
 
+fn reportPluginError(lua_manager: ?*lua_state_manager_type, handle: u64, code: i32, msg: []const u8) void {
+    if (lua_manager) |m| {
+        m.postEvent(.{ .plugin_error = .{
+            .plugin_handle = handle,
+            .error_code = code,
+            .error_message = msg,
+        } }) catch {};
+    }
+    if (g_plugin_manager) |pm| pm.setResult(handle, .failed, code, 0, msg);
+}
+
+/// 启动期入口：复制字节码后同步执行（保持原有调用方式）
 fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
-    const plugin_handle = if (lua_manager) |m|
-        m.generatePluginHandle(null) catch 0
+    const bytes = g_alloc.dupe(u8, wasm_bin) catch {
+        std.debug.print("[错误] {s}: 内存不足，无法复制字节码\n", .{cfg.name});
+        return;
+    };
+    _ = launchPlugin(cfg, bytes, maybe_chord, lua_manager, true) catch return;
+}
+
+/// 动态装载入口（Lua/API 触发）：fire-and-forget，立即返回句柄
+fn dynamicLaunch(
+    ctx: ?*anyopaque,
+    name: []const u8,
+    bytes: []const u8,
+    snap: plugin_mod.ConfigSnapshot,
+) !u64 {
+    const lua_manager: ?*lua_state_manager_type = @ptrCast(@alignCast(ctx));
+    // name 来自 Manager 的临时缓冲，这里独立复制并交由 worker 释放
+    const owned_name = g_alloc.dupe(u8, name) catch return error.OutOfMemory;
+    errdefer g_alloc.free(owned_name);
+    const cfg = PlugConfig{
+        .name = owned_name,
+        .embed_path = owned_name,
+        .mem_kb = snap.mem_kb,
+        .timeout_ms = snap.timeout_ms,
+        .network = snap.network,
+        .write = snap.write,
+        .allow_host_info = snap.allow_host_info,
+    };
+    return launchPlugin(cfg, bytes, g_chord, lua_manager, false);
+}
+
+// ── 本地控制通道（daemon API 经 127.0.0.1 UDP 调用）──
+
+const control_info_json = struct {
+    handle: u64,
+    name: []const u8,
+    state: []const u8,
+    duration_ms: u64,
+    exit_code: i32,
+    error_message: ?[]const u8,
+    config: plugin_mod.ConfigSnapshot,
+};
+
+fn infoToJson(arena: std.mem.Allocator, info: anytype) !control_info_json {
+    return .{
+        .handle = info.handle,
+        .name = try arena.dupe(u8, info.name),
+        .state = @tagName(info.state),
+        .duration_ms = info.duration_ms,
+        .exit_code = info.exit_code,
+        .error_message = if (info.error_message) |m| try arena.dupe(u8, m) else null,
+        .config = info.config,
+    };
+}
+
+/// 控制通道处理器；所有临时分配都在 arena 中，由 node.zig 在发送响应后释放
+fn pluginControlHandler(
+    action: []const u8,
+    params: std.json.Value,
+    arena: std.mem.Allocator,
+) ?[]u8 {
+    const pm = g_plugin_manager orelse {
+        return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "plugin manager unavailable" }, .{}) catch null;
+    };
+
+    if (std.mem.eql(u8, action, "plugin_load")) {
+        const p = if (params == .object) params.object else {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "params must be object" }, .{}) catch null;
+        };
+        const ref = p.get("ref") orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "missing ref" }, .{}) catch null;
+        };
+        if (ref != .string) {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "ref must be string" }, .{}) catch null;
+        }
+        const cfg = if (p.get("config")) |c| configFromControlJson(c) else plugin_mod.ConfigSnapshot{};
+        const handle = pm.startFromFile(ref.string, cfg) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+        return std.json.stringifyAlloc(arena, .{ .ok = true, .handle = handle }, .{}) catch null;
+    }
+
+    if (std.mem.eql(u8, action, "plugin_publish")) {
+        const p = if (params == .object) params.object else {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "params must be object" }, .{}) catch null;
+        };
+        const ref = p.get("ref") orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "missing ref" }, .{}) catch null;
+        };
+        if (ref != .string) {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "ref must be string" }, .{}) catch null;
+        }
+        const chord = g_chord orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "p2p unavailable" }, .{}) catch null;
+        };
+
+        const local_bytes = readLocalPluginBytes(arena, ref.string) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+
+        const hex = content_mod.publish(chord, arena, local_bytes) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+        return std.json.stringifyAlloc(arena, .{
+            .ok = true,
+            .hash = @as([]const u8, &hex),
+            .size = local_bytes.len,
+        }, .{}) catch null;
+    }
+
+    if (std.mem.eql(u8, action, "plugin_fetch")) {
+        const p = if (params == .object) params.object else {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "params must be object" }, .{}) catch null;
+        };
+        const hash_val = p.get("hash") orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "missing hash" }, .{}) catch null;
+        };
+        if (hash_val != .string) {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "hash must be string" }, .{}) catch null;
+        }
+        const hex = content_mod.normalizeHash(hash_val.string) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+        const want_load = if (p.get("load")) |v| (if (v == .bool) v.bool else true) else true;
+        const cfg = if (p.get("config")) |c| configFromControlJson(c) else plugin_mod.ConfigSnapshot{};
+
+        // 1. 本地缓存优先
+        var source: []const u8 = "cache";
+        var bytes: []u8 = blk: {
+            if (content_mod.readCache(arena, &hex) catch null) |b| break :blk b;
+            const chord = g_chord orelse {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "p2p unavailable" }, .{}) catch null;
+            };
+            const fetched = content_mod.fetch(chord, arena, &hex) catch |err| {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+            };
+            content_mod.writeCache(&hex, fetched) catch |err| {
+                std.debug.print("[content] 缓存写入失败: {}\n", .{err});
+            };
+            source = "dht";
+            break :blk fetched;
+        };
+
+        var response_info = FetchResponse{
+            .ok = true,
+            .hash = &hex,
+            .size = bytes.len,
+            .source = source,
+            .handle = null,
+        };
+
+        if (want_load) {
+            // worker 以 g_alloc 释放字节码：独立复制一份，使其脱离 arena 生命周期
+            const launch_bytes = g_alloc.dupe(u8, bytes) catch {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "out of memory" }, .{}) catch null;
+            };
+            bytes = launch_bytes;
+            const display_name = std.fmt.allocPrint(arena, "{s}.wasm", .{hex[0..16]}) catch return null;
+            const handle = pm.startFromBytes(display_name, launch_bytes, cfg) catch |err| {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+            };
+            response_info.handle = handle;
+        }
+
+        return std.json.stringifyAlloc(arena, response_info, .{}) catch null;
+    }
+
+    if (std.mem.eql(u8, action, "plugin_list")) {
+        const files = pm.listPluginFiles(arena) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+        const names = arena.alloc([]const u8, files.len) catch return null;
+        for (files, 0..) |f, i| names[i] = f;
+        return std.json.stringifyAlloc(arena, .{ .ok = true, .plugins = names }, .{}) catch null;
+    }
+
+    if (std.mem.eql(u8, action, "plugin_active")) {
+        const infos = pm.snapshotAll(arena) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+        const out = arena.alloc(control_info_json, infos.len) catch return null;
+        for (infos, 0..) |info, i| {
+            out[i] = infoToJson(arena, info) catch return null;
+        }
+        return std.json.stringifyAlloc(arena, .{ .ok = true, .active = out }, .{}) catch null;
+    }
+
+    // 以下动作都需要整数 handle
+    if (std.mem.eql(u8, action, "plugin_stop") or
+        std.mem.eql(u8, action, "plugin_pause") or
+        std.mem.eql(u8, action, "plugin_resume") or
+        std.mem.eql(u8, action, "plugin_info"))
+    {
+        const handle = controlHandleParam(params) orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "missing/invalid handle" }, .{}) catch null;
+        };
+
+        if (std.mem.eql(u8, action, "plugin_info")) {
+            const maybe_info = pm.snapshot(arena, handle) catch |err| {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+            };
+            const info = maybe_info orelse {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "handle not found" }, .{}) catch null;
+            };
+            const out = infoToJson(arena, info) catch return null;
+            return std.json.stringifyAlloc(arena, .{ .ok = true, .info = out }, .{}) catch null;
+        }
+
+        const changed = if (std.mem.eql(u8, action, "plugin_stop"))
+            pm.cancel(handle)
+        else if (std.mem.eql(u8, action, "plugin_pause"))
+            pm.pause(handle)
+        else
+            pm.resumePlugin(handle);
+
+        return std.json.stringifyAlloc(arena, .{ .ok = changed }, .{}) catch null;
+    }
+
+    if (std.mem.eql(u8, action, "plugin_unload")) {
+        const handle = controlHandleParam(params) orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "missing/invalid handle" }, .{}) catch null;
+        };
+        const ok = pm.unload(handle);
+        return std.json.stringifyAlloc(arena, .{ .ok = ok }, .{}) catch null;
+    }
+
+    // 热更新：取消旧实例 → 按 hash 拉取新字节码 → 以原配置重新装载
+    if (std.mem.eql(u8, action, "plugin_update")) {
+        const p = if (params == .object) params.object else {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "params must be object" }, .{}) catch null;
+        };
+        const handle = controlHandleParam(params) orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "missing/invalid handle" }, .{}) catch null;
+        };
+        const hash_val = p.get("hash") orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "missing hash" }, .{}) catch null;
+        };
+        if (hash_val != .string) {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "hash must be string" }, .{}) catch null;
+        }
+        const hex = content_mod.normalizeHash(hash_val.string) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+
+        // 读取旧实例配置快照
+        const maybe_info = pm.snapshot(arena, handle) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+        const old_info = maybe_info orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "handle not found" }, .{}) catch null;
+        };
+        const cfg = old_info.config;
+
+        // 取消旧实例并等待其结束
+        _ = pm.cancel(handle);
+        var wait_ms: u32 = 0;
+        while (wait_ms < 3000) : (wait_ms += 20) {
+            const s = (pm.snapshot(arena, handle) catch null) orelse break;
+            const st = s.state;
+            if (st != .starting and st != .running and st != .paused) break;
+            std.time.sleep(20 * std.time.ns_per_ms);
+        }
+
+        // 拉取新字节码（缓存优先，缺失则 DHT）
+        var source: []const u8 = "cache";
+        const bytes: []u8 = blk: {
+            if (content_mod.readCache(arena, &hex) catch null) |b| break :blk b;
+            const chord = g_chord orelse {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "p2p unavailable" }, .{}) catch null;
+            };
+            const fetched = content_mod.fetch(chord, arena, &hex) catch |err| {
+                return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+            };
+            content_mod.writeCache(&hex, fetched) catch {};
+            source = "dht";
+            break :blk fetched;
+        };
+
+        // 复制字节码脱离 arena，并构造展示名
+        const launch_bytes = g_alloc.dupe(u8, bytes) catch {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "out of memory" }, .{}) catch null;
+        };
+        const display_name = std.fmt.allocPrint(arena, "{s}.wasm", .{hex[0..16]}) catch return null;
+        const new_handle = pm.startFromBytes(display_name, launch_bytes, cfg) catch |err| {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = @errorName(err) }, .{}) catch null;
+        };
+        return std.json.stringifyAlloc(arena, .{ .ok = true, .old_handle = handle, .handle = new_handle, .source = source }, .{}) catch null;
+    }
+
+    return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "unknown action" }, .{}) catch null;
+}
+
+/// fetch 动作响应
+const FetchResponse = struct {
+    ok: bool,
+    hash: []const u8,
+    size: usize,
+    source: []const u8,
+    handle: ?u64,
+};
+
+/// 按 manager 相同约定读取本地插件：.wasm 结尾视为路径，否则解析为 plug/<ref>.wasm
+fn readLocalPluginBytes(arena: std.mem.Allocator, ref: []const u8) ![]u8 {
+    const path = if (std.mem.endsWith(u8, ref, ".wasm"))
+        try arena.dupe(u8, ref)
     else
-        0;
+        try std.fmt.allocPrint(arena, "plug/{s}.wasm", .{ref});
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return error.PluginFileNotFound;
+    defer file.close();
+    return try file.readToEndAlloc(arena, 32 * 1024 * 1024);
+}
+
+fn controlHandleParam(params: std.json.Value) ?u64 {
+    if (params != .object) return null;
+    const h = params.object.get("handle") orelse return null;
+    return switch (h) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        .float => |f| if (f >= 0) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+fn configFromControlJson(v: std.json.Value) plugin_mod.ConfigSnapshot {
+    var cfg = plugin_mod.ConfigSnapshot{};
+    if (v != .object) return cfg;
+    if (v.object.get("mem_kb")) |x| {
+        if (x == .integer and x.integer > 0) cfg.mem_kb = @intCast(x.integer);
+    }
+    if (v.object.get("timeout_ms")) |x| {
+        if (x == .integer and x.integer > 0) cfg.timeout_ms = @intCast(x.integer);
+    }
+    if (v.object.get("network")) |x| {
+        if (x == .bool) cfg.network = x.bool;
+    }
+    if (v.object.get("write")) |x| {
+        if (x == .bool) cfg.write = x.bool;
+    }
+    if (v.object.get("allow_host_info")) |x| {
+        if (x == .bool) cfg.allow_host_info = x.bool;
+    }
+    return cfg;
+}
+
+/// 装载核心。owned_bytes 所有权在本函数终止时统一释放（解析已复制数据）。
+/// wait=true：阻塞至完成/超时（启动期语义）；wait=false：立即返回（动态语义）。
+fn launchPlugin(
+    cfg: PlugConfig,
+    owned_bytes: []const u8,
+    maybe_chord: ?*chord_node.ChordNode,
+    lua_manager: ?*lua_state_manager_type,
+    wait: bool,
+) !u64 {
+    // wasm3 不拷贝字节码：早期错误路径这里释放，成功路径转交 worker
+    var bytes_owned: bool = true;
+    defer if (bytes_owned) g_alloc.free(owned_bytes);
+
+    const name = if (cfg.name.len > 0) cfg.name else cfg.embed_path;
+
+    const handle = blk: {
+        if (lua_manager) |m| break :blk m.generatePluginHandle(null) catch 0;
+        if (g_plugin_manager) |pm| break :blk pm.allocHandle();
+        break :blk 0;
+    };
     const start_time = std.time.nanoTimestamp();
 
     std.debug.print("\n=== [启动] {s} (mem={d}KB, timeout={d}ms, net={}, write={}, host_info={}) ===\n", .{
-        cfg.name, cfg.mem_kb, cfg.timeout_ms, cfg.network, cfg.write, cfg.allow_host_info,
+        name, cfg.mem_kb, cfg.timeout_ms, cfg.network, cfg.write, cfg.allow_host_info,
     });
 
     if (lua_manager) |m| {
-        const payload = lua_events.EventPayload{
-            .plugin_start = .{
-                .plugin_handle = plugin_handle,
-                .plugin_name = cfg.name,
-                .connection_id = null,
-            },
-        };
-        m.postEvent(payload) catch |e| {
+        m.postEvent(.{ .plugin_start = .{
+            .plugin_handle = handle,
+            .plugin_name = name,
+            .connection_id = null,
+        } }) catch |e| {
             std.debug.print("[警告] Lua 事件队列满: {}\n", .{e});
         };
     }
 
+    // 登记注册表，获取控制块（取消/暂停/超时）
+    const control = if (g_plugin_manager) |pm|
+        pm.register(handle, name, .{
+            .mem_kb = cfg.mem_kb,
+            .timeout_ms = cfg.timeout_ms,
+            .network = cfg.network,
+            .write = cfg.write,
+            .allow_host_info = cfg.allow_host_info,
+        }) catch |e| {
+            std.debug.print("[错误] {s}: 注册表登记失败 ({})\n", .{ name, e });
+            reportPluginError(lua_manager, handle, -8, "Failed to register plugin");
+            return e;
+        }
+    else blk: {
+        const c = try g_alloc.create(plugin_mod.ControlBlock);
+        c.* = .{};
+        break :blk c;
+    };
+
     var guard = TimeoutGuard.start(cfg.timeout_ms) catch {
-        std.debug.print("[错误] {s}: 无法创建定时器\n", .{cfg.name});
-        return;
+        std.debug.print("[错误] {s}: 无法创建定时器\n", .{name});
+        reportPluginError(lua_manager, handle, -1, "Failed to create timer");
+        return error.PluginLaunchFailed;
     };
 
     const env = wasm3.m3_NewEnvironment() orelse {
-        std.debug.print("[错误] {s}: 创建环境失败\n", .{cfg.name});
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_error = .{
-                    .plugin_handle = plugin_handle,
-                    .error_code = -1,
-                    .error_message = "Failed to create WASM environment",
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        return;
+        std.debug.print("[错误] {s}: 创建环境失败\n", .{name});
+        reportPluginError(lua_manager, handle, -1, "Failed to create WASM environment");
+        return error.PluginLaunchFailed;
     };
     // 资源所有权标志：早期错误路径由 defer 释放；成功路径转交给 worker。
     var env_owned: bool = true;
@@ -346,77 +764,51 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
 
     const chord_userdata: ?*anyopaque = @ptrCast(maybe_chord);
     const runtime = wasm3.m3_NewRuntime(env, cfg.mem_kb * 1024, chord_userdata) orelse {
-        std.debug.print("[错误] {s}: 创建运行时失败\n", .{cfg.name});
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_error = .{
-                    .plugin_handle = plugin_handle,
-                    .error_code = -1,
-                    .error_message = "Failed to create WASM runtime",
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        return;
+        std.debug.print("[错误] {s}: 创建运行时失败\n", .{name});
+        reportPluginError(lua_manager, handle, -1, "Failed to create WASM runtime");
+        return error.PluginLaunchFailed;
     };
     var runtime_owned: bool = true;
     defer if (runtime_owned) wasm3.m3_FreeRuntime(runtime);
 
     if (guard.check()) {
-        std.debug.print("[超时] {s}: 初始化超时\n", .{cfg.name});
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_timeout = .{
-                    .plugin_handle = plugin_handle,
-                    .timeout_ms = cfg.timeout_ms,
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        return;
+        std.debug.print("[超时] {s}: 初始化超时\n", .{name});
+        reportPluginError(lua_manager, handle, -1, "Initialization timeout");
+        return error.PluginLaunchFailed;
     }
 
     var mod: ?*wasm3.M3Module = null;
-    if (wasm3.m3_ParseModule(env, &mod, wasm_bin.ptr, @intCast(wasm_bin.len)) != 0) {
-        std.debug.print("[错误] {s}: 模块解析失败\n", .{cfg.name});
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_error = .{
-                    .plugin_handle = plugin_handle,
-                    .error_code = -2,
-                    .error_message = "Failed to parse WASM module",
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        return;
+    if (wasm3.m3_ParseModule(env, &mod, owned_bytes.ptr, @intCast(owned_bytes.len)) != 0) {
+        std.debug.print("[错误] {s}: 模块解析失败\n", .{name});
+        reportPluginError(lua_manager, handle, -2, "Failed to parse WASM module");
+        return error.PluginLaunchFailed;
     }
-    if (guard.check()) return;
+    if (guard.check()) {
+        reportPluginError(lua_manager, handle, -2, "Parse timeout");
+        return error.PluginLaunchFailed;
+    }
 
     if (wasm3.m3_LoadModule(runtime, mod) != 0) {
-        std.debug.print("[错误] {s}: 模块加载失败\n", .{cfg.name});
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_error = .{
-                    .plugin_handle = plugin_handle,
-                    .error_code = -3,
-                    .error_message = "Failed to load WASM module",
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        return;
+        std.debug.print("[错误] {s}: 模块加载失败\n", .{name});
+        reportPluginError(lua_manager, handle, -3, "Failed to load WASM module");
+        return error.PluginLaunchFailed;
     }
-    if (guard.check()) return;
+    if (guard.check()) {
+        reportPluginError(lua_manager, handle, -3, "Load timeout");
+        return error.PluginLaunchFailed;
+    }
 
     _ = wasm3.m3_LinkWASI(mod);
     // P0-2 沙箱强制：在 m3_LinkWASI 之后覆盖 fd_write/path_open/fd_fdstat_set_flags，
     // 使 cfg.write=false 时 WASM 无法绕过配置直接调用 WASI 写入或打开文件。
     if (!cfg.write) {
         linkWriteBlockingStubs(mod);
-        std.debug.print("[沙箱] {s}: write=false → 已阻断 WASI fd_write/path_open/fd_fdstat_set_flags\n", .{cfg.name});
+        std.debug.print("[沙箱] {s}: write=false → 已阻断 WASI fd_write/path_open/fd_fdstat_set_flags\n", .{name});
     }
-    if (guard.check()) return;
+    if (guard.check()) {
+        reportPluginError(lua_manager, handle, -3, "Link timeout");
+        return error.PluginLaunchFailed;
+    }
 
     if (cfg.allow_host_info) {
         inline for (.{
@@ -430,7 +822,7 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
             if (result) |msg| {
                 const slice = std.mem.sliceTo(msg, 0);
                 if (std.mem.indexOf(u8, slice, "function lookup") == null) {
-                    std.debug.print("[警告] {s}: 绑定 {s} 失败 ({s})\n", .{ cfg.name, entry[0], slice });
+                    std.debug.print("[警告] {s}: 绑定 {s} 失败 ({s})\n", .{ name, entry[0], slice });
                 }
             }
         }
@@ -447,66 +839,63 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
             if (result) |msg| {
                 const slice = std.mem.sliceTo(msg, 0);
                 if (std.mem.indexOf(u8, slice, "function lookup") == null) {
-                    std.debug.print("[警告] {s}: 绑定 {s} 失败 ({s})\n", .{ cfg.name, entry[0], slice });
+                    std.debug.print("[警告] {s}: 绑定 {s} 失败 ({s})\n", .{ name, entry[0], slice });
                 }
             }
         }
-        std.debug.print("[p2p] 已为 {s} 注册 P2P 宿主函数\n", .{cfg.name});
+        std.debug.print("[p2p] 已为 {s} 注册 P2P 宿主函数\n", .{name});
     }
-    if (guard.check()) return;
+    if (guard.check()) {
+        reportPluginError(lua_manager, handle, -3, "Binding timeout");
+        return error.PluginLaunchFailed;
+    }
 
     var entry_fn: ?*wasm3.M3Function = null;
     if (wasm3.m3_FindFunction(&entry_fn, runtime, "_start") != 0) {
-        std.debug.print("[警告] {s}: 未找到 _start 入口\n", .{cfg.name});
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_error = .{
-                    .plugin_handle = plugin_handle,
-                    .error_code = -4,
-                    .error_message = "Failed to find _start entry point",
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        return;
+        std.debug.print("[警告] {s}: 未找到 _start 入口\n", .{name});
+        reportPluginError(lua_manager, handle, -4, "Failed to find _start entry point");
+        return error.PluginLaunchFailed;
     }
-    if (entry_fn == null) return;
+    if (entry_fn == null) {
+        reportPluginError(lua_manager, handle, -4, "Missing _start entry point");
+        return error.PluginLaunchFailed;
+    }
 
-    // P0-1 超时熔断：将 m3_Call 移到 worker 线程，主线程带超时等待。
-    // 成功路径：转移 env/runtime 所有权给 worker（worker 完成后释放）。
-    // 超时路径：detach worker，runtime/env 由 worker 在最终完成或死循环时持有
-    // （可接受的资源泄漏，优于阻塞主线程）。
-    var work = PluginCallWork{
+    const work = try g_alloc.create(PluginCallWork);
+    errdefer g_alloc.destroy(work);
+    work.* = .{
         .cfg = cfg,
         .env = env,
         .runtime = runtime,
         .entry_fn = entry_fn.?,
         .lua = lua_manager,
-        .plugin_handle = plugin_handle,
+        .mgr = g_plugin_manager,
+        .plugin_handle = handle,
         .start_time = start_time,
+        .control = control,
+        .owned_bytes = owned_bytes,
+        .name_owned = !wait,
+        .self_free = !wait,
     };
     env_owned = false;
     runtime_owned = false;
+    bytes_owned = false;
 
-    const thread = std.Thread.spawn(.{}, PluginCallWork.run, .{&work}) catch |e| {
-        std.debug.print("[错误] {s}: 无法创建执行线程 ({})\n", .{ cfg.name, e });
-        // spawn 失败：reclaim 所有权由 defer 释放
+    work.thread = std.Thread.spawn(.{}, PluginCallWork.run, .{work}) catch |e| {
+        std.debug.print("[错误] {s}: 无法创建执行线程 ({})\n", .{ name, e });
+        reportPluginError(lua_manager, handle, -6, "Failed to spawn worker thread");
+        g_alloc.destroy(work);
         env_owned = true;
         runtime_owned = true;
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_error = .{
-                    .plugin_handle = plugin_handle,
-                    .error_code = -6,
-                    .error_message = "Failed to spawn worker thread",
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        return;
+        return e;
     };
 
-    // 等待 worker，最长 cfg.timeout_ms（10ms 步长轮询）
+    if (!wait) {
+        // 动态模式：立即返回句柄，worker 自行释放 work；完成事件经事件队列通知
+        return handle;
+    }
+
+    // 同步模式：等待 worker，最长 cfg.timeout_ms（10ms 步长轮询）
     var waited: u64 = 0;
     const step_ms: u64 = 10;
     while (waited < cfg.timeout_ms) {
@@ -516,22 +905,29 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
     }
 
     if (work.done.load(.acquire)) {
-        // worker 已完成，join 释放线程资源
-        thread.join();
-    } else {
-        // 超时：detach worker，runtime/env 由 worker 接管（可能永久持有）
-        std.debug.print("[超时] {s}: 执行超时 {d}ms（worker 已 detach）\n", .{ cfg.name, cfg.timeout_ms });
-        if (lua_manager) |m| {
-            const payload = lua_events.EventPayload{
-                .plugin_timeout = .{
-                    .plugin_handle = plugin_handle,
-                    .timeout_ms = cfg.timeout_ms,
-                },
-            };
-            m.postEvent(payload) catch {};
-        }
-        thread.detach();
+        work.thread.?.join();
+        g_alloc.destroy(work);
+        return handle;
     }
+
+    // 超时：先发取消信号，worker 应在指令边界退出；给予 200ms 宽限
+    control.timeoutCancel();
+    var grace: u64 = 0;
+    while (grace < 200) {
+        if (work.done.load(.acquire)) break;
+        std.time.sleep(10 * std.time.ns_per_ms);
+        grace += 10;
+    }
+
+    if (work.done.load(.acquire)) {
+        work.thread.?.join();
+        g_alloc.destroy(work);
+    } else {
+        // 卡在原生宿主调用（如阻塞 socket）：无法中断，detach 兜底
+        std.debug.print("[超时] {s}: 执行超时 {d}ms（worker 已 detach）\n", .{ name, cfg.timeout_ms });
+        work.thread.?.detach();
+    }
+    return handle;
 }
 
 /// 初始化 P2P 身份：加载或生成 ED25519 密钥
@@ -637,6 +1033,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
+    g_alloc = alloc;
 
     // ── CLI args ───────────────────────────────────────────────
     const args = try std.process.argsAlloc(alloc);
@@ -669,6 +1066,17 @@ pub fn main() !void {
 
     // Set global LuaStateManager reference for host functions
     @import("src/lua/host_functions.zig").HostFunctions.setLuaStateManager(&lua_state_manager);
+    // 注册 wasm_* host 函数到全局 Lua 状态
+    @import("src/lua/host_functions.zig").HostFunctions.register(lua_state_manager.global_state);
+
+    // ── 动态插件运行时 ───────────────────────────────────────
+    const plugin_manager = try plugin_mod.Manager.init(alloc);
+    defer plugin_manager.deinit();
+    g_plugin_manager = plugin_manager;
+    defer g_plugin_manager = null;
+    plugin_mod.global_manager = plugin_manager;
+    defer plugin_mod.global_manager = null;
+    plugin_manager.setLauncher(dynamicLaunch, @ptrCast(&lua_state_manager));
 
     // Load Lua script if configured
     if (top_cfg) |c| {
@@ -921,6 +1329,12 @@ pub fn main() !void {
             // const p2p_events_enabled = if (top_cfg) |c| c.value.lua_p2p_events_enabled else true;
             // chord.initLua(&lua_state_manager, p2p_events_enabled); // Temporarily disabled
             maybe_chord = &chord;
+            g_chord = &chord;
+            content_mod.setChord(&chord);
+            chord.control_handler = pluginControlHandler;
+            if (top_cfg) |c| {
+                if (c.value.control_token) |tok| chord.control_token = tok;
+            }
 
             // 启动加密中继 readerLoop（接收其他节点转发来的数据）
             if (maybe_encrypted_relay) |erc| {
@@ -1100,14 +1514,27 @@ pub fn main() !void {
     if (p2p_cfg != null and p2p_cfg.?.enabled) {
         const run_duration = p2p_cfg.?.run_duration_s;
         std.debug.print("[chord] 保持运行 {d}s 以完成 stabilize...\n", .{run_duration});
-        var elapsed: u64 = 0;
         const print_interval = if (run_duration > 20) run_duration / 4 else run_duration;
-        while (elapsed < run_duration) {
-            std.time.sleep(1 * std.time.ns_per_s);
-            elapsed += 1;
+        var elapsed_s: u64 = 0;
+        var ticks_this_s: u32 = 0;
+        while (elapsed_s < run_duration) {
+            // 持续驱动事件循环（收消息/stabilize/看门狗/控制通道），100ms 一拍
             if (maybe_chord) |chord| {
-                if (elapsed % print_interval == 0 or elapsed == run_duration) {
-                    chord.printState();
+                chord.tick() catch |err| {
+                    std.debug.print("[chord] tick 错误: {}\n", .{err});
+                };
+            }
+            // 同步派发 Lua 事件（wasm_on_event 回调在此线程执行）
+            lua_state_manager.processEvents(10);
+            std.time.sleep(100 * std.time.ns_per_ms);
+            ticks_this_s += 1;
+            if (ticks_this_s >= 10) {
+                ticks_this_s = 0;
+                elapsed_s += 1;
+                if (maybe_chord) |chord| {
+                    if (elapsed_s % print_interval == 0 or elapsed_s == run_duration) {
+                        chord.printState();
+                    }
                 }
             }
         }

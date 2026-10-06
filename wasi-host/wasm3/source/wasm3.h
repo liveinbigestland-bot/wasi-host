@@ -288,6 +288,8 @@ d_m3ErrorConst  (trapStackOverflow,             "[trap] stack overflow")
 //-------------------------------------------------------------------------------------------------------------------------------
     M3Result            m3_Yield                    (void);
 
+    M3Result            m3_ControlCheck             (void);
+
     // o_function is valid during the lifetime of the originating runtime
     M3Result            m3_FindFunction             (IM3Function *          o_function,
                                                      IM3Runtime             i_runtime,

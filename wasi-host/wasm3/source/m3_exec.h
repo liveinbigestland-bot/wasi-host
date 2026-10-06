@@ -913,7 +913,16 @@ d_m3Op  (Loop)
 
 d_m3Op  (Branch)
 {
-    jumpOp (* _pc);
+    pc_t target = * _pc;
+
+    // Backward edge (loop back-edge): host can cooperatively cancel/pause here.
+    if (M3_UNLIKELY(target <= _pc))
+    {
+        m3ret_t possible_trap = m3_ControlCheck ();
+        if (possible_trap) return possible_trap;
+    }
+
+    jumpOp (target);
 }
 
 
@@ -953,7 +962,15 @@ d_m3Op  (BranchTable)
     if (branchIndex > numTargets)
         branchIndex = numTargets; // the default index
 
-    jumpOp (branches [branchIndex]);
+    pc_t target = branches [branchIndex];
+
+    if (M3_UNLIKELY(target <= _pc))
+    {
+        m3ret_t possible_trap = m3_ControlCheck ();
+        if (possible_trap) return possible_trap;
+    }
+
+    jumpOp (target);
 }
 
 
@@ -1232,9 +1249,9 @@ d_m3Op  (ContinueLoop)
 {
     m3StackCheck();
 
-    // TODO: this is where execution can "escape" the M3 code and callback to the client / fiber switch
-    // OR it can go in the Loop operation. I think it's best to do here. adding code to the loop operation
-    // has the potential to increase its native-stack usage. (don't forget ContinueLoopIf too.)
+    // Loop continuation: host can cooperatively cancel/pause here.
+    m3ret_t possible_trap = m3_ControlCheck ();
+    if (possible_trap) return possible_trap;
 
     void * loopId = immediate (void *);
     return loopId;
@@ -1248,6 +1265,8 @@ d_m3Op  (ContinueLoopIf)
 
     if (condition)
     {
+        m3ret_t possible_trap = m3_ControlCheck ();
+        if (possible_trap) return possible_trap;
         return loopId;
     }
     else nextOp ();

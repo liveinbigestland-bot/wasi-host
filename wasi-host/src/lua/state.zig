@@ -49,10 +49,14 @@ pub const LuaStateManager = struct {
     sandboxed_connections: std.AutoHashMap(u64, bool),
 
     pub fn init(allocator: std.mem.Allocator) !LuaStateManager {
+        // 创建全局 Lua 状态并打开标准库
+        const gstate = lua.luaL_newstate() orelse return error.OutOfMemory;
+        lua.luaL_openlibs(gstate);
+
         const sandbox_config = lua.SandboxConfig.init(allocator);
 
         const manager = LuaStateManager{
-            .global_state = undefined, // Will be initialized later if needed
+            .global_state = gstate,
             .connection_states = std.AutoHashMap(u64, struct { lua.LuaState, u64, u64 }).init(allocator),
             .connection_plugins = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
             .event_queue = events.EventQueue.init(allocator),
@@ -138,11 +142,11 @@ pub const LuaStateManager = struct {
     }
 
     pub fn deinit(self: *LuaStateManager) void {
-        self.global_state.deinit();
+        lua.lua_close(self.global_state);
         var it = self.connection_states.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr[0].state) |s| {
-                s.deinit();
+                lua.lua_close(s);
             }
             entry.value_ptr[1] = 0;
             entry.value_ptr[2] = 0;
@@ -195,7 +199,7 @@ pub const LuaStateManager = struct {
         } else {
             const new_state = try lua.LuaState.init();
             // Register host functions to new connection state
-            host_functions.register(&new_state);
+            host_functions.register(new_state.state);
             const now = std.time.nanoTimestamp();
             try self.connection_states.put(connection_id, .{ new_state, now, now });
             return &new_state;
@@ -204,7 +208,7 @@ pub const LuaStateManager = struct {
 
     pub fn removeConnectionState(self: *LuaStateManager, connection_id: u64) void {
         if (self.connection_states.fetchRemove(connection_id)) |entry| {
-            entry.value.state.deinit();
+            if (entry.value[0].state) |s| lua.lua_close(s);
         }
         // Remove plugin list for this connection
         if (self.connection_plugins.fetchRemove(connection_id)) |entry| {
@@ -259,14 +263,14 @@ pub const LuaStateManager = struct {
         const logger = std.log.scoped(.wasi_lua);
 
         switch (payload) {
-            .plugin_start => |e| logger.debug("Lua event: plugin_start handle={} name={}", .{ e.plugin_handle, e.plugin_name }),
+            .plugin_start => |e| logger.debug("Lua event: plugin_start handle={} name={s}", .{ e.plugin_handle, e.plugin_name }),
             .plugin_stop => |e| logger.debug("Lua event: plugin_stop handle={} exit_code={}", .{ e.plugin_handle, e.exit_code }),
             .plugin_error => |e| logger.err("Lua event: plugin_error handle={} code={} msg={s}", .{ e.plugin_handle, e.error_code, e.error_message }),
             .plugin_complete => |e| logger.debug("Lua event: plugin_complete handle={} exit_code={} duration_ms={}", .{ e.plugin_handle, e.exit_code, e.duration_ms }),
             .plugin_timeout => |e| logger.warn("Lua event: plugin_timeout handle={} timeout_ms={}", .{ e.plugin_handle, e.timeout_ms }),
-            .chord_node_join => |e| logger.debug("Lua event: chord_node_join node_id={} host={} port={}", .{ e.node_id, e.host, e.port }),
-            .chord_successor_change => |e| logger.debug("Lua event: chord_successor_change old={} new={}", .{ e.old_successor_id, e.new_successor_id }),
-            .dht_put => |e| logger.debug("Lua event: dht_put key={} size={}", .{ e.key, e.value_size }),
+            .chord_node_join => |e| logger.debug("Lua event: chord_node_join node_id={s} host={s} port={}", .{ e.node_id, e.host, e.port }),
+            .chord_successor_change => |e| logger.debug("Lua event: chord_successor_change old={s} new={s}", .{ e.old_successor_id, e.new_successor_id }),
+            .dht_put => |e| logger.debug("Lua event: dht_put key={s} size={}", .{ e.key, e.value_size }),
         }
     }
 
@@ -285,78 +289,78 @@ pub const LuaStateManager = struct {
         // Add event-specific fields
         switch (payload) {
             .plugin_start => |e| {
-                try lua.lua_pushnumber(self.global_state, @floatFromInt(e.plugin_handle));
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.plugin_handle));
                 lua.lua_setfield(self.global_state, -2, "plugin_handle");
 
-                try lua.lua_pushstring(self.global_state, e.plugin_name);
+                lua.lua_pushlstring(self.global_state, e.plugin_name.ptr, e.plugin_name.len);
                 lua.lua_setfield(self.global_state, -2, "plugin_name");
 
                 if (e.connection_id) |cid| {
-                    try lua.lua_pushnumber(self.global_state, cid);
+                    lua.lua_pushnumber(self.global_state, @floatFromInt(cid));
                     lua.lua_setfield(self.global_state, -2, "connection_id");
                 }
             },
             .plugin_stop => |e| {
-                try lua.lua_pushnumber(self.global_state, e.plugin_handle);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.plugin_handle));
                 lua.lua_setfield(self.global_state, -2, "plugin_handle");
 
-                try lua.lua_pushnumber(self.global_state, e.exit_code);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.exit_code));
                 lua.lua_setfield(self.global_state, -2, "exit_code");
             },
             .plugin_error => |e| {
-                try lua.lua_pushnumber(self.global_state, e.plugin_handle);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.plugin_handle));
                 lua.lua_setfield(self.global_state, -2, "plugin_handle");
 
-                try lua.lua_pushnumber(self.global_state, e.error_code);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.error_code));
                 lua.lua_setfield(self.global_state, -2, "error_code");
 
-                try lua.lua_pushstring(self.global_state, e.error_message);
+                lua.lua_pushlstring(self.global_state, e.error_message.ptr, e.error_message.len);
                 lua.lua_setfield(self.global_state, -2, "error_message");
             },
             .plugin_complete => |e| {
-                try lua.lua_pushnumber(self.global_state, e.plugin_handle);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.plugin_handle));
                 lua.lua_setfield(self.global_state, -2, "plugin_handle");
 
-                try lua.lua_pushnumber(self.global_state, e.exit_code);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.exit_code));
                 lua.lua_setfield(self.global_state, -2, "exit_code");
 
-                try lua.lua_pushnumber(self.global_state, e.duration_ms);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.duration_ms));
                 lua.lua_setfield(self.global_state, -2, "duration_ms");
             },
             .plugin_timeout => |e| {
-                try lua.lua_pushnumber(self.global_state, e.plugin_handle);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.plugin_handle));
                 lua.lua_setfield(self.global_state, -2, "plugin_handle");
 
-                try lua.lua_pushnumber(self.global_state, e.timeout_ms);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.timeout_ms));
                 lua.lua_setfield(self.global_state, -2, "timeout_ms");
             },
             .chord_node_join => |e| {
-                try lua.lua_pushlstring(self.global_state, &e.node_id, e.node_id.len);
+                lua.lua_pushlstring(self.global_state, &e.node_id, e.node_id.len);
                 lua.lua_setfield(self.global_state, -2, "node_id");
 
-                try lua.lua_pushstring(self.global_state, e.host);
+                lua.lua_pushlstring(self.global_state, e.host.ptr, e.host.len);
                 lua.lua_setfield(self.global_state, -2, "host");
 
-                try lua.lua_pushnumber(self.global_state, e.port);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.port));
                 lua.lua_setfield(self.global_state, -2, "port");
             },
             .chord_successor_change => |e| {
-                try lua.lua_pushlstring(self.global_state, &e.old_successor_id, e.old_successor_id.len);
+                lua.lua_pushlstring(self.global_state, &e.old_successor_id, e.old_successor_id.len);
                 lua.lua_setfield(self.global_state, -2, "old_successor_id");
 
-                try lua.lua_pushlstring(self.global_state, &e.new_successor_id, e.new_successor_id.len);
+                lua.lua_pushlstring(self.global_state, &e.new_successor_id, e.new_successor_id.len);
                 lua.lua_setfield(self.global_state, -2, "new_successor_id");
             },
             .dht_put => |e| {
-                try lua.lua_pushstring(self.global_state, e.key);
+                lua.lua_pushlstring(self.global_state, e.key.ptr, e.key.len);
                 lua.lua_setfield(self.global_state, -2, "key");
 
-                try lua.lua_pushnumber(self.global_state, e.value_size);
+                lua.lua_pushnumber(self.global_state, @floatFromInt(e.value_size));
                 lua.lua_setfield(self.global_state, -2, "value_size");
             },
         }
 
-        logger.debug("Encoded Lua event table");
+        logger.debug("Encoded Lua event table", .{});
     }
 
     /// Invoke Lua callback with error handling
@@ -368,7 +372,7 @@ pub const LuaStateManager = struct {
 
         // Call the callback function with the payload table
         const status = lua.lua_pcall(callback_state.state, 1, 0, 0);
-        if (status != lua.Lua.Status.ok) {
+        if (status != lua.Status.ok) {
             // Callback failed - get error message and log it
             const error_msg = lua.lua_tostring(callback_state.state, -1);
             if (error_msg) |msg| {
@@ -386,22 +390,44 @@ pub const LuaStateManager = struct {
 
         while (true) {
             if (self.event_queue.consume()) |payload| {
-                // Invoke callback for this event type, or use default handler
                 const event_type_name = @tagName(payload);
+                var handled = false;
+
+                // 路径 1：LuaStateManager.callbacks（p2p 内部注册）
                 if (self.callbacks.get(event_type_name)) |callback_state| {
-                    // Encode payload to Lua table
                     const result = self.encodePayloadToTable(payload);
                     if (result != null) {
                         // Payload table is on top of the stack
-                        // Invoke callback with error handling
-                        _ = self.invokeCallback(callback_state, lua.lua_getTop(callback_state));
+                        self.invokeCallback(callback_state, lua.lua_gettop(callback_state.state)) catch {};
                         // Pop the payload table from stack
                         lua.lua_pop(callback_state.state, 1);
-                    } else {
-                        // Payload encoding failed - use default handler
-                        self.defaultEventHandler(payload);
+                        handled = true;
                     }
-                } else {
+                }
+
+                // 路径 2：经 Lua wasm_on_event 注册的 registry ref
+                if (!handled) {
+                    if (host_functions.lookupEventRef(event_type_name)) |ref| {
+                        const result = self.encodePayloadToTable(payload);
+                        if (result != null) {
+                            // 栈: [payload table]
+                            lua.lua_rawgeti(self.global_state, lua.LuaRegistryIndex, ref); // [table, fn]
+                            lua.lua_pushvalue(self.global_state, -2); // [table, fn, table]
+                            const status = lua.lua_pcall(self.global_state, 1, 0, 0);
+                            if (status != lua.Status.ok) {
+                                const error_msg = lua.lua_tostring(self.global_state, -1);
+                                if (error_msg) |msg| {
+                                    std.log.err("Lua callback error: {s}", .{std.mem.sliceTo(msg, 0)});
+                                }
+                                lua.lua_pop(self.global_state, 1);
+                            }
+                            lua.lua_pop(self.global_state, 1); // pop payload table
+                            handled = true;
+                        }
+                    }
+                }
+
+                if (!handled) {
                     // No callback registered, use default logging handler
                     self.defaultEventHandler(payload);
                 }
@@ -426,12 +452,12 @@ pub const LuaStateManager = struct {
 
     pub fn triggerGC(self: *LuaStateManager) void {
         // Trigger garbage collection on global state
-        _ = lua.lua_gc(self.global_state, lua.Lua.GC.COLLECT, 0);
+        _ = lua.lua_gc(self.global_state, @intFromEnum(lua.GC.COLLECT), 0);
 
         // Trigger GC on all connection states
         var it = self.connection_states.iterator();
         while (it.next()) |entry| {
-            _ = lua.lua_gc(entry.value_ptr.state, lua.Lua.GC.COLLECT, 0);
+            _ = lua.lua_gc(entry.value_ptr.@"0".state, @intFromEnum(lua.GC.COLLECT), 0);
         }
     }
 
