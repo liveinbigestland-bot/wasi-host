@@ -158,6 +158,7 @@ pub fn build(b: *std.Build) void {
             .target = host_target,
             .optimize = optimize,
         });
+        test_obj.root_module.addImport("logging", logging_module);
         const run_test = b.addRunArtifact(test_obj);
         test_step.dependOn(&run_test.step);
     }

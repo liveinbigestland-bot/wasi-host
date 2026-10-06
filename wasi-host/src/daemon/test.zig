@@ -678,9 +678,9 @@ test "controller handleReport version mismatch triggers update_binary" {
     const response = try ctrl.handleReport(report_json);
     defer testing.allocator.free(response);
 
+    // 任务在响应中下发后即从 pending 队列清除（buildResponse 语义）
     const info = ctrl.getNodeInfo("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") orelse return error.TestFailed;
-    try testing.expect(info.pending_tasks.items.len > 0);
-    try testing.expectEqualSlices(u8, "update_binary", info.pending_tasks.items[0].command);
+    try testing.expectEqual(@as(usize, 0), info.pending_tasks.items.len);
 
     // Response should include the task
     try testing.expect(std.mem.indexOf(u8, response, "update_binary") != null);
@@ -701,9 +701,14 @@ test "controller handleReport multiple reports increment count" {
         \\}
     ;
 
-    _ = try ctrl.handleReport(report_json);
-    _ = try ctrl.handleReport(report_json);
-    _ = try ctrl.handleReport(report_json);
+    {
+        const r1 = try ctrl.handleReport(report_json);
+        defer testing.allocator.free(r1);
+        const r2 = try ctrl.handleReport(report_json);
+        defer testing.allocator.free(r2);
+        const r3 = try ctrl.handleReport(report_json);
+        defer testing.allocator.free(r3);
+    }
 
     const info = ctrl.getNodeInfo("cccccccccccccccccccccccccccccccccccccccc") orelse return error.TestFailed;
     try testing.expectEqual(@as(u64, 3), info.report_count);
@@ -722,8 +727,12 @@ test "controller handleReport two distinct nodes" {
         \\{"node_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "wasi_host_version": "1.0.0", "daemon_version": "1.0.0"}
     ;
 
-    _ = try ctrl.handleReport(report1);
-    _ = try ctrl.handleReport(report2);
+    {
+        const r1 = try ctrl.handleReport(report1);
+        defer testing.allocator.free(r1);
+        const r2 = try ctrl.handleReport(report2);
+        defer testing.allocator.free(r2);
+    }
 
     try testing.expectEqual(@as(usize, 2), ctrl.nodeCount());
 
@@ -737,7 +746,8 @@ test "controller handleReport missing node_id returns error" {
     var ctrl = controller_mod.Controller.init(testing.allocator, cfg, "1.0.0");
     defer ctrl.deinit();
 
-    const bad_json = \\{"type": "report"}
+    const bad_json =
+        \\{"type": "report"}
     ;
     try testing.expectError(error.MissingNodeId, ctrl.handleReport(bad_json));
 }
@@ -751,7 +761,8 @@ test "controller addTask works after node registered via handleReport" {
     const report =
         \\{"node_id": "ffffffffffffffffffffffffffffffffffffffff", "wasi_host_version": "1.0.0", "daemon_version": "1.0.0"}
     ;
-    _ = try ctrl.handleReport(report);
+    const report_resp = try ctrl.handleReport(report);
+    defer testing.allocator.free(report_resp);
 
     const added = try ctrl.addTask("ffffffffffffffffffffffffffffffffffffffff", "restart");
     try testing.expect(added);
@@ -863,8 +874,8 @@ test "reporter buildReport health section is correct" {
     // Health status should be one of the known values
     try testing.expect(
         std.mem.indexOf(u8, json, "\"status\": \"ok\"") != null or
-        std.mem.indexOf(u8, json, "\"status\": \"isolated\"") != null or
-        std.mem.indexOf(u8, json, "\"status\": \"unknown\"") != null,
+            std.mem.indexOf(u8, json, "\"status\": \"isolated\"") != null or
+            std.mem.indexOf(u8, json, "\"status\": \"unknown\"") != null,
     );
 }
 

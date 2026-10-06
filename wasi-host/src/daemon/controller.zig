@@ -303,17 +303,17 @@ pub const Controller = struct {
                 .daemon_version = try self.alloc.dupe(u8, daemon_version),
                 .pending_tasks = std.ArrayList(Task).init(self.alloc),
             };
-            try self.nodes.put(try self.alloc.dupe(u8, node_id_hex), info);
+            try self.nodes.put(info.node_id_hex, info);
         }
 
         // 自动版本检查：版本不匹配时下发 update_binary
+        // 注意：新注册节点的 NodeInfo 指针须经 get 重新获取，
+        // HashMap 扩容会使注册路径上的局部指针失效
         if (node_version.len > 0 and !std.mem.eql(u8, node_version, self.version)) {
-            if (existing) |info| {
+            if (self.nodes.get(node_id_hex)) |info| {
                 if (!hasPendingUpdate(info)) {
                     try self.addUpdateTask(node_id_hex);
                 }
-            } else {
-                try self.addUpdateTask(node_id_hex);
             }
         }
 

@@ -47,6 +47,7 @@ test "checkRead checkWrite for owner vs non-owner" {
     const other_pk = "pk-other";
 
     // Setup: owner creates a private entry
+    // 字段为字符串字面量（非堆分配），不可调用 deinit
     var entry = DHTEntry{
         .key = @constCast("k"),
         .value = @constCast("v"),
@@ -55,7 +56,6 @@ test "checkRead checkWrite for owner vs non-owner" {
         .version = 1,
         .timestamp = 0,
     };
-    defer entry.deinit(std.testing.allocator);
 
     // Owner can always read/write
     try std.testing.expectEqual(PermissionResult.allowed, checkRead(&entry, owner_pk));

@@ -1,5 +1,4 @@
 /// DHT KV 存储：内存 HashMap + 文件持久化
-
 const std = @import("std");
 const logging = @import("logging");
 const log = logging.log;
@@ -57,10 +56,11 @@ pub const KVStore = struct {
         if (data.len == 0) return;
 
         const snapshot = try std.json.parseFromSliceLeaky(meta_types.StoreSnapshot, self.alloc, data, .{ .allocate = .alloc_always });
+        // entries 结构体按值拷入 map，外层数组本身可即释放（内部切片由 map 持有）
+        defer self.alloc.free(snapshot.entries);
         for (snapshot.entries) |entry| {
-            const key_copy = try self.alloc.dupe(u8, entry.key);
-            errdefer self.alloc.free(key_copy);
-            try self.map.put(self.alloc, key_copy, entry);
+            // entry.key 已由 parseFromSliceLeaky 分配，直接兼作 map 键（避免双份分配泄漏）
+            try self.map.put(self.alloc, entry.key, entry);
             if (entry.version >= self.next_version) {
                 self.next_version = entry.version + 1;
             }
@@ -130,7 +130,8 @@ pub const KVStore = struct {
             .timestamp = std.time.milliTimestamp(),
         };
 
-        try self.map.put(self.alloc, try self.alloc.dupe(u8, key), entry);
+        // entry.key 兼作 map 键（单份分配，deinit 随 entry 一并释放）
+        try self.map.put(self.alloc, entry.key, entry);
         self.dirty = true;
 
         return entry;
@@ -147,8 +148,8 @@ pub const KVStore = struct {
     pub fn delete(self: *KVStore, key: []const u8) bool {
         if (self.map.fetchRemove(key)) |kv| {
             var entry = kv.value;
+            // map 键与 entry.key 为同一分配，entry.deinit 已释放
             entry.deinit(self.alloc);
-            self.alloc.free(kv.key);
             self.dirty = true;
             return true;
         }
@@ -242,7 +243,7 @@ test "kvstore persistence save load" {
 
     // Save phase
     {
-        var store = KVStore.init(alloc, data_dir);
+        var store = KVStore.init(alloc, try alloc.dupe(u8, data_dir));
         defer store.deinit();
 
         _ = try store.put("k1", "v1", "owner", Permission.public_read);
@@ -253,7 +254,7 @@ test "kvstore persistence save load" {
 
     // Load phase — verify data survived
     {
-        var store = KVStore.init(alloc, data_dir);
+        var store = KVStore.init(alloc, try alloc.dupe(u8, data_dir));
         defer store.deinit();
         try store.load();
 
@@ -278,7 +279,7 @@ test "kvstore version tracking across saves" {
     defer alloc.free(data_dir);
 
     {
-        var store = KVStore.init(alloc, data_dir);
+        var store = KVStore.init(alloc, try alloc.dupe(u8, data_dir));
         defer store.deinit();
         _ = try store.put("k1", "v1", "owner", Permission.public_read);
         _ = try store.put("k2", "v2", "owner", Permission.public_read);
@@ -287,7 +288,7 @@ test "kvstore version tracking across saves" {
     }
     // next_version should continue from where it left off
     {
-        var store = KVStore.init(alloc, data_dir);
+        var store = KVStore.init(alloc, try alloc.dupe(u8, data_dir));
         defer store.deinit();
         try store.load();
 

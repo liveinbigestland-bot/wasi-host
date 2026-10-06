@@ -14,7 +14,7 @@ pub const SupervisorStatus = struct {
     crash_count: u32 = 0,
     last_crash_time: i64 = 0,
     penalty_until: i64 = 0, // 时间戳，在此时间之前不重启
-    stable_start: i64 = 0,  // 本次稳定运行起始时间（用于判断 stable_period）
+    stable_start: i64 = 0, // 本次稳定运行起始时间（用于判断 stable_period）
     in_penalty: bool = false,
 };
 
@@ -181,6 +181,7 @@ pub const Supervisor = struct {
 
     /// 强制停止子进程
     pub fn killChild(self: *Supervisor) void {
+        self.should_stop = true;
         self.signal(9); // SIGKILL
     }
 
