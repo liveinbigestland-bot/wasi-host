@@ -78,10 +78,6 @@ git push
 git status         # 确认 "up to date with origin"
 ```
 
-**bd (beads) 任务跟踪**：当前 `bd dolt push` 存在 panic 问题（需调查），
-任务状态可用 `bd ready` / `bd close <id>` 管理，但数据推送暂不可靠。
-不要使用 TodoWrite 替代 bd。
-
 ## 临时文件规范
 
 - 根目录禁止遗留一次性脚本（test_*.py、deploy_*.py、fix_*.ps1 等）
@@ -90,5 +86,4 @@ git status         # 确认 "up to date with origin"
 
 ## 已知问题
 
-- `bd dolt push` panic（dolt 版本兼容性问题，待修复）
 - `web config overrides` 测试在 Windows 上偶发失败（端口占用），Linux 正常
