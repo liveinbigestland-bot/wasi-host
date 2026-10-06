@@ -1,0 +1,4 @@
+repos:
+  primary: "."
+  additional:
+    - "D:\\claudework\\.beads"

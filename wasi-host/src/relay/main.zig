@@ -272,7 +272,7 @@ pub const RelayServer = struct {
                 var resp: [32]u8 = undefined;
                 @memcpy(&resp, &challenge);
                 self.sendControlUDP(from_addr, CTRL_CHALLENGE, &resp);
-                std.debug.print("[relay2] 挑战发送 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
+                std.debug.print("[relay2] 挑战发送 node={x}\n", .{ node_id });
             },
             CTRL_AUTH => {
                 // [NodeID 20][signature 64]
@@ -294,7 +294,7 @@ pub const RelayServer = struct {
                 // 验证签名
                 const valid = Auth.verifySignature(session.public_key, &challenge, signature);
                 if (!valid) {
-                    std.debug.print("[relay2] 鉴权失败 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
+                    std.debug.print("[relay2] 鉴权失败 node={x}\n", .{ node_id });
                     self.sendControlUDP(from_addr, CTRL_AUTH_FAIL, &.{});
                     return;
                 }
@@ -302,7 +302,7 @@ pub const RelayServer = struct {
                 // 激活会话
                 self.registry.activate(node_id) catch {};
                 self.sendControlUDP(from_addr, CTRL_AUTH_OK, &.{});
-                std.debug.print("[relay2] 鉴权成功 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
+                std.debug.print("[relay2] 鉴权成功 node={x}\n", .{ node_id });
             },
             CTRL_PING => {
                 // [NodeID 20]
@@ -442,7 +442,7 @@ pub const RelayServer = struct {
 
         const valid = Auth.verifySignature(pubkey, &sess_challenge, auth_sig);
         if (!valid) {
-            std.debug.print("[relay2/tcp] TCP 鉴权失败 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
+            std.debug.print("[relay2/tcp] TCP 鉴权失败 node={x}\n", .{ node_id });
             self.sendTCPControl(fd, CTRL_AUTH_FAIL, &.{});
             self.registry.unregister(node_id);
             return;
@@ -450,7 +450,7 @@ pub const RelayServer = struct {
 
         self.registry.activate(node_id) catch {};
         self.sendTCPControl(fd, CTRL_AUTH_OK, &.{});
-        std.debug.print("[relay2/tcp] TCP 鉴权成功 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
+        std.debug.print("[relay2/tcp] TCP 鉴权成功 node={x}\n", .{ node_id });
 
         // 第三步：进入数据转发循环（接收 → 查表 → 转发）
         // 使用本地心跳跟踪，避免持有 *Session 带来的 use-after-free 竞争
@@ -507,7 +507,7 @@ pub const RelayServer = struct {
         }
 
         // 清理
-        std.debug.print("[relay2/tcp] 连接断开 node={}\n", .{std.fmt.fmtSliceHexLower(&node_id)});
+        std.debug.print("[relay2/tcp] 连接断开 node={x}\n", .{ node_id });
         self.registry.unregisterIfFdMatches(node_id, fd);
     }
 

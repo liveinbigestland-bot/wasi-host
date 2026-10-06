@@ -38,11 +38,61 @@ pub fn build(b: *std.Build) void {
         .strip = optimize != .Debug,
     });
     exe.linkLibC();
+    if (host_target.result.os.tag == .windows) {
+        exe.linkSystemLibrary("ws2_32"); // UDP sockets（Winsock，仅 Windows 需要）
+    }
+
+    // Link wasm3 static library (built from wasm3/build.zig)
+    const wasm3_lib = b.addStaticLibrary(.{
+        .name = "m3",
+        .target = host_target,
+        .optimize = optimize,
+    });
+    wasm3_lib.root_module.addCMacro("d_m3HasWASI", "");
+    // ARM 的 LLVM 后端无法满足 wasm3 解释器分发处的 musttail 要求
+    // （ICE: failed to perform tail call elimination），禁用 tail call
+    if (host_target.result.cpu.arch == .arm) {
+        wasm3_lib.root_module.addCMacro("M3_HAS_TAIL_CALL", "0");
+    }
+    wasm3_lib.addIncludePath(b.path("wasm3/source"));
+    wasm3_lib.addCSourceFiles(.{
+        .root = b.path("wasm3/source"),
+        .files = &.{
+            "m3_api_libc.c",
+            "extensions/m3_extensions.c",
+            "m3_api_meta_wasi.c",
+            "m3_api_tracer.c",
+            "m3_api_uvwasi.c",
+            "m3_api_wasi.c",
+            "m3_bind.c",
+            "m3_code.c",
+            "m3_compile.c",
+            "m3_core.c",
+            "m3_env.c",
+            "m3_exec.c",
+            "m3_function.c",
+            "m3_info.c",
+            "m3_module.c",
+            "m3_parse.c",
+        },
+        .flags = &.{"-std=c11"},
+    });
+    wasm3_lib.linkLibC();
+    exe.linkLibrary(wasm3_lib);
+    // 显式暴露 wasm3 头文件给 main.zig 的 @cImport（不依赖 linkLibrary 的传递暂存，
+    // 其暂存目录可能在构建其他目标（如 test）时被缓存清理清空）
+    exe.addIncludePath(b.path("wasm3/source"));
 
     // 检测是否本机编译（不是交叉编译）
     const native_target = b.resolveTargetQuery(.{});
     const building_natively = host_target.result.cpu.arch == native_target.result.cpu.arch and
         host_target.result.os.tag == native_target.result.os.tag;
+
+    std.debug.print("[build] Platform: {s}, Arch: {s}, Building natively: {}\n", .{
+        @tagName(host_target.result.os.tag),
+        @tagName(host_target.result.cpu.arch),
+        building_natively,
+    });
 
     // WSS TLS 支持需要 OpenSSL（仅本机 Linux 编译）
     const wss_tls_enabled = building_natively and host_target.result.os.tag == .linux;
@@ -51,63 +101,43 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("crypto");
     }
 
-    // Lua 5.4 支持 - 交叉平台动态链接
+    // Lua 5.4 支持 - 根据平台加载不同库
     const lua_enabled = true;
+    std.debug.print("[build] Lua support enabled: {}\n", .{lua_enabled});
     if (lua_enabled) {
-        // 系统库链接 (优先)
-        if (building_natively) {
-            switch (host_target.result.os.tag) {
-                .linux => {
-                    exe.linkSystemLibrary("lua5.4");
-                    exe.linkSystemLibrary("lua");
-                },
-                .windows => {
-                    exe.linkSystemLibrary("lua54");
-                    exe.linkSystemLibrary("lua");
-                },
-                else => {
-                    // 其他平台使用静态链接
-                    const lua_dep = b.dependency("lua", .{
-                        .target = host_target,
-                        .optimize = optimize,
-                    });
-                    exe.root_module.addImport("lua", lua_dep.module("lua"));
-                },
-            }
+        // 检测平台
+        const target_os = host_target.result.os.tag;
+        const target_arch = host_target.result.cpu.arch;
+        std.debug.print("[build] Target OS: {s}, Arch: {s}\n", .{ @tagName(target_os), @tagName(target_arch) });
+
+        // 根据平台选择 Lua 库
+        if (building_natively and target_os == .linux) {
+            // 本机 Linux - 动态链接系统 lua5.4
+            exe.linkSystemLibrary("lua5.4");
+            std.debug.print("[build] Linking system lua5.4 (native Linux)\n", .{});
+        } else if (target_os == .windows) {
+            // Windows - lua-libs 下预构建库
+            exe.addLibraryPath(.{ .cwd_relative = "lua-libs" });
+            exe.linkSystemLibrary("lua54");
+            exe.addIncludePath(.{ .cwd_relative = "lua-libs/include" });
+            std.debug.print("[build] Linking prebuilt lua54 (Windows)\n", .{});
         } else {
-            // 交叉编译 - 使用静态链接
-            const lua_dep = b.dependency("lua", .{
-                .target = host_target,
-                .optimize = optimize,
-            });
-            exe.root_module.addImport("lua", lua_dep.module("lua"));
+            // 交叉编译到 Linux - 使用随仓库分发的静态 liblua 归档
+            const archive = switch (target_arch) {
+                .x86_64 => "liblua54-x86_64-linux.a",
+                .arm => "liblua54-arm.a",
+                else => @panic("该交叉目标无预构建 liblua，请先构建静态归档"),
+            };
+            exe.addObjectFile(.{ .cwd_relative = b.fmt("lua-libs/{s}", .{archive}) });
+            exe.addIncludePath(.{ .cwd_relative = "lua-libs/include" });
+            std.debug.print("[build] Linking prebuilt static {s} (cross)\n", .{archive});
         }
+    } else {
+        std.debug.print("[build] Lua disabled\n", .{});
     }
     const options = b.addOptions();
     options.addOption(bool, "wss_tls_enabled", wss_tls_enabled);
-    options.addOption(bool, "lua_enabled", lua_enabled);
     exe.root_module.addOptions("build_options", options);
-
-    exe.addCSourceFiles(.{
-        .root = b.path("wasm3/source"),
-        .files = &.{
-            "m3_core.c",
-            "m3_env.c",
-            "m3_exec.c",
-            "m3_compile.c",
-            "m3_parse.c",
-            "m3_bind.c",
-            "m3_code.c",
-            "m3_module.c",
-            "m3_function.c",
-            "m3_info.c",
-            "m3_api_wasi.c",
-            "m3_api_libc.c",
-            "extensions/m3_extensions.c",
-        },
-        .flags = &.{"-DM3_ENABLE_WASI=1", "-Dd_m3HasWASI=1", "-DM3_HAS_TAIL_CALL=0", "-std=gnu11"},
-    });
-    exe.addIncludePath(b.path("wasm3/source"));
 
     // Add logging module
     const logging_module = b.createModule(.{
@@ -150,12 +180,8 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(daemon);
 
     // ── Lua 5.4 依赖 ──
-    const lua_dep = b.dependency("lua", .{
-        .target = host_target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("lua", lua_dep.module("lua"));
-    daemon.root_module.addImport("lua", lua_dep.module("lua"));
+    // 跳过 lua 依赖（临时方案）
+    std.debug.print("[build] Lua dependency skipped for daemon\n", .{});
 
     // ── 单元测试 ──
     const test_step = b.step("test", "Run unit tests");
