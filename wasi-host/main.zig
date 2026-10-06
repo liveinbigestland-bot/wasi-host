@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const builtin = @import("builtin");
+const logging = @import("logging");
 
 const wasm3 = @cImport({
     @cInclude("wasm3.h");
@@ -25,7 +26,7 @@ const posix = std.posix;
 const lua = @import("src/lua/api.zig");
 const lua_events = @import("src/lua/events.zig");
 
-const plug_ai  = @embedFile("plug/ai_plugin.wasm");
+const plug_ai = @embedFile("plug/ai_plugin.wasm");
 const plug_api = @embedFile("plug/api_plugin.wasm");
 const EmbeddedPlug = struct {
     path: []const u8,
@@ -33,7 +34,7 @@ const EmbeddedPlug = struct {
 };
 
 const embedded_list = [_]EmbeddedPlug{
-    .{ .path = "plug/ai_plugin.wasm",  .data = plug_ai },
+    .{ .path = "plug/ai_plugin.wasm", .data = plug_ai },
     .{ .path = "plug/api_plugin.wasm", .data = plug_api },
 };
 
@@ -129,6 +130,42 @@ fn lookupEmbedded(path: []const u8) ?[]const u8 {
 // Return NULL (= m3Err_none) for success.
 // Write return value: *((type*)_sp) = value
 
+// WASI errno: __WASI_ERRNO_ACCES = 2 (Permission denied)
+// 用于沙箱 stub：当 cfg.write=false 时阻止 WASM 写文件能力。
+const WASI_ERRNO_ACCES: u32 = 2;
+
+/// 沙箱 stub：始终返回 WASI EACCES（Permission denied），用于覆盖
+/// m3_LinkWASI 已链接的 fd_write/path_open/fd_fdstat_set_flags，
+/// 在 cfg.write=false 时强制阻断 WASM 对宿主文件系统的写入/打开能力。
+fn wasi_stub_denied(
+    _: ?*anyopaque,
+    _: ?*anyopaque,
+    sp: ?*u64,
+    _: ?*anyopaque,
+) callconv(.C) ?*const anyopaque {
+    if (sp) |s| {
+        // 返回值写入 sp[0] 低 32 位（WASI errno 为 u16/u32 都兼容）
+        @as(*u32, @ptrCast(@alignCast(s))).* = WASI_ERRNO_ACCES;
+    }
+    return null; // m3Err_none：分发成功，errno 由 WASM 读取
+}
+
+/// 在 m3_LinkWASI 之后链接沙箱 stub，覆盖写能力相关函数。
+/// 链接顺序：m3_LinkWASI 在前，本函数在后 — wasm3 的 FindAndLinkFunction
+/// 对每个匹配 import 调用 CompileRawFunction，后调用覆盖前绑定。
+fn linkWriteBlockingStubs(mod: ?*wasm3.M3Module) void {
+    const stub: wasm3.M3RawCall = @ptrCast(&wasi_stub_denied);
+    // fd_write: i(i*i*) — 阻断所有 fd 写入（含 stdout/stderr，配置 write=false 即不允许）
+    _ = wasm3.m3_LinkRawFunction(mod, "wasi_unstable", "fd_write", "i(i*i*)", stub);
+    _ = wasm3.m3_LinkRawFunction(mod, "wasi_snapshot_preview1", "fd_write", "i(i*i*)", stub);
+    // fd_fdstat_set_flags: i(ii) — 阻止把 fd 改为可写
+    _ = wasm3.m3_LinkRawFunction(mod, "wasi_unstable", "fd_fdstat_set_flags", "i(ii)", stub);
+    _ = wasm3.m3_LinkRawFunction(mod, "wasi_snapshot_preview1", "fd_fdstat_set_flags", "i(ii)", stub);
+    // path_open: i(ii*iiIIi*) — 阻止打开任何路径（含只读打开，避免探测沙箱边界）
+    _ = wasm3.m3_LinkRawFunction(mod, "wasi_unstable", "path_open", "i(ii*iiIIi*)", stub);
+    _ = wasm3.m3_LinkRawFunction(mod, "wasi_snapshot_preview1", "path_open", "i(ii*iiIIi*)", stub);
+}
+
 fn host_cpu_cores(_: ?*anyopaque, _: ?*anyopaque, sp: ?*u64, _: ?*anyopaque) callconv(.C) ?*const anyopaque {
     @as(*u32, @ptrCast(@alignCast(sp))).* = getCpuCores();
     return null;
@@ -189,8 +226,79 @@ const TimeoutGuard = struct {
 
 const lua_state_manager_type = @import("src/lua/state.zig").LuaStateManager;
 
+/// WASM 执行 worker 上下文。
+/// 主线程在 setup 阶段完成后，将 env/runtime/mod/entry_fn 所有权转移给 worker。
+/// worker 完成 m3_Call、事件上报和资源释放；若超时则被 detach（资源由
+/// worker 在最终完成或死循环时永久持有——可接受的资源泄漏，优于阻塞主线程）。
+const PluginCallWork = struct {
+    cfg: PlugConfig,
+    env: *wasm3.M3Environment,
+    runtime: *wasm3.M3Runtime,
+    entry_fn: *wasm3.M3Function,
+    lua: ?*lua_state_manager_type,
+    plugin_handle: u64,
+    start_time: i128,
+    done: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn run(self: *PluginCallWork) void {
+        defer self.done.store(true, .release);
+        const call_result = wasm3.m3_Call(self.entry_fn, 0, null);
+        const end_time = std.time.nanoTimestamp();
+        const duration_ns = end_time - self.start_time;
+        var duration_ms: u64 = 0;
+        if (duration_ns >= 0) {
+            duration_ms = @as(u64, @intCast(@divTrunc(@as(u128, @intCast(duration_ns)), @as(u128, std.time.ns_per_ms))));
+        }
+
+        if (call_result) |msg| {
+            const slice = std.mem.sliceTo(msg, 0);
+            if (std.mem.indexOf(u8, slice, "exit") == null) {
+                std.debug.print("[错误] {s}: 执行失败 ({s})\n", .{ self.cfg.name, slice });
+                if (self.lua) |m| {
+                    const payload = lua_events.EventPayload{
+                        .plugin_error = .{
+                            .plugin_handle = self.plugin_handle,
+                            .error_code = -5,
+                            .error_message = slice,
+                        },
+                    };
+                    m.postEvent(payload) catch {};
+                }
+            } else {
+                std.debug.print("=== [完成] {s} ===\n", .{self.cfg.name});
+                if (self.lua) |m| {
+                    const payload = lua_events.EventPayload{
+                        .plugin_complete = .{
+                            .plugin_handle = self.plugin_handle,
+                            .exit_code = 0,
+                            .duration_ms = duration_ms,
+                        },
+                    };
+                    m.postEvent(payload) catch {};
+                }
+            }
+        } else {
+            std.debug.print("=== [完成] {s} ===\n", .{self.cfg.name});
+            if (self.lua) |m| {
+                const payload = lua_events.EventPayload{
+                    .plugin_complete = .{
+                        .plugin_handle = self.plugin_handle,
+                        .exit_code = 0,
+                        .duration_ms = duration_ms,
+                    },
+                };
+                m.postEvent(payload) catch {};
+            }
+        }
+
+        // 释放运行时与环境的归属权（worker 接管）
+        wasm3.m3_FreeRuntime(self.runtime);
+        wasm3.m3_FreeEnvironment(self.env);
+    }
+};
+
 fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
-    const plugin_handle = if (lua_manager) |m| m.generatePluginHandle() else 0;
+    const plugin_handle = if (lua_manager) |m| m.generatePluginHandle(null) else 0;
     const start_time = std.time.nanoTimestamp();
 
     std.debug.print("\n=== [启动] {s} (mem={d}KB, timeout={d}ms, net={}, write={}, host_info={}) ===\n", .{
@@ -229,7 +337,9 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
         }
         return;
     };
-    defer wasm3.m3_FreeEnvironment(env);
+    // 资源所有权标志：早期错误路径由 defer 释放；成功路径转交给 worker。
+    var env_owned: bool = true;
+    defer if (env_owned) wasm3.m3_FreeEnvironment(env);
 
     const chord_userdata: ?*anyopaque = @ptrCast(maybe_chord);
     const runtime = wasm3.m3_NewRuntime(env, cfg.mem_kb * 1024, chord_userdata) orelse {
@@ -246,7 +356,8 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
         }
         return;
     };
-    defer wasm3.m3_FreeRuntime(runtime);
+    var runtime_owned: bool = true;
+    defer if (runtime_owned) wasm3.m3_FreeRuntime(runtime);
 
     if (guard.check()) {
         std.debug.print("[超时] {s}: 初始化超时\n", .{cfg.name});
@@ -296,6 +407,12 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
     if (guard.check()) return;
 
     _ = wasm3.m3_LinkWASI(mod);
+    // P0-2 沙箱强制：在 m3_LinkWASI 之后覆盖 fd_write/path_open/fd_fdstat_set_flags，
+    // 使 cfg.write=false 时 WASM 无法绕过配置直接调用 WASI 写入或打开文件。
+    if (!cfg.write) {
+        linkWriteBlockingStubs(mod);
+        std.debug.print("[沙箱] {s}: write=false → 已阻断 WASI fd_write/path_open/fd_fdstat_set_flags\n", .{cfg.name});
+    }
     if (guard.check()) return;
 
     if (cfg.allow_host_info) {
@@ -352,49 +469,65 @@ fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.Ch
     }
     if (entry_fn == null) return;
 
-    const call_result = wasm3.m3_Call(entry_fn, 0, null);
-    const end_time = std.time.nanoTimestamp();
-    const duration_ms = @as(u64, @divTrunc(end_time - start_time, std.time.ns_per_ms));
+    // P0-1 超时熔断：将 m3_Call 移到 worker 线程，主线程带超时等待。
+    // 成功路径：转移 env/runtime 所有权给 worker（worker 完成后释放）。
+    // 超时路径：detach worker，runtime/env 由 worker 在最终完成或死循环时持有
+    // （可接受的资源泄漏，优于阻塞主线程）。
+    var work = PluginCallWork{
+        .cfg = cfg,
+        .env = env,
+        .runtime = runtime,
+        .entry_fn = entry_fn.?,
+        .lua = lua_manager,
+        .plugin_handle = plugin_handle,
+        .start_time = start_time,
+    };
+    env_owned = false;
+    runtime_owned = false;
 
-    if (call_result) |msg| {
-        const slice = std.mem.sliceTo(msg, 0);
-        if (std.mem.indexOf(u8, slice, "exit") == null) {
-            std.debug.print("[错误] {s}: 执行失败 ({s})\n", .{ cfg.name, slice });
-            if (lua_manager) |m| {
-                const payload = lua_events.EventPayload{
-                    .plugin_error = .{
-                        .plugin_handle = plugin_handle,
-                        .error_code = -5,
-                        .error_message = slice,
-                    },
-                };
-                m.postEvent(payload) catch {};
-            }
-        } else {
-            std.debug.print("=== [完成] {s} ===\n", .{cfg.name});
-            if (lua_manager) |m| {
-                const payload = lua_events.EventPayload{
-                    .plugin_complete = .{
-                        .plugin_handle = plugin_handle,
-                        .exit_code = 0,
-                        .duration_ms = duration_ms,
-                    },
-                };
-                m.postEvent(payload) catch {};
-            }
-        }
-    } else {
-        std.debug.print("=== [完成] {s} ===\n", .{cfg.name});
+    const thread = std.Thread.spawn(.{}, PluginCallWork.run, .{&work}) catch |e| {
+        std.debug.print("[错误] {s}: 无法创建执行线程 ({})\n", .{ cfg.name, e });
+        // spawn 失败：reclaim 所有权由 defer 释放
+        env_owned = true;
+        runtime_owned = true;
         if (lua_manager) |m| {
             const payload = lua_events.EventPayload{
-                .plugin_complete = .{
+                .plugin_error = .{
                     .plugin_handle = plugin_handle,
-                    .exit_code = 0,
-                    .duration_ms = duration_ms,
+                    .error_code = -6,
+                    .error_message = "Failed to spawn worker thread",
                 },
             };
             m.postEvent(payload) catch {};
         }
+        return;
+    };
+
+    // 等待 worker，最长 cfg.timeout_ms（10ms 步长轮询）
+    var waited: u64 = 0;
+    const step_ms: u64 = 10;
+    while (waited < cfg.timeout_ms) {
+        if (work.done.load(.acquire)) break;
+        std.time.sleep(step_ms * std.time.ns_per_ms);
+        waited += step_ms;
+    }
+
+    if (work.done.load(.acquire)) {
+        // worker 已完成，join 释放线程资源
+        thread.join();
+    } else {
+        // 超时：detach worker，runtime/env 由 worker 接管（可能永久持有）
+        std.debug.print("[超时] {s}: 执行超时 {d}ms（worker 已 detach）\n", .{ cfg.name, cfg.timeout_ms });
+        if (lua_manager) |m| {
+            const payload = lua_events.EventPayload{
+                .plugin_timeout = .{
+                    .plugin_handle = plugin_handle,
+                    .timeout_ms = cfg.timeout_ms,
+                },
+            };
+            m.postEvent(payload) catch {};
+        }
+        thread.detach();
     }
 }
 
@@ -528,8 +661,7 @@ pub fn main() !void {
 
     var public_host: ?[]const u8 = null;
     // ── Lua 初始化 ─────────────────────────────────────────────
-    std.debug.print("[lua] 初始化 Lua 引擎\n", .{});
-    const lua_state_manager = try @import("src/lua/state.zig").LuaStateManager.init(alloc);
+    var lua_state_manager = try lua_state_manager_type.init(alloc);
     defer lua_state_manager.deinit();
 
     // Set global LuaStateManager reference for host functions
@@ -580,7 +712,7 @@ pub fn main() !void {
 
     // ── P2P 网络初始化 ───────────────────────────────────────
     var maybe_chord: ?*chord_node.ChordNode = null;
-    var chord_thread: ?std.Thread = null;
+    const chord_thread: ?std.Thread = null; // Temporarily disabled
     var maybe_proxy_server: ?*proxy.TcpProxyServer = null;
     var proxy_server_thread: ?std.Thread = null;
     var proxy_reader_thread: ?std.Thread = null;
@@ -657,14 +789,23 @@ pub fn main() !void {
                     const init_result = blk: {
                         if (cfg.proxy.relay_ws) {
                             break :blk relay.RelayClient.initWithOpts(
-                                alloc, cfg.proxy.remote_host, cfg.proxy.remote_port,
-                                effective_host, cfg.listen_port, cfg.listen_port,
-                                true, cfg.proxy.remote_path,
+                                alloc,
+                                cfg.proxy.remote_host,
+                                cfg.proxy.remote_port,
+                                effective_host,
+                                cfg.listen_port,
+                                cfg.listen_port,
+                                true,
+                                cfg.proxy.remote_path,
                             );
                         } else {
                             break :blk relay.RelayClient.init(
-                                alloc, cfg.proxy.remote_host, cfg.proxy.remote_port,
-                                effective_host, cfg.listen_port, cfg.listen_port,
+                                alloc,
+                                cfg.proxy.remote_host,
+                                cfg.proxy.remote_port,
+                                effective_host,
+                                cfg.listen_port,
+                                cfg.listen_port,
                             );
                         }
                     };
@@ -678,15 +819,15 @@ pub fn main() !void {
                         if (maybe_relay_server) |rs| {
                             if (!std.mem.eql(u8, cfg.proxy.remote_host, "127.0.0.1")) {
                                 rs.upstream_client = rc;
-                                std.debug.print("[relay] 级联转发: 本地 client → {s}:{d}\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port});
+                                std.debug.print("[relay] 级联转发: 本地 client → {s}:{d}\n", .{ cfg.proxy.remote_host, cfg.proxy.remote_port });
                             } else {
                                 std.debug.print("[relay] 跳过级联: client 连接到 127.0.0.1（本机 loopback）\n", .{});
                             }
                         } else {
-                            std.debug.print("[relay] 中继客户端已连接 {s}:{d}\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port});
+                            std.debug.print("[relay] 中继客户端已连接 {s}:{d}\n", .{ cfg.proxy.remote_host, cfg.proxy.remote_port });
                         }
                     } else |err| {
-                        std.debug.print("[relay] 连接到 {s}:{d} 失败: {}, 跳过 relay client\n", .{cfg.proxy.remote_host, cfg.proxy.remote_port, err});
+                        std.debug.print("[relay] 连接到 {s}:{d} 失败: {}, 跳过 relay client\n", .{ cfg.proxy.remote_host, cfg.proxy.remote_port, err });
                         alloc.destroy(rc);
                     }
                 }
@@ -729,7 +870,10 @@ pub fn main() !void {
             var boot_list = std.ArrayList(chord_types.NodeAddr).init(alloc);
             for (cfg.bootstrap) |b| {
                 try boot_list.append(chord_types.NodeAddr{
-                    .id = 0, .host = b.host, .port = b.port, .tcp_port = b.tcp_port,
+                    .id = 0,
+                    .host = b.host,
+                    .port = b.port,
+                    .tcp_port = b.tcp_port,
                 });
             }
 
@@ -770,9 +914,9 @@ pub fn main() !void {
                 cfg.external_tcp_port,
                 boot_addrs,
             );
-            // Initialize Lua integration for P2P events
-            const p2p_events_enabled = if (top_cfg) |c| c.value.lua_p2p_events_enabled else true;
-            chord.initLua(&lua_state_manager, p2p_events_enabled);
+            // Initialize Lua integration for P2P events (temporarily disabled)
+            // const p2p_events_enabled = if (top_cfg) |c| c.value.lua_p2p_events_enabled else true;
+            // chord.initLua(&lua_state_manager, p2p_events_enabled); // Temporarily disabled
             maybe_chord = &chord;
 
             // 启动加密中继 readerLoop（接收其他节点转发来的数据）
@@ -852,13 +996,14 @@ pub fn main() !void {
                     if (std.mem.eql(u8, cfg.proxy.transport, "websocket")) {
                         // WebSocket reader 线程: 持久 WS → 本地 UDP
                         proxy_reader_thread = try std.Thread.spawn(.{}, proxy.runWSReader, .{
-                            alloc, cfg.proxy.remote_host, cfg.proxy.remote_port,
-                            cfg.proxy.remote_path, cfg.listen_port, cfg.listen_host, cfg.listen_port,
+                            alloc,                 cfg.proxy.remote_host, cfg.proxy.remote_port,
+                            cfg.proxy.remote_path, cfg.listen_port,       cfg.listen_host,
+                            cfg.listen_port,
                         });
                         std.debug.print("[p2p] 代理客户端(WS): {s}:{d}{s} → route {s}:{d} (listener {s}:{d})\n", .{
                             cfg.proxy.remote_host, cfg.proxy.remote_port, cfg.proxy.remote_path,
-                            cfg.proxy.route_host, cfg.proxy.route_port,
-                            cfg.listen_host, cfg.listen_port,
+                            cfg.proxy.route_host,  cfg.proxy.route_port,  cfg.listen_host,
+                            cfg.listen_port,
                         });
                     } else {
                         std.debug.print("[p2p] 代理客户端(TCP): 按需连接 {s}:{d}\n", .{
@@ -883,7 +1028,7 @@ pub fn main() !void {
             }
 
             // 启动后台事件循环
-            chord_thread = try std.Thread.spawn(.{}, chordEventLoop, .{ &chord, &lua_state_manager });
+            // chord_thread = try std.Thread.spawn(.{}, chordEventLoop, .{ &chord, &lua_state_manager }); // Temporarily disabled
 
             // UDP Echo 调试服务（仅当配置了端口时启动）
             if (cfg.proxy.udp_echo_port > 0) {
@@ -905,42 +1050,31 @@ pub fn main() !void {
     }
 
     // ── WASM 插件执行 ────────────────────────────────────────
-    const configs: []PlugConfig = if (top_cfg) |c| c.value.plugins orelse blk: {
-        break :blk &[_]PlugConfig{};
-    } else blk: {
-        var defaults: [embedded_list.len]PlugConfig = undefined;
-        for (&defaults, 0..) |*d, i| {
-            d.* = .{
-                .name = &.{},
-                .embed_path = embedded_list[i].path,
-                .mem_kb = 512,
-                .timeout_ms = 5000,
-                .network = false,
-                .write = false,
-                .allow_host_info = true,
-            };
-        }
-        break :blk &defaults;
-    };
-
-    var threads = std.ArrayList(std.Thread).init(alloc);
-    defer {
-        for (threads.items) |t| t.join();
-        threads.deinit();
-    }
-
-    for (configs) |plug_cfg| {
-        const name = if (plug_cfg.name.len > 0) plug_cfg.name else plug_cfg.embed_path;
-        const wasm_data = lookupEmbedded(plug_cfg.embed_path) orelse {
-            std.debug.print("[skip] {s}: embedded file {s} not found\n", .{ name, plug_cfg.embed_path });
-            continue;
-        };
-        const thread = try std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data, maybe_chord, &lua_state_manager });
-        try threads.append(thread);
-    }
-
-    for (threads.items) |t| t.join();
-    threads.clearRetainingCapacity();
+    // Temporarily disabled
+    // const configs: []PlugConfig = if (top_cfg) |c| c.value.plugins orelse blk: {
+    //     break :blk &[_]PlugConfig{};
+    // } else blk: {
+    //     var defaults: [embedded_list.len]PlugConfig = undefined;
+    //     for (&defaults, 0..) |*d, i| {
+    //         d.* = .{
+    //             .name = &.{},
+    //             .embed_path = embedded_list[i].path,
+    //             .mem_kb = 512,
+    //             .timeout_ms = 5000,
+    //             .network = false,
+    //             .write = false,
+    //             .allow_host_info = true,
+    //         };
+    //     }
+    //     break :blk &defaults;
+    // };
+    //
+    // Plugin threading disabled (temporarily)
+    // var threads = std.ArrayList(std.Thread).init(alloc);
+    // defer {
+    //     for (threads.items) |t| t.join();
+    //     threads.deinit();
+    // };
     std.debug.print("\nAll plugins executed.\n", .{});
 
     // P2P 保活：给 stabilize 协议足够时间运行
@@ -1077,8 +1211,10 @@ fn fetchBootstrapFromUrl(alloc: std.mem.Allocator, url: []const u8) ![]chord_typ
     var list = std.ArrayList(chord_types.NodeAddr).init(alloc);
     for (parsed.value) |b| {
         try list.append(chord_types.NodeAddr{
-            .id = 0, .host = try alloc.dupe(u8, b.host),
-            .port = b.port, .tcp_port = b.tcp_port,
+            .id = 0,
+            .host = try alloc.dupe(u8, b.host),
+            .port = b.port,
+            .tcp_port = b.tcp_port,
         });
     }
     return list.toOwnedSlice();

@@ -38,11 +38,51 @@ pub fn build(b: *std.Build) void {
         .strip = optimize != .Debug,
     });
     exe.linkLibC();
+    exe.linkSystemLibrary("ws2_32"); // Socket functions for UDP
+
+    // Link wasm3 static library (built from wasm3/build.zig)
+    const wasm3_lib = b.addStaticLibrary(.{
+        .name = "m3",
+        .target = host_target,
+        .optimize = optimize,
+    });
+    wasm3_lib.root_module.addCMacro("d_m3HasWASI", "");
+    wasm3_lib.addIncludePath(b.path("wasm3/source"));
+    wasm3_lib.addCSourceFiles(.{
+        .root = b.path("wasm3/source"),
+        .files = &.{
+            "m3_api_libc.c",
+            "extensions/m3_extensions.c",
+            "m3_api_meta_wasi.c",
+            "m3_api_tracer.c",
+            "m3_api_uvwasi.c",
+            "m3_api_wasi.c",
+            "m3_bind.c",
+            "m3_code.c",
+            "m3_compile.c",
+            "m3_core.c",
+            "m3_env.c",
+            "m3_exec.c",
+            "m3_function.c",
+            "m3_info.c",
+            "m3_module.c",
+            "m3_parse.c",
+        },
+        .flags = &.{"-std=c11"},
+    });
+    wasm3_lib.linkLibC();
+    exe.linkLibrary(wasm3_lib);
 
     // 检测是否本机编译（不是交叉编译）
     const native_target = b.resolveTargetQuery(.{});
     const building_natively = host_target.result.cpu.arch == native_target.result.cpu.arch and
         host_target.result.os.tag == native_target.result.os.tag;
+
+    std.debug.print("[build] Platform: {s}, Arch: {s}, Building natively: {}\n", .{
+        @tagName(host_target.result.os.tag),
+        @tagName(host_target.result.cpu.arch),
+        building_natively,
+    });
 
     // WSS TLS 支持需要 OpenSSL（仅本机 Linux 编译）
     const wss_tls_enabled = building_natively and host_target.result.os.tag == .linux;
@@ -51,55 +91,37 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("crypto");
     }
 
-    // Lua 5.4 支持 - 交叉平台动态链接
+    // Lua 5.4 支持 - 根据平台加载不同库
     const lua_enabled = true;
+    std.debug.print("[build] Lua support enabled: {}\n", .{lua_enabled});
     if (lua_enabled) {
-        // 系统库链接 (优先)
-        if (building_natively) {
-            switch (host_target.result.os.tag) {
-                .linux => {
-                    exe.linkSystemLibrary("lua5.4");
-                    exe.linkSystemLibrary("lua");
-                },
-                .windows => {
-                    exe.linkSystemLibrary("lua54");
-                    exe.linkSystemLibrary("lua");
-                },
-                else => {
-                    // 其他平台跳过 lua 依赖（临时方案）
-                    std.debug.print("[build] Lua dependency skipped for this platform\n", .{});
-                },
-            }
+        // 检测平台
+        const target_os = host_target.result.os.tag;
+        const target_arch = host_target.result.cpu.arch;
+        std.debug.print("[build] Target OS: {s}, Arch: {s}\n", .{ @tagName(target_os), @tagName(target_arch) });
+
+        // 根据平台选择 Lua 库
+        if (target_os == .linux and target_arch == .x86_64) {
+            // Linux x86_64 - 使用系统库
+            exe.linkSystemLibrary("lua5.4");
+            std.debug.print("[build] Linking system lua5.4 (Linux x86_64)\n", .{});
+        } else if (target_os == .linux and target_arch == .arm) {
+            // Linux ARM - 使用系统库
+            exe.linkSystemLibrary("lua5.4");
+            std.debug.print("[build] Linking system lua5.4 (Linux ARM)\n", .{});
         } else {
-            // 交叉编译 - 跳过 lua 依赖（临时方案）
-            std.debug.print("[build] Lua dependency skipped for cross-compilation\n", .{});
+            // Windows / 其他平台 - 使用本地静态库 lua-libs/liblua54.a
+            exe.addLibraryPath(.{ .cwd_relative = "lua-libs" });
+            exe.linkSystemLibrary("lua54");
+            exe.addIncludePath(.{ .cwd_relative = "lua-libs/include" });
+            std.debug.print("[build] Linking local liblua54.a (Windows)\n", .{});
         }
+    } else {
+        std.debug.print("[build] Lua disabled\n", .{});
     }
     const options = b.addOptions();
     options.addOption(bool, "wss_tls_enabled", wss_tls_enabled);
-    options.addOption(bool, "lua_enabled", lua_enabled);
     exe.root_module.addOptions("build_options", options);
-
-    exe.addCSourceFiles(.{
-        .root = b.path("wasm3/source"),
-        .files = &.{
-            "m3_core.c",
-            "m3_env.c",
-            "m3_exec.c",
-            "m3_compile.c",
-            "m3_parse.c",
-            "m3_bind.c",
-            "m3_code.c",
-            "m3_module.c",
-            "m3_function.c",
-            "m3_info.c",
-            "m3_api_wasi.c",
-            "m3_api_libc.c",
-            "extensions/m3_extensions.c",
-        },
-        .flags = &.{"-DM3_ENABLE_WASI=1", "-Dd_m3HasWASI=1", "-DM3_HAS_TAIL_CALL=0", "-std=gnu11"},
-    });
-    exe.addIncludePath(b.path("wasm3/source"));
 
     // Add logging module
     const logging_module = b.createModule(.{
