@@ -13,8 +13,6 @@ const kv_store = @import("../metadata/store.zig");
 const meta_permission = @import("../metadata/permission.zig");
 const replication = @import("../metadata/replication.zig");
 const config_mod = @import("../config.zig");
-const lua_events = @import("../../../src/lua/events.zig");
-const lua = @import("../../../src/lua/api.zig");
 
 const NodeId = ring.NodeId;
 const Message = types.Message;
@@ -110,10 +108,6 @@ pub const ChordNode = struct {
     save_interval_ms: u64 = 60000, // 每分钟持久化一次
     own_pk_hex: []const u8 = "", // 本机公钥十六进制
 
-    // Lua 集成
-    lua_manager: ?*@import("../../../src/lua/state.zig").LuaStateManager = null,
-    p2p_events_enabled: bool = true,
-
     /// 本地控制通道处理器（由 main.zig 设置；仅接受 loopback 来源）
     control_handler: ?ControlHandler = null,
 
@@ -196,44 +190,6 @@ pub const ChordNode = struct {
         return node;
     }
 
-    /// 注册 Lua 管理器和 P2P 事件回调
-    pub fn initLua(self: *ChordNode, lua_manager: ?*@import("../../../src/lua/state.zig").LuaStateManager, p2p_events_enabled: bool) void {
-        self.lua_manager = lua_manager;
-        self.p2p_events_enabled = p2p_events_enabled;
-        self.registerLuaCallbacks();
-    }
-
-    /// 注册 Lua P2P 事件回调
-    pub fn registerLuaCallbacks(self: *ChordNode) void {
-        if (self.lua_manager) |m| {
-            const callback_state = lua.LuaState{
-                .state = m.getGlobalState(),
-                .allocator = undefined,
-            };
-            m.registerCallback("chord_node_join", callback_state) catch |err| {
-                std.debug.print("[chord] 注册 chord_node_join 回调失败: {}\n", .{err});
-            };
-            m.registerCallback("chord_successor_change", callback_state) catch |err| {
-                std.debug.print("[chord] 注册 chord_successor_change 回调失败: {}\n", .{err});
-            };
-            m.registerCallback("dht_put", callback_state) catch |err| {
-                std.debug.print("[chord] 注册 dht_put 回调失败: {}\n", .{err});
-            };
-            std.debug.print("[chord] Lua P2P 事件回调已注册\n", .{});
-        }
-    }
-
-    /// Post P2P event to Lua if callbacks are registered and enabled
-    fn postP2PEvent(self: *ChordNode, event: lua_events.EventPayload) void {
-        if (self.p2p_events_enabled) {
-            if (self.lua_manager) |m| {
-                m.postEvent(event) catch |err| {
-                    std.debug.print("[chord] Lua 事件队列满: {}\n", .{err});
-                };
-            }
-        }
-    }
-
     /// 启动 TCP 监听器（transport_mode == tcp 或 dual 时调用）
     pub fn startTcpListener(self: *ChordNode, port: u16) !void {
         if (self.transport_mode == .udp) return; // UDP 模式不需要 TCP
@@ -296,15 +252,6 @@ pub const ChordNode = struct {
             ring.idToHex(succ.id), succ.host, succ.port, succ.tcp_port,
         });
         self.routing.setSuccessor(succ);
-
-        // Post chord_node_join event
-        self.postP2PEvent(lua_events.EventPayload{
-            .chord_node_join = .{
-                .node_id = ring.idToBytes(self.own_id),
-                .host = self.own_host,
-                .port = self.own_port,
-            },
-        });
 
         // ── Finger 表快速填充：利用后继节点批量填充初始 finger 条目 ──
         if (self.routing.successor) |s| {
@@ -1119,15 +1066,6 @@ pub const ChordNode = struct {
             ring.idToHex(result.successor.id), result.successor.port,
             result.successor.tcp_port,
         });
-        // Post successor change event
-        var zero_id: [20]u8 = undefined;
-        @memset(&zero_id, 0);
-        self.postP2PEvent(lua_events.EventPayload{
-            .chord_successor_change = .{
-                .old_successor_id = if (self.routing.successor) |old| ring.idToBytes(old.id) else zero_id,
-                .new_successor_id = ring.idToBytes(result.successor.id),
-            },
-        });
         return true;
     }
 
@@ -1153,13 +1091,6 @@ pub const ChordNode = struct {
             if (self.findAlternativeSuccessor(succ)) |alt| {
                 std.debug.print("[chord] stabilize: 切换到替代后继 {s}:{d}\n", .{ ring.idToHex(alt.id), alt.port });
                 self.routing.setSuccessor(alt);
-                // Post successor change event
-                self.postP2PEvent(lua_events.EventPayload{
-                    .chord_successor_change = .{
-                        .old_successor_id = ring.idToBytes(succ.id),
-                        .new_successor_id = ring.idToBytes(alt.id),
-                    },
-                });
             } else if (self.tryBootstrapFallback()) {
                 // 兜底：重新连接 Bootstrap 节点
                 std.debug.print("[chord] stabilize: 通过 Bootstrap 成功重新加入\n", .{});
@@ -1177,23 +1108,9 @@ pub const ChordNode = struct {
                     if (succ.id == self.own_id and pred_id != self.own_id) {
                         self.routing.setSuccessor(pred_addr);
                         std.debug.print("[chord] stabilize: 孤立节点检测到新节点，更新后继为 {s}\n", .{ring.idToHex(pred_id)});
-                        // Post successor change event
-                        self.postP2PEvent(lua_events.EventPayload{
-                            .chord_successor_change = .{
-                                .old_successor_id = ring.idToBytes(succ.id),
-                                .new_successor_id = ring.idToBytes(pred_id),
-                            },
-                        });
                     } else if (ring.between(pred_id, self.own_id, succ.id)) {
                         self.routing.setSuccessor(pred_addr);
                         std.debug.print("[chord] stabilize: 更新后继为 {s}\n", .{ring.idToHex(pred_id)});
-                        // Post successor change event
-                        self.postP2PEvent(lua_events.EventPayload{
-                            .chord_successor_change = .{
-                                .old_successor_id = ring.idToBytes(succ.id),
-                                .new_successor_id = ring.idToBytes(pred_id),
-                            },
-                        });
                     }
                 }
             },

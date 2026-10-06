@@ -101,40 +101,6 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("crypto");
     }
 
-    // Lua 5.4 支持 - 根据平台加载不同库
-    const lua_enabled = true;
-    std.debug.print("[build] Lua support enabled: {}\n", .{lua_enabled});
-    if (lua_enabled) {
-        // 检测平台
-        const target_os = host_target.result.os.tag;
-        const target_arch = host_target.result.cpu.arch;
-        std.debug.print("[build] Target OS: {s}, Arch: {s}\n", .{ @tagName(target_os), @tagName(target_arch) });
-
-        // 根据平台选择 Lua 库
-        if (building_natively and target_os == .linux) {
-            // 本机 Linux - 动态链接系统 lua5.4
-            exe.linkSystemLibrary("lua5.4");
-            std.debug.print("[build] Linking system lua5.4 (native Linux)\n", .{});
-        } else if (target_os == .windows) {
-            // Windows - lua-libs 下预构建库
-            exe.addLibraryPath(.{ .cwd_relative = "lua-libs" });
-            exe.linkSystemLibrary("lua54");
-            exe.addIncludePath(.{ .cwd_relative = "lua-libs/include" });
-            std.debug.print("[build] Linking prebuilt lua54 (Windows)\n", .{});
-        } else {
-            // 交叉编译到 Linux - 使用随仓库分发的静态 liblua 归档
-            const archive = switch (target_arch) {
-                .x86_64 => "liblua54-x86_64-linux.a",
-                .arm => "liblua54-arm.a",
-                else => @panic("该交叉目标无预构建 liblua，请先构建静态归档"),
-            };
-            exe.addObjectFile(.{ .cwd_relative = b.fmt("lua-libs/{s}", .{archive}) });
-            exe.addIncludePath(.{ .cwd_relative = "lua-libs/include" });
-            std.debug.print("[build] Linking prebuilt static {s} (cross)\n", .{archive});
-        }
-    } else {
-        std.debug.print("[build] Lua disabled\n", .{});
-    }
     const options = b.addOptions();
     options.addOption(bool, "wss_tls_enabled", wss_tls_enabled);
     exe.root_module.addOptions("build_options", options);
@@ -178,10 +144,6 @@ pub fn build(b: *std.Build) void {
     daemon.root_module.addOptions("build_options", daemon_opts);
 
     b.installArtifact(daemon);
-
-    // ── Lua 5.4 依赖 ──
-    // 跳过 lua 依赖（临时方案）
-    std.debug.print("[build] Lua dependency skipped for daemon\n", .{});
 
     // ── 单元测试 ──
     const test_step = b.step("test", "Run unit tests");

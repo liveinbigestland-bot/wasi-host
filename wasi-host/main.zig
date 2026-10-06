@@ -23,8 +23,6 @@ const wss = @import("src/p2p/wss.zig");
 const net_detect = @import("src/p2p/net_detect.zig");
 const p2p_bindings = @import("src/host/p2p_bindings.zig");
 const posix = std.posix;
-const lua = @import("src/lua/api.zig");
-const lua_events = @import("src/lua/events.zig");
 const plugin_mod = @import("src/plugin/manager.zig");
 const content_mod = @import("src/plugin/content.zig");
 
@@ -64,9 +62,6 @@ const AppConfig = struct {
 const TopConfig = struct {
     p2p: ?p2p_config_mod.P2PConfig = null,
     plugins: ?[]PlugConfig = null,
-    lua_script: ?[]const u8 = null,
-    lua_events_enabled: bool = true,
-    lua_p2p_events_enabled: bool = true,
     control_token: ?[]const u8 = null,
 };
 
@@ -234,8 +229,6 @@ const TimeoutGuard = struct {
     }
 };
 
-const lua_state_manager_type = @import("src/lua/state.zig").LuaStateManager;
-
 /// WASM 执行 worker 上下文。
 /// launchPlugin 在堆上分配 work；worker 接管 env/runtime，完成 m3_Call、
 /// 事件上报、结果回写和资源释放。控制信号（取消/超时）通过 m3_Yield 与
@@ -246,7 +239,6 @@ const PluginCallWork = struct {
     env: *wasm3.M3Environment,
     runtime: *wasm3.M3Runtime,
     entry_fn: *wasm3.M3Function,
-    lua: ?*lua_state_manager_type,
     mgr: ?*plugin_mod.Manager,
     plugin_handle: u64,
     start_time: i128,
@@ -270,13 +262,6 @@ const PluginCallWork = struct {
 
     fn postComplete(self: *PluginCallWork, dur_ms: u64) void {
         std.debug.print("=== [完成] {s} ===\n", .{self.cfg.name});
-        if (self.lua) |m| {
-            m.postEvent(.{ .plugin_complete = .{
-                .plugin_handle = self.plugin_handle,
-                .exit_code = 0,
-                .duration_ms = dur_ms,
-            } }) catch {};
-        }
         if (self.mgr) |pm| pm.setResult(self.plugin_handle, .completed, 0, dur_ms, null);
     }
 
@@ -291,22 +276,9 @@ const PluginCallWork = struct {
 
         if (sig == plugin_mod.sig_timeout) {
             std.debug.print("[超时] {s}: 执行超时 {d}ms\n", .{ self.cfg.name, self.cfg.timeout_ms });
-            if (self.lua) |m| {
-                m.postEvent(.{ .plugin_timeout = .{
-                    .plugin_handle = self.plugin_handle,
-                    .timeout_ms = self.cfg.timeout_ms,
-                } }) catch {};
-            }
             if (self.mgr) |pm| pm.setResult(self.plugin_handle, .timeout, -1, dur_ms, "execution timeout");
         } else if (sig == plugin_mod.sig_cancel) {
             std.debug.print("[取消] {s}: 已被请求终止\n", .{self.cfg.name});
-            if (self.lua) |m| {
-                m.postEvent(.{ .plugin_error = .{
-                    .plugin_handle = self.plugin_handle,
-                    .error_code = -7,
-                    .error_message = "cancelled",
-                } }) catch {};
-            }
             if (self.mgr) |pm| pm.setResult(self.plugin_handle, .cancelled, -7, dur_ms, "cancelled");
         } else if (call_result) |msg| {
             const slice = std.mem.sliceTo(msg, 0);
@@ -314,13 +286,6 @@ const PluginCallWork = struct {
                 self.postComplete(dur_ms);
             } else {
                 std.debug.print("[错误] {s}: 执行失败 ({s})\n", .{ self.cfg.name, slice });
-                if (self.lua) |m| {
-                    m.postEvent(.{ .plugin_error = .{
-                        .plugin_handle = self.plugin_handle,
-                        .error_code = -5,
-                        .error_message = slice,
-                    } }) catch {};
-                }
                 if (self.mgr) |pm| pm.setResult(self.plugin_handle, .failed, -5, dur_ms, slice);
             }
         } else {
@@ -336,34 +301,27 @@ const PluginCallWork = struct {
     }
 };
 
-fn reportPluginError(lua_manager: ?*lua_state_manager_type, handle: u64, code: i32, msg: []const u8) void {
-    if (lua_manager) |m| {
-        m.postEvent(.{ .plugin_error = .{
-            .plugin_handle = handle,
-            .error_code = code,
-            .error_message = msg,
-        } }) catch {};
-    }
+fn reportPluginError(handle: u64, code: i32, msg: []const u8) void {
     if (g_plugin_manager) |pm| pm.setResult(handle, .failed, code, 0, msg);
 }
 
 /// 启动期入口：复制字节码后同步执行（保持原有调用方式）
-fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
+fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode) void {
     const bytes = g_alloc.dupe(u8, wasm_bin) catch {
         std.debug.print("[错误] {s}: 内存不足，无法复制字节码\n", .{cfg.name});
         return;
     };
-    _ = launchPlugin(cfg, bytes, maybe_chord, lua_manager, true) catch return;
+    _ = launchPlugin(cfg, bytes, maybe_chord, true) catch return;
 }
 
-/// 动态装载入口（Lua/API 触发）：fire-and-forget，立即返回句柄
+/// 动态装载入口（控制通道触发）：fire-and-forget，立即返回句柄
 fn dynamicLaunch(
     ctx: ?*anyopaque,
     name: []const u8,
     bytes: []const u8,
     snap: plugin_mod.ConfigSnapshot,
 ) !u64 {
-    const lua_manager: ?*lua_state_manager_type = @ptrCast(@alignCast(ctx));
+    _ = ctx;
     // name 来自 Manager 的临时缓冲，这里独立复制并交由 worker 释放
     const owned_name = g_alloc.dupe(u8, name) catch return error.OutOfMemory;
     errdefer g_alloc.free(owned_name);
@@ -376,7 +334,7 @@ fn dynamicLaunch(
         .write = snap.write,
         .allow_host_info = snap.allow_host_info,
     };
-    return launchPlugin(cfg, bytes, g_chord, lua_manager, false);
+    return launchPlugin(cfg, bytes, g_chord, false);
 }
 
 // ── 本地控制通道（daemon API 经 127.0.0.1 UDP 调用）──
@@ -698,7 +656,6 @@ fn launchPlugin(
     cfg: PlugConfig,
     owned_bytes: []const u8,
     maybe_chord: ?*chord_node.ChordNode,
-    lua_manager: ?*lua_state_manager_type,
     wait: bool,
 ) !u64 {
     // wasm3 不拷贝字节码：早期错误路径这里释放，成功路径转交 worker
@@ -707,26 +664,12 @@ fn launchPlugin(
 
     const name = if (cfg.name.len > 0) cfg.name else cfg.embed_path;
 
-    const handle = blk: {
-        if (lua_manager) |m| break :blk m.generatePluginHandle(null) catch 0;
-        if (g_plugin_manager) |pm| break :blk pm.allocHandle();
-        break :blk 0;
-    };
+    const handle = if (g_plugin_manager) |pm| pm.allocHandle() else 0;
     const start_time = std.time.nanoTimestamp();
 
     std.debug.print("\n=== [启动] {s} (mem={d}KB, timeout={d}ms, net={}, write={}, host_info={}) ===\n", .{
         name, cfg.mem_kb, cfg.timeout_ms, cfg.network, cfg.write, cfg.allow_host_info,
     });
-
-    if (lua_manager) |m| {
-        m.postEvent(.{ .plugin_start = .{
-            .plugin_handle = handle,
-            .plugin_name = name,
-            .connection_id = null,
-        } }) catch |e| {
-            std.debug.print("[警告] Lua 事件队列满: {}\n", .{e});
-        };
-    }
 
     // 登记注册表，获取控制块（取消/暂停/超时）
     const control = if (g_plugin_manager) |pm|
@@ -738,7 +681,7 @@ fn launchPlugin(
             .allow_host_info = cfg.allow_host_info,
         }) catch |e| {
             std.debug.print("[错误] {s}: 注册表登记失败 ({})\n", .{ name, e });
-            reportPluginError(lua_manager, handle, -8, "Failed to register plugin");
+            reportPluginError(handle, -8, "Failed to register plugin");
             return e;
         }
     else blk: {
@@ -749,13 +692,13 @@ fn launchPlugin(
 
     var guard = TimeoutGuard.start(cfg.timeout_ms) catch {
         std.debug.print("[错误] {s}: 无法创建定时器\n", .{name});
-        reportPluginError(lua_manager, handle, -1, "Failed to create timer");
+        reportPluginError(handle, -1, "Failed to create timer");
         return error.PluginLaunchFailed;
     };
 
     const env = wasm3.m3_NewEnvironment() orelse {
         std.debug.print("[错误] {s}: 创建环境失败\n", .{name});
-        reportPluginError(lua_manager, handle, -1, "Failed to create WASM environment");
+        reportPluginError(handle, -1, "Failed to create WASM environment");
         return error.PluginLaunchFailed;
     };
     // 资源所有权标志：早期错误路径由 defer 释放；成功路径转交给 worker。
@@ -765,7 +708,7 @@ fn launchPlugin(
     const chord_userdata: ?*anyopaque = @ptrCast(maybe_chord);
     const runtime = wasm3.m3_NewRuntime(env, cfg.mem_kb * 1024, chord_userdata) orelse {
         std.debug.print("[错误] {s}: 创建运行时失败\n", .{name});
-        reportPluginError(lua_manager, handle, -1, "Failed to create WASM runtime");
+        reportPluginError(handle, -1, "Failed to create WASM runtime");
         return error.PluginLaunchFailed;
     };
     var runtime_owned: bool = true;
@@ -773,28 +716,28 @@ fn launchPlugin(
 
     if (guard.check()) {
         std.debug.print("[超时] {s}: 初始化超时\n", .{name});
-        reportPluginError(lua_manager, handle, -1, "Initialization timeout");
+        reportPluginError(handle, -1, "Initialization timeout");
         return error.PluginLaunchFailed;
     }
 
     var mod: ?*wasm3.M3Module = null;
     if (wasm3.m3_ParseModule(env, &mod, owned_bytes.ptr, @intCast(owned_bytes.len)) != 0) {
         std.debug.print("[错误] {s}: 模块解析失败\n", .{name});
-        reportPluginError(lua_manager, handle, -2, "Failed to parse WASM module");
+        reportPluginError(handle, -2, "Failed to parse WASM module");
         return error.PluginLaunchFailed;
     }
     if (guard.check()) {
-        reportPluginError(lua_manager, handle, -2, "Parse timeout");
+        reportPluginError(handle, -2, "Parse timeout");
         return error.PluginLaunchFailed;
     }
 
     if (wasm3.m3_LoadModule(runtime, mod) != 0) {
         std.debug.print("[错误] {s}: 模块加载失败\n", .{name});
-        reportPluginError(lua_manager, handle, -3, "Failed to load WASM module");
+        reportPluginError(handle, -3, "Failed to load WASM module");
         return error.PluginLaunchFailed;
     }
     if (guard.check()) {
-        reportPluginError(lua_manager, handle, -3, "Load timeout");
+        reportPluginError(handle, -3, "Load timeout");
         return error.PluginLaunchFailed;
     }
 
@@ -806,7 +749,7 @@ fn launchPlugin(
         std.debug.print("[沙箱] {s}: write=false → 已阻断 WASI fd_write/path_open/fd_fdstat_set_flags\n", .{name});
     }
     if (guard.check()) {
-        reportPluginError(lua_manager, handle, -3, "Link timeout");
+        reportPluginError(handle, -3, "Link timeout");
         return error.PluginLaunchFailed;
     }
 
@@ -846,18 +789,18 @@ fn launchPlugin(
         std.debug.print("[p2p] 已为 {s} 注册 P2P 宿主函数\n", .{name});
     }
     if (guard.check()) {
-        reportPluginError(lua_manager, handle, -3, "Binding timeout");
+        reportPluginError(handle, -3, "Binding timeout");
         return error.PluginLaunchFailed;
     }
 
     var entry_fn: ?*wasm3.M3Function = null;
     if (wasm3.m3_FindFunction(&entry_fn, runtime, "_start") != 0) {
         std.debug.print("[警告] {s}: 未找到 _start 入口\n", .{name});
-        reportPluginError(lua_manager, handle, -4, "Failed to find _start entry point");
+        reportPluginError(handle, -4, "Failed to find _start entry point");
         return error.PluginLaunchFailed;
     }
     if (entry_fn == null) {
-        reportPluginError(lua_manager, handle, -4, "Missing _start entry point");
+        reportPluginError(handle, -4, "Missing _start entry point");
         return error.PluginLaunchFailed;
     }
 
@@ -868,7 +811,6 @@ fn launchPlugin(
         .env = env,
         .runtime = runtime,
         .entry_fn = entry_fn.?,
-        .lua = lua_manager,
         .mgr = g_plugin_manager,
         .plugin_handle = handle,
         .start_time = start_time,
@@ -883,7 +825,7 @@ fn launchPlugin(
 
     work.thread = std.Thread.spawn(.{}, PluginCallWork.run, .{work}) catch |e| {
         std.debug.print("[错误] {s}: 无法创建执行线程 ({})\n", .{ name, e });
-        reportPluginError(lua_manager, handle, -6, "Failed to spawn worker thread");
+        reportPluginError(handle, -6, "Failed to spawn worker thread");
         g_alloc.destroy(work);
         env_owned = true;
         runtime_owned = true;
@@ -964,69 +906,6 @@ fn initP2PIdentity(cfg: ?p2p_config_mod.P2PConfig) !p2p_identity.Identity {
     return id;
 }
 
-/// Chord 事件循环（在后台线程中运行）
-/// 处理 Chord 网络事件，同时处理 Lua 事件队列
-fn chordEventLoop(node: *chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
-    std.debug.print("[chord] 事件循环已启动\n", .{});
-    node.running = true;
-    while (node.running) {
-        node.tick() catch |err| {
-            std.debug.print("[chord] tick 错误: {}\n", .{err});
-        };
-
-        // Process Lua events with 10ms budget per tick
-        if (lua_manager) |m| {
-            m.processEvents(10);
-        }
-
-        std.time.sleep(100 * std.time.ns_per_ms); // 100ms tick 间隔
-    }
-    std.debug.print("[chord] 事件循环已停止\n", .{});
-}
-
-/// Lua 集成说明
-///
-/// wasi-host 支持通过 Lua 脚本控制 WASM 插件生命周期和监控事件。
-///
-/// ## Lua 主函数
-///
-/// 当加载 Lua 脚本时，脚本以全局 Lua 状态执行。脚本可以:
-/// - 注册回调函数监听 WASM 插件事件
-/// - 调用 WASM 控制函数启动/停止/暂停/恢复插件
-/// - 访问连接特定状态进行多用户管理
-///
-/// ## WASM 事件回调
-///
-/// 脚本可以注册以下事件类型的回调:
-/// - `plugin_start`: 插件启动事件
-/// - `plugin_complete`: 插件完成事件
-/// - `plugin_error`: 插件错误事件
-/// - `plugin_timeout`: 插件超时事件
-/// - `chord_node_join`: Chord 节点加入事件
-/// - `chord_successor_change`: 后继节点变化事件
-/// - `dht_put`: DHT 数据写入事件
-///
-/// ## 配置选项
-///
-/// 在 `config.json` 中配置:
-/// ```json
-/// {
-///   "lua_script": "path/to/script.lua",
-///   "lua_events_enabled": true,
-///   "lua_p2p_events_enabled": true
-/// }
-/// ```
-///
-/// ## 示例脚本
-///
-/// 参见 `examples/lua/` 目录:
-/// - `plugin_monitor.lua`: 监控插件执行状态
-/// - `orchestrator.lua`: 管理多个插件
-/// - `p2p_monitor.lua`: 监控 P2P 网络事件
-//
-// 注意: Lua 脚本会作为单线程全局状态执行，不支持跨连接隔离
-// 多用户场景下应使用连接特定状态 (getConnectionState)
-
 pub fn main() !void {
     initOsNameBuf();
 
@@ -1060,14 +939,6 @@ pub fn main() !void {
     var p2p_cfg = if (top_cfg) |c| c.value.p2p else null;
 
     var public_host: ?[]const u8 = null;
-    // ── Lua 初始化 ─────────────────────────────────────────────
-    var lua_state_manager = try lua_state_manager_type.init(alloc);
-    defer lua_state_manager.deinit();
-
-    // Set global LuaStateManager reference for host functions
-    @import("src/lua/host_functions.zig").HostFunctions.setLuaStateManager(&lua_state_manager);
-    // 注册 wasm_* host 函数到全局 Lua 状态
-    @import("src/lua/host_functions.zig").HostFunctions.register(lua_state_manager.global_state);
 
     // ── 动态插件运行时 ───────────────────────────────────────
     const plugin_manager = try plugin_mod.Manager.init(alloc);
@@ -1076,19 +947,7 @@ pub fn main() !void {
     defer g_plugin_manager = null;
     plugin_mod.global_manager = plugin_manager;
     defer plugin_mod.global_manager = null;
-    plugin_manager.setLauncher(dynamicLaunch, @ptrCast(&lua_state_manager));
-
-    // Load Lua script if configured
-    if (top_cfg) |c| {
-        if (c.value.lua_script) |script_path| {
-            std.debug.print("[lua] 加载 Lua 脚本: {s}\n", .{script_path});
-            lua_state_manager.loadScript(script_path) catch |err| {
-                std.debug.print("[lua] 警告: 加载 Lua 脚本失败: {}\n", .{err});
-            };
-        }
-    }
-
-    std.debug.print("[lua] Lua 引擎初始化完成\n", .{});
+    plugin_manager.setLauncher(dynamicLaunch, null);
 
     // ── 自动网络检测（覆盖 transport_mode） ──────────────────
     if (p2p_cfg) |_| {
@@ -1325,9 +1184,6 @@ pub fn main() !void {
                 cfg.external_tcp_port,
                 boot_addrs,
             );
-            // Initialize Lua integration for P2P events (temporarily disabled)
-            // const p2p_events_enabled = if (top_cfg) |c| c.value.lua_p2p_events_enabled else true;
-            // chord.initLua(&lua_state_manager, p2p_events_enabled); // Temporarily disabled
             maybe_chord = &chord;
             g_chord = &chord;
             content_mod.setChord(&chord);
@@ -1444,9 +1300,6 @@ pub fn main() !void {
                 std.debug.print("[chord] 无 Bootstrap 配置, 作为孤立节点\n", .{});
             }
 
-            // 启动后台事件循环
-            // chord_thread = try std.Thread.spawn(.{}, chordEventLoop, .{ &chord, &lua_state_manager }); // Temporarily disabled
-
             // UDP Echo 调试服务（仅当配置了端口时启动）
             if (cfg.proxy.udp_echo_port > 0) {
                 const echo_server = try alloc.create(@import("src/p2p/udpecho.zig").UdpEchoServer);
@@ -1499,7 +1352,7 @@ pub fn main() !void {
             std.debug.print("[skip] {s}: embedded file {s} not found\n", .{ name, plug_cfg.embed_path });
             continue;
         };
-        const thread = std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data, maybe_chord, &lua_state_manager }) catch |err| {
+        const thread = std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data, maybe_chord }) catch |err| {
             std.debug.print("[error] 无法启动插件线程 {s}: {}\n", .{ name, err });
             continue;
         };
@@ -1524,8 +1377,6 @@ pub fn main() !void {
                     std.debug.print("[chord] tick 错误: {}\n", .{err});
                 };
             }
-            // 同步派发 Lua 事件（wasm_on_event 回调在此线程执行）
-            lua_state_manager.processEvents(10);
             std.time.sleep(100 * std.time.ns_per_ms);
             ticks_this_s += 1;
             if (ticks_this_s >= 10) {

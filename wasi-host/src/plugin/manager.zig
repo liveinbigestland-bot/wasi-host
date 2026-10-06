@@ -94,7 +94,7 @@ pub const LaunchFn = *const fn (
     cfg: ConfigSnapshot,
 ) anyerror!u64;
 
-/// 当前进程的管理器实例（供 Lua 宿主函数访问）
+/// 当前进程的管理器实例
 pub var global_manager: ?*Manager = null;
 
 pub const Manager = struct {

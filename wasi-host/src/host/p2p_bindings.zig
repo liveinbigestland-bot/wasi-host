@@ -1,5 +1,4 @@
 /// P2P 宿主函数：给 WASM 插件调用 DHT 能力
-
 const std = @import("std");
 const wasm3 = @cImport({
     @cInclude("wasm3.h");
@@ -8,7 +7,6 @@ const wasm3 = @cImport({
 const chord_node = @import("../p2p/chord/node.zig");
 const chord_types = @import("../p2p/chord/types.zig");
 const meta_types = @import("../p2p/metadata/types.zig");
-const lua_events = @import("../lua/events.zig");
 const Permission = meta_types.Permission;
 
 const ChordNode = chord_node.ChordNode;
@@ -172,24 +170,16 @@ pub fn host_dht_put(rt: ?*anyopaque, _: ?*anyopaque, sp: ?*u64, _: ?*anyopaque) 
             chord.replication_mgr.enqueue(&entry) catch {};
         }
         std.debug.print("[p2p_bindings] dht_put: key={s} 已存储\n", .{key});
-        // Post dht_put event to Lua if lua_manager is registered
-        if (chord.lua_manager) |m| {
-            m.postEvent(lua_events.EventPayload{
-                .dht_put = .{
-                    .key = key,
-                    .value_size = value.len,
-                },
-            }) catch |err| {
-                std.debug.print("[p2p_bindings] Lua 事件队列满: {}\n", .{err});
-            };
-        }
         setRet(sp, 0);
         return null;
     }
 
     const resp = chord.sendAndWait(Message{ .dht_put = .{
-        .key = key, .value = value, .owner = chord.own_pk_hex,
-        .permission = @intFromEnum(perm), .version = 0,
+        .key = key,
+        .value = value,
+        .owner = chord.own_pk_hex,
+        .permission = @intFromEnum(perm),
+        .version = 0,
         .timestamp = std.time.milliTimestamp(),
     } }, .dht_put_resp, target, 5000) catch {
         setRet(sp, 1);
@@ -217,11 +207,13 @@ pub fn host_node_info(rt: ?*anyopaque, _: ?*anyopaque, sp: ?*u64, _: ?*anyopaque
         .port = chord.own_port,
         .successor = if (chord.routing.successor) |s| .{
             .id = std.mem.toBytes(s.id),
-            .host = s.host, .port = s.port,
+            .host = s.host,
+            .port = s.port,
         } else null,
         .predecessor = if (chord.routing.predecessor) |p| .{
             .id = std.mem.toBytes(p.id),
-            .host = p.host, .port = p.port,
+            .host = p.host,
+            .port = p.port,
         } else null,
         .store_count = chord.store.count(),
     }, .{}) catch {

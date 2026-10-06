@@ -1,6 +1,6 @@
 /// 插件内容寻址：字节码 ↔ SHA256 内容身份 ↔ DHT 分发/拉取。
 ///
-/// 唯一归一化模块——Lua 宿主函数、控制通道 handler 都只消费本模块，
+/// 唯一归一化模块——控制通道 handler 等调用方只消费本模块，
 /// 不各自实现哈希/编码/校验约定。
 ///
 /// 约定：
@@ -27,7 +27,7 @@ pub const max_plugin_bytes: usize = 40 * 1024;
 
 pub const cache_dir = "wasm-cache";
 
-/// 进程内 ChordNode 引用（由 main 设置），供 Lua 宿主函数等无参路径取用
+/// 进程内 ChordNode 引用（由 main 设置），供无参路径取用
 var global_chord: ?*chord_node.ChordNode = null;
 
 pub fn setChord(c: ?*chord_node.ChordNode) void {
