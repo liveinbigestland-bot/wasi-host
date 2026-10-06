@@ -45,8 +45,8 @@
             "wss_enabled": true,
             "wss_port": 8443,
             "wss_path": "/chord",
-            "wss_cert_file": "/etc/letsencrypt/live/example.com/fullchain.pem",
-            "wss_key_file": "/etc/letsencrypt/live/example.com/privkey.pem"
+            "wss_cert_file": "/home/ubuntu/certs/fullchain.pem",
+            "wss_key_file": "/home/ubuntu/certs/privkey.pem"
         }
     },
     "plugins": []
