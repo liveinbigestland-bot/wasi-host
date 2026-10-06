@@ -71,12 +71,3 @@ Ops agent (`gsd-ops`) 位于 `$CLAUDE_HOME/agents/gsd-ops.md`，提供以下工�
 3. **SFTP 中转**: ARM 机器上 SFTP 直接写 /root/ 可能失败，必须经 /tmp/
 4. **后继自指**: 孤立 seed 的 successor=null，需要 stabilize 中特判逻辑修复
 5. **UDP**: 外网服务器 alwaysdata 屏蔽 inbound UDP，ext 使用 direct TCP (port 8400) 通信
-
-## graphify
-
-This project has a graphify-rs knowledge graph at graphify-out/.
-
-Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- After modifying code files in this session, run `graphify-rs build --path . --output graphify-out --no-llm --update` to keep the graph current (fast, AST-only, ~2-5s)
