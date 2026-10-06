@@ -1,7 +1,7 @@
 {
     "p2p": {
         "enabled": true,
-        "listen_host": "192.168.2.59",
+        "listen_host": "192.168.2.57",
         "listen_port": 20808,
         "bootstrap": [{"host": "185.31.41.85", "port": 20808}],
         "key_file": "p2p_key_59.bin",

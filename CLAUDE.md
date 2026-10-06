@@ -5,10 +5,10 @@
 | 节点 | IP/主机 | 用户 | 架构 | 角色 |
 |------|---------|------|------|------|
 | **seed** | 192.168.2.210:20808 | (local Windows) | x86_64 | LAN 种子节点 |
-| **node59** | 192.168.2.59:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
-| **node60** | 192.168.2.60:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
+| **node59** | 192.168.2.57:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
+| **node60** | 192.168.2.58:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
 | **ext** | ssh-metaai.alwaysdata.net:20808 | metaai / 1qaz@WSXasdfasdf | x86_64 | 外网加入节点 (UDP inbound blocked, TCP direct port 8400) |
-| **外2** | 192.140.185.171:20808 | root / aetej1AzIQpE | x86_64 Ubuntu 24.04 | 独立 VPS (UFW 已开放 20808/udp) |
+| **外2** | 170.106.170.85:20808 | ubuntu / A?G|4Ed7a#3sHPb | x86_64 Ubuntu 24.04 | 独立 VPS (UFW 已开放 20808/udp) |
 
 ## 构建命令
 
@@ -16,8 +16,8 @@
 # Windows (native)
 zig build
 
-# ARM (armv7l 节点，必须指定 cortex_a7：baseline(ARMv5TE) 不支持 64 位原子操作)
-zig build -Dtarget=arm-linux-musleabihf -Dcpu=cortex_a7 -p /d/tmp/zig-out-arm && cp /d/tmp/zig-out-arm/bin/wasi-host zig-out/bin/wasi-host-arm-v5
+# ARM (armv7l 节点，Cortex-A5：cortex_a7 会生成不支持的指令导致 Illegal instruction)
+zig build -Dtarget=arm-linux-musleabihf -Dcpu=cortex_a5 -p /d/tmp/zig-out-arm && cp /d/tmp/zig-out-arm/bin/wasi-host zig-out/bin/wasi-host-arm-v5
 
 # x86_64 Linux (外网服务器 + relay-server)
 zig build -Dtarget=x86_64-linux-gnu -p /d/tmp/zig-out-x64 && cp /d/tmp/zig-out-x64/bin/wasi-host zig-out/bin/wasi-host-x86_64 && cp /d/tmp/zig-out-x64/bin/relay-server zig-out/bin/relay-server-x86_64

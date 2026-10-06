@@ -41,15 +41,15 @@ RELAY_CONFIG = os.path.join(PROJECT_DIR, "config-relay-server.json")
 MACHINES = [
     {
         "name": "外2",
-        "host": "192.140.185.171",
+        "host": "170.106.170.85",
         "port": 22,
-        "user": "root",
-        "password": "aetej1AzIQpE",
+        "user": "ubuntu",
+        "password": "A?G|4Ed7a#3sHPb",
         "arch": "x86_64",
-        "remote_bin": "/root/wasi-host",
+        "remote_bin": "/home/ubuntu/wasi-host",
         "config": os.path.join(PROJECT_DIR, "config-ext-node2.json"),
-        "remote_config": "/root/config-ext-node2.json",
-        "remote_log": "/root/test-ext-node2.log",
+        "remote_config": "/home/ubuntu/config-ext-node2.json",
+        "remote_log": "/home/ubuntu/test-ext-node2.log",
     },
     {
         "name": "ext",
@@ -65,7 +65,7 @@ MACHINES = [
     },
     {
         "name": "node59",
-        "host": "192.168.2.59",
+        "host": "192.168.2.57",
         "port": 22,
         "user": "root",
         "password": "ecoo1234",
@@ -77,7 +77,7 @@ MACHINES = [
     },
     {
         "name": "node60",
-        "host": "192.168.2.60",
+        "host": "192.168.2.58",
         "port": 22,
         "user": "root",
         "password": "ecoo1234",
@@ -191,25 +191,27 @@ class RemoteNode:
         return pids[0] if pids else None
 
     def upload_relay(self):
-        """上传 relay-server 二进制"""
+        """上传 relay-server 二进制（部署到 home 目录，兼容非 root 用户）"""
         remote_tmp = "/tmp/relay-server-deploy"
+        home = "~"
         sftp = self.client.open_sftp()
         sftp.put(RELAY_BINARY, remote_tmp)
         sftp.close()
         self.exec(
-            f"rm -f /root/relay-server && cp {remote_tmp} /root/relay-server"
-            f" && chmod +x /root/relay-server && rm -f {remote_tmp}",
+            f"rm -f {home}/relay-server && cp {remote_tmp} {home}/relay-server"
+            f" && chmod +x {home}/relay-server && rm -f {remote_tmp}",
             timeout=10,
         )
 
     def upload_relay_config(self):
         """上传 relay-server 配置"""
         remote_tmp = "/tmp/relay-config-deploy.json"
+        home = "~"
         sftp = self.client.open_sftp()
         sftp.put(RELAY_CONFIG, remote_tmp)
         sftp.close()
         self.exec(
-            f"rm -f /root/config-relay-server.json && cp {remote_tmp} /root/config-relay-server.json"
+            f"rm -f {home}/config-relay-server.json && cp {remote_tmp} {home}/config-relay-server.json"
             f" && rm -f {remote_tmp}",
             timeout=10,
         )
@@ -219,10 +221,7 @@ class RemoteNode:
         self.exec("pkill -f relay-server 2>/dev/null || true", timeout=5)
         time.sleep(1)
 
-        # Create log directory if it doesn't exist
-        self.exec("mkdir -p /var/log/wasi-host", timeout=5)
-
-        cmd = "nohup /root/relay-server --config /root/config-relay-server.json > /var/log/wasi-host/relay-server.log 2>&1 &"
+        cmd = "nohup ~/relay-server --config ~/config-relay-server.json > ~/relay-server.log 2>&1 &"
         self.exec(cmd, timeout=5)
         time.sleep(2)
         _, out, _ = self.exec("pgrep -f relay-server || echo NOT_RUNNING", timeout=5)
@@ -289,61 +288,73 @@ def cmd_deploy():
     # 阶段 1: 清理所有旧进程
     print("\n── 阶段 1: 清理旧进程 ──")
     for m in MACHINES:
-        with RemoteNode(m) as n:
-            print(f"  {m['name']}: ", end="", flush=True)
-            n.kill_all()
-            print("已清理")
+        try:
+            with RemoteNode(m) as n:
+                print(f"  {m['name']}: ", end="", flush=True)
+                n.kill_all()
+                print("已清理")
+        except Exception as e:
+            print(f"  {m['name']}: [跳过] {e}")
 
     # 阶段 2: 上传 binary + config
     print("\n── 阶段 2: 上传 binary + config ──")
     for m in MACHINES:
-        with RemoteNode(m) as n:
-            print(f"  {m['name']}: ", end="", flush=True)
-            n.upload_binary()
-            n.upload_config()
-            print("binary + config 已上传")
+        try:
+            with RemoteNode(m) as n:
+                print(f"  {m['name']}: ", end="", flush=True)
+                n.upload_binary()
+                n.upload_config()
+                print("binary + config 已上传")
+        except Exception as e:
+            print(f"  {m['name']}: [跳过] {e}")
 
     # 上传 relay-server binary + config 到 外2
     if os.path.exists(RELAY_BINARY):
         print("\n── relay-server 上传 ──")
         ext2 = MACHINES[0]
-        with RemoteNode(ext2) as n:
-            n.upload_relay()
-            n.upload_relay_config()
-            print(f"  {ext2['name']}: relay-server + config 已上传")
+        try:
+            with RemoteNode(ext2) as n:
+                n.upload_relay()
+                n.upload_relay_config()
+                print(f"  {ext2['name']}: relay-server + config 已上传")
+        except Exception as e:
+            print(f"  {ext2['name']}: [跳过] {e}")
 
     # 阶段 3: 启动 外2（中继服务器 + relay-server）
     print("\n── 阶段 3: 启动 外2（中继服务器 + relay-server）──")
     ext2 = MACHINES[0]
-    with RemoteNode(ext2) as n:
-        pid = n.start()
-        if pid:
-            print(f"  [OK] {ext2['name']} wasi-host PID={pid}")
-        else:
-            print(f"  [ERR] {ext2['name']} wasi-host 启动失败!")
-            print(f"  {n.tail_log(10)}")
-            sys.exit(1)
-        if n.check_port(8356):
-            print(f"  [OK] port 8356 (relay) listening")
-        if n.check_port(443) or n.check_port(8443):
-            print(f"  [OK] WSS listening")
-
-        # 启动新 relay-server
-        if os.path.exists(RELAY_BINARY):
-            n.upload_relay()
-            n.upload_relay_config()
-            relay_pid = n.start_relay()
-            if relay_pid:
-                print(f"  [OK] relay-server PID={relay_pid}")
-                if n.check_port(20809):
-                    print(f"  [OK] port 20809 (relay-server) listening")
+    try:
+        with RemoteNode(ext2) as n:
+            pid = n.start()
+            if pid:
+                print(f"  [OK] {ext2['name']} wasi-host PID={pid}")
             else:
-                print(f"  [..] relay-server 跳过（未找到 binary 或启动失败）")
-        else:
-            print(f"  [..] relay-server binary 未找到，跳过（编译: zig build -Dtarget=x86_64-linux-gnu）")
+                print(f"  [ERR] {ext2['name']} wasi-host 启动失败!")
+                print(f"  {n.tail_log(10)}")
+                sys.exit(1)
+            if n.check_port(8356):
+                print(f"  [OK] port 8356 (relay) listening")
+            if n.check_port(443) or n.check_port(8443):
+                print(f"  [OK] WSS listening")
 
-    print("  等待 外2 就绪 (5s)...")
-    time.sleep(5)
+            # 启动新 relay-server
+            if os.path.exists(RELAY_BINARY):
+                n.upload_relay()
+                n.upload_relay_config()
+                relay_pid = n.start_relay()
+                if relay_pid:
+                    print(f"  [OK] relay-server PID={relay_pid}")
+                    if n.check_port(20809):
+                        print(f"  [OK] port 20809 (relay-server) listening")
+                else:
+                    print(f"  [..] relay-server 跳过（未找到 binary 或启动失败）")
+            else:
+                print(f"  [..] relay-server binary 未找到，跳过（编译: zig build -Dtarget=x86_64-linux-gnu）")
+
+        print("  等待 外2 就绪 (5s)...")
+        time.sleep(5)
+    except Exception as e:
+        print(f"  {ext2['name']}: [跳过] {e}")
 
     # 阶段 4: 启动其他节点
     print("\n── 阶段 4: 启动其余节点 ──")
