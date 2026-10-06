@@ -72,7 +72,7 @@ Ops agent (`gsd-ops`) 位于 `$CLAUDE_HOME/agents/gsd-ops.md`，提供以下工�
 4. **后继自指**: 孤立 seed 的 successor=null，需要 stabilize 中特判逻辑修复
 5. **UDP**: 外网服务器 alwaysdata 屏蔽 inbound UDP，ext 使用 direct TCP (port 8400) 通信
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:5c2c0639 -->
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
 This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
@@ -104,6 +104,7 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
+   bd dolt push
    git push
    git status  # MUST show "up to date with origin"
    ```
@@ -117,6 +118,7 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
 
 ## graphify
 
