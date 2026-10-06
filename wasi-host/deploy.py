@@ -71,8 +71,8 @@ MACHINES = [
         "password": "ecoo1234",
         "arch": "arm",
         "remote_bin": "/root/wasi-host",
-        "config": os.path.join(PROJECT_DIR, "config-remote-node59.json"),
-        "remote_config": "/root/config-remote-node59.json",
+        "config": os.path.join(PROJECT_DIR, "config-lan-node59.json"),
+        "remote_config": "/root/config-lan-node59.json",
         "remote_log": "/root/test-remote-node59.log",
     },
     {
@@ -83,8 +83,8 @@ MACHINES = [
         "password": "ecoo1234",
         "arch": "arm",
         "remote_bin": "/root/wasi-host",
-        "config": os.path.join(PROJECT_DIR, "config-remote-node60.json"),
-        "remote_config": "/root/config-remote-node60.json",
+        "config": os.path.join(PROJECT_DIR, "config-lan-node60.json"),
+        "remote_config": "/root/config-lan-node60.json",
         "remote_log": "/root/test-remote-node60.log",
     },
 ]
