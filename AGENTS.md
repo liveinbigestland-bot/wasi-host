@@ -1,86 +1,94 @@
 # Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+## 项目概览
 
-## Quick Reference
+**wasi-host** — Zig 跨平台 WASM 插件运行时，基于 wasm3 解释器。
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+核心能力：
+- WASM 插件沙箱执行（内存/超时/网络/文件系统权限控制）
+- 动态插件加载：控制通道（本地 TCP）+ DHT 内容寻址分发
+- Chord DHT：节点发现、键值存储、内容寻址（SHA256）
+- P2P 通信：UDP + TCP 双传输，自动网络检测
+- 守护进程 wasi-hostd：节点监控、自恢复、远程升级
+- 中继服务器 relay-server：加密中继（NAT 穿透）
+
+详细机器拓扑、部署脚本、构建命令见 [CLAUDE.md](CLAUDE.md)。
+
+## 分支策略
+
+| 分支 | 用途 |
+|------|------|
+| `master` | 主分支。Lua 已移除，编排由动态插件机制承担 |
+| `lua-preserved` | Lua 集成版本保留（36b02fcf），不再演进 |
+
+## 构建与测试
+
+```powershell
+# 主构建（含 WASM 插件、守护进程、中继服务器）
+zig build
+
+# 单元测试（全部通过为成功标准）
+zig build test
+
+# 交叉编译（见 CLAUDE.md）
+zig build -Dtarget=arm-linux-musleabihf -Dcpu=cortex_a7
+zig build -Dtarget=x86_64-linux-gnu
 ```
 
-## Non-Interactive Shell Commands
+**注意**：Windows 上编译前须先终止 `wasi-host.exe`，否则 zig build 报 AccessDenied。
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+## 代码结构
 
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
-
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
-
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
+```
+wasi-host/
+├── main.zig              # 入口：插件装载、控制通道、事件循环
+├── build.zig             # 构建配置（无 Lua 依赖）
+├── src/
+│   ├── plugin/           # 动态插件运行时
+│   │   ├── manager.zig   # 注册表、看门狗、取消/暂停/超时
+│   │   └── content.zig   # 内容寻址（SHA256 ↔ DHT 键 ↔ Base64）
+│   ├── p2p/chord/        # Chord DHT 节点
+│   ├── p2p/metadata/     # 键值存储、权限、复制
+│   ├── host/             # WASM 宿主函数（DHT、文件、网络）
+│   ├── daemon/           # 守护进程（controller/supervisor/reporter）
+│   ├── relay/            # 加密中继服务器
+│   └── logging/          # 日志模块
+├── plugins/              # WASM 插件源码（wasm32-wasi）
+├── wasm3/                # wasm3 解释器（含 m3_Yield/m3_ControlCheck 钩子）
+└── tests/                # 单元测试
 ```
 
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+## 关键设计约束
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+1. **WASM 执行隔离**：插件在独立线程运行，看门狗线程统一处理超时
+2. **控制通道鉴权**：所有控制请求必须携带 `control_token`
+3. **内容寻址不可变**：插件字节码 SHA256 即身份，DHT 值不可篡改
+4. **插件卸载安全**：仅允许卸载非活动实例（completed/failed/timeout/cancelled）
+5. **热更新序列**：取消旧实例 → 等待退出 → 拉取新字节码（缓存优先）→ 重载
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+## 会话收尾协议
 
-### Quick Reference
+代码变更后必须完成：
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
+```powershell
+zig build          # 编译通过
+zig build test     # 测试通过（当前 98/98，0 泄漏）
+git pull --rebase
+git push
+git status         # 确认 "up to date with origin"
 ```
 
-### Rules
+**bd (beads) 任务跟踪**：当前 `bd dolt push` 存在 panic 问题（需调查），
+任务状态可用 `bd ready` / `bd close <id>` 管理，但数据推送暂不可靠。
+不要使用 TodoWrite 替代 bd。
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+## 临时文件规范
 
-## Session Completion
+- 根目录禁止遗留一次性脚本（test_*.py、deploy_*.py、fix_*.ps1 等）
+- 运行时数据目录（p2p_data/、wasm-cache/）不提交，但清理前须确认无节点运行
+- zig-cache/、zig-out/ 已加入 .gitignore
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+## 已知问题
 
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
-
-
+- `bd dolt push` panic（dolt 版本兼容性问题，待修复）
+- `web config overrides` 测试在 Windows 上偶发失败（端口占用），Linux 正常
