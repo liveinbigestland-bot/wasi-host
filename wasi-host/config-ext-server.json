@@ -5,6 +5,7 @@
         "listen_port": 20808,
         "transport_mode": "tcp",
         "tcp_port": 8400,
+        "external_tcp_port": 443,
         "prefer_ipv4": true,
         "bootstrap": [{"host": "170.106.170.85", "port": 20808, "tcp_port": 8444}],
         "key_file": "p2p_key_ext.bin",
