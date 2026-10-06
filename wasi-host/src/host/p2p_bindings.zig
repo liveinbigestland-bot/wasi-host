@@ -8,6 +8,7 @@ const wasm3 = @cImport({
 const chord_node = @import("../p2p/chord/node.zig");
 const chord_types = @import("../p2p/chord/types.zig");
 const meta_types = @import("../p2p/metadata/types.zig");
+const lua_events = @import("../lua/events.zig");
 const Permission = meta_types.Permission;
 
 const ChordNode = chord_node.ChordNode;
@@ -211,15 +212,15 @@ pub fn host_node_info(rt: ?*anyopaque, _: ?*anyopaque, sp: ?*u64, _: ?*anyopaque
     };
 
     const info = std.json.stringifyAlloc(std.heap.page_allocator, .{
-        .id = std.fmt.fmtSliceHexLower(&std.mem.toBytes(chord.own_id)),
+        .id = std.mem.toBytes(chord.own_id),
         .host = chord.own_host,
         .port = chord.own_port,
         .successor = if (chord.routing.successor) |s| .{
-            .id = std.fmt.fmtSliceHexLower(&std.mem.toBytes(s.id)),
+            .id = std.mem.toBytes(s.id),
             .host = s.host, .port = s.port,
         } else null,
         .predecessor = if (chord.routing.predecessor) |p| .{
-            .id = std.fmt.fmtSliceHexLower(&std.mem.toBytes(p.id)),
+            .id = std.mem.toBytes(p.id),
             .host = p.host, .port = p.port,
         } else null,
         .store_count = chord.store.count(),

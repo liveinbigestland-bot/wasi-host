@@ -298,7 +298,10 @@ const PluginCallWork = struct {
 };
 
 fn runPlugin(cfg: PlugConfig, wasm_bin: []const u8, maybe_chord: ?*chord_node.ChordNode, lua_manager: ?*lua_state_manager_type) void {
-    const plugin_handle = if (lua_manager) |m| m.generatePluginHandle(null) else 0;
+    const plugin_handle = if (lua_manager) |m|
+        m.generatePluginHandle(null) catch 0
+    else
+        0;
     const start_time = std.time.nanoTimestamp();
 
     std.debug.print("\n=== [启动] {s} (mem={d}KB, timeout={d}ms, net={}, write={}, host_info={}) ===\n", .{
@@ -1050,31 +1053,47 @@ pub fn main() !void {
     }
 
     // ── WASM 插件执行 ────────────────────────────────────────
-    // Temporarily disabled
-    // const configs: []PlugConfig = if (top_cfg) |c| c.value.plugins orelse blk: {
-    //     break :blk &[_]PlugConfig{};
-    // } else blk: {
-    //     var defaults: [embedded_list.len]PlugConfig = undefined;
-    //     for (&defaults, 0..) |*d, i| {
-    //         d.* = .{
-    //             .name = &.{},
-    //             .embed_path = embedded_list[i].path,
-    //             .mem_kb = 512,
-    //             .timeout_ms = 5000,
-    //             .network = false,
-    //             .write = false,
-    //             .allow_host_info = true,
-    //         };
-    //     }
-    //     break :blk &defaults;
-    // };
-    //
-    // Plugin threading disabled (temporarily)
-    // var threads = std.ArrayList(std.Thread).init(alloc);
-    // defer {
-    //     for (threads.items) |t| t.join();
-    //     threads.deinit();
-    // };
+    const configs: []PlugConfig = if (top_cfg) |c| c.value.plugins orelse blk: {
+        break :blk &[_]PlugConfig{};
+    } else blk: {
+        var defaults: [embedded_list.len]PlugConfig = undefined;
+        for (&defaults, 0..) |*d, i| {
+            d.* = .{
+                .name = &.{},
+                .embed_path = embedded_list[i].path,
+                .mem_kb = 512,
+                .timeout_ms = 5000,
+                .network = false,
+                .write = false,
+                .allow_host_info = true,
+            };
+        }
+        break :blk &defaults;
+    };
+
+    // runPlugin 内部已将 m3_Call 移至 worker 线程并带超时熔断；
+    // 外层仍按插件并发执行，join 等待全部返回（超时的 worker 已 detach）。
+    var threads = std.ArrayList(std.Thread).init(alloc);
+    defer {
+        for (threads.items) |t| t.join();
+        threads.deinit();
+    }
+
+    for (configs) |plug_cfg| {
+        const name = if (plug_cfg.name.len > 0) plug_cfg.name else plug_cfg.embed_path;
+        const wasm_data = lookupEmbedded(plug_cfg.embed_path) orelse {
+            std.debug.print("[skip] {s}: embedded file {s} not found\n", .{ name, plug_cfg.embed_path });
+            continue;
+        };
+        const thread = std.Thread.spawn(.{}, runPlugin, .{ plug_cfg, wasm_data, maybe_chord, &lua_state_manager }) catch |err| {
+            std.debug.print("[error] 无法启动插件线程 {s}: {}\n", .{ name, err });
+            continue;
+        };
+        try threads.append(thread);
+    }
+
+    for (threads.items) |t| t.join();
+    threads.clearRetainingCapacity();
     std.debug.print("\nAll plugins executed.\n", .{});
 
     // P2P 保活：给 stabilize 协议足够时间运行

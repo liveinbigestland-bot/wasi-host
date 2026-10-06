@@ -9,7 +9,6 @@ pub const HostFunctions = struct {
     /// config table may contain: mem_kb (default 512), timeout_ms (default 5000), network (default false), write (default false)
     fn wasmStart(l: ?*Lua) callconv(.C) c_int {
         const L = LuaState.fromPtr(l);
-        const alloc = L.allocator();
         defer L.setTop(0);
 
         // Get plugin_name (arg 1)
@@ -20,7 +19,7 @@ pub const HostFunctions = struct {
         }
 
         const plugin_name = L.toString(1) orelse "";
-        defer if (plugin_name.len > 0) alloc.free(plugin_name);
+        defer if (plugin_name.len > 0) L.allocator().free(plugin_name);
 
         // Get config table (arg 2, optional)
         var mem_kb: u32 = 512;
@@ -58,13 +57,6 @@ pub const HostFunctions = struct {
 
         // TODO: Actually start the WASM plugin
         // For now, return a fake handle
-        _ = plugin_name;
-        _ = mem_kb;
-        _ = timeout_ms;
-        _ = network;
-        _ = write;
-        _ = allow_host_info;
-
         const fake_handle: u64 = 0;
         L.pushInteger(fake_handle);
         L.pushNil();
@@ -174,7 +166,6 @@ pub const HostFunctions = struct {
     /// Get metadata for a plugin
     fn wasmPluginInfo(l: ?*Lua) callconv(.C) c_int {
         const L = LuaState.fromPtr(l);
-        const alloc = L.allocator();
         defer L.setTop(0);
 
         if (L.getType(1) != .string) {
@@ -183,7 +174,7 @@ pub const HostFunctions = struct {
         }
 
         const plugin_name = L.toString(1) orelse "";
-        defer if (plugin_name.len > 0) alloc.free(plugin_name);
+        defer if (plugin_name.len > 0) L.allocator().free(plugin_name);
 
         L.newTable();
 
@@ -213,7 +204,6 @@ pub const HostFunctions = struct {
 
     fn wasmOnEvent(l: ?*Lua) callconv(.C) c_int {
         const L = LuaState.fromPtr(l);
-        const alloc = L.allocator();
         defer L.setTop(0);
 
         if (global_lua_manager == null) {
@@ -235,7 +225,7 @@ pub const HostFunctions = struct {
         }
 
         const event_type = L.toString(1) orelse "";
-        defer if (event_type.len > 0) alloc.free(event_type);
+        defer if (event_type.len > 0) L.allocator().free(event_type);
 
         // Validate event type
         const valid = checkValidEventType(event_type);
@@ -248,7 +238,7 @@ pub const HostFunctions = struct {
         // Store callback function reference
         // We need to create a persistent reference to the Lua function
         L.pushValue(2); // Push callback onto stack
-        const ref = L.ref(lua.lua.LuaRegistryIndex);
+        const ref = L.ref(Lua.LuaRegistryIndex);
         _ = ref;
 
         // Store in LuaStateManager
@@ -264,7 +254,6 @@ pub const HostFunctions = struct {
     /// Unregister a callback for a specific event type
     fn wasmOffEvent(l: ?*Lua) callconv(.C) c_int {
         const L = LuaState.fromPtr(l);
-        const alloc = L.allocator();
         defer L.setTop(0);
 
         if (global_lua_manager == null) {
@@ -280,7 +269,7 @@ pub const HostFunctions = struct {
         }
 
         const event_type = L.toString(1) orelse "";
-        defer if (event_type.len > 0) alloc.free(event_type);
+        defer if (event_type.len > 0) L.allocator().free(event_type);
 
         // Unregister callback from LuaStateManager
         global_lua_manager.?.unregisterCallback(event_type);
@@ -294,7 +283,6 @@ pub const HostFunctions = struct {
     /// Get configuration for a specific connection
     fn wasmGetConnectionConfig(l: ?*Lua) callconv(.C) c_int {
         const L = LuaState.fromPtr(l);
-        const alloc = L.allocator();
         defer L.setTop(0);
 
         if (global_lua_manager == null) {
@@ -313,7 +301,8 @@ pub const HostFunctions = struct {
         const manager = global_lua_manager.?;
 
         // Get connection state
-        if (manager.getConnectionState(connection_id)) |state| {
+        if (manager.getConnectionState(connection_id)) |@"_"| {
+            _ = @"_"; // Capture but not use - connection state exists
             // Create config table with default values
             L.newTable();
 
@@ -347,7 +336,6 @@ pub const HostFunctions = struct {
     /// Set configuration for a specific connection
     fn wasmSetConnectionConfig(l: ?*Lua) callconv(.C) c_int {
         const L = LuaState.fromPtr(l);
-        const alloc = L.allocator();
         defer L.setTop(0);
 
         if (global_lua_manager == null) {
@@ -388,7 +376,6 @@ pub const HostFunctions = struct {
     /// Explicitly remove a connection state and clean up resources
     fn wasmRemoveConnectionState(l: ?*Lua) callconv(.C) c_int {
         const L = LuaState.fromPtr(l);
-        const alloc = L.allocator();
         defer L.setTop(0);
 
         if (global_lua_manager == null) {

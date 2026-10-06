@@ -84,7 +84,7 @@ pub const EventQueue = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         var buffer: [Capacity]Event align(128) = undefined;
-        for (&buffer, 0..) |*e, i| {
+        for (&buffer) |*e| {
             e.* = Event{
                 .payload = undefined,
                 .allocated = false,
@@ -100,8 +100,17 @@ pub const EventQueue = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        _ = self;
-        // Static buffer, no cleanup needed
+        // 排空未消费事件并释放其堆字段（clonePayload 时分配）
+        var head = self.head.load(.acquire);
+        const tail = self.tail.load(.acquire);
+        while (head < tail) : (head += 1) {
+            const slot = &self.buffer[head % Capacity];
+            if (slot.allocated) {
+                self.freePayload(slot.payload);
+                slot.allocated = false;
+            }
+        }
+        self.head.store(tail, .release);
     }
 
     /// Post an event from any thread (producer)
@@ -127,7 +136,6 @@ pub const EventQueue = struct {
                 return;
             }
             attempts += 1;
-            std.atomic.thread_fence(.acquire);
         }
 
         // Cleanup and return overflow error

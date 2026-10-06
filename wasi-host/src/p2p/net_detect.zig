@@ -75,7 +75,7 @@ pub fn fullNetDetect(alloc: std.mem.Allocator, test_port: u16, listen_host: []co
     if (pub_ip) |ip| {
         log.info("[net_detect] 公网 IP: {s}", .{ip});
     } else {
-        log.info("[net_detect] 无法获取公网 IP（可能无外网连接）");
+        log.info("[net_detect] 无法获取公网 IP（可能无外网连接）", .{});
     }
 
     // ── 3. 并发执行外网/内网探测 ──

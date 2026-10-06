@@ -15,6 +15,7 @@ const meta_permission = @import("../metadata/permission.zig");
 const replication = @import("../metadata/replication.zig");
 const config_mod = @import("../config.zig");
 const lua_events = @import("../../../src/lua/events.zig");
+const lua = @import("../../../src/lua/api.zig");
 
 const NodeId = ring.NodeId;
 const Message = types.Message;
@@ -193,13 +194,17 @@ pub const ChordNode = struct {
     /// 注册 Lua P2P 事件回调
     pub fn registerLuaCallbacks(self: *ChordNode) void {
         if (self.lua_manager) |m| {
-            m.registerCallback("chord_node_join", m.getGlobalState().*) catch |err| {
+            const callback_state = lua.LuaState{
+                .state = m.getGlobalState(),
+                .allocator = undefined,
+            };
+            m.registerCallback("chord_node_join", callback_state) catch |err| {
                 std.debug.print("[chord] 注册 chord_node_join 回调失败: {}\n", .{err});
             };
-            m.registerCallback("chord_successor_change", m.getGlobalState().*) catch |err| {
+            m.registerCallback("chord_successor_change", callback_state) catch |err| {
                 std.debug.print("[chord] 注册 chord_successor_change 回调失败: {}\n", .{err});
             };
-            m.registerCallback("dht_put", m.getGlobalState().*) catch |err| {
+            m.registerCallback("dht_put", callback_state) catch |err| {
                 std.debug.print("[chord] 注册 dht_put 回调失败: {}\n", .{err});
             };
             std.debug.print("[chord] Lua P2P 事件回调已注册\n", .{});
@@ -208,10 +213,12 @@ pub const ChordNode = struct {
 
     /// Post P2P event to Lua if callbacks are registered and enabled
     fn postP2PEvent(self: *ChordNode, event: lua_events.EventPayload) void {
-        if (self.p2p_events_enabled and self.lua_manager) |m| {
-            m.postEvent(event) catch |err| {
-                std.debug.print("[chord] Lua 事件队列满: {}\n", .{err});
-            };
+        if (self.p2p_events_enabled) {
+            if (self.lua_manager) |m| {
+                m.postEvent(event) catch |err| {
+                    std.debug.print("[chord] Lua 事件队列满: {}\n", .{err});
+                };
+            }
         }
     }
 
@@ -281,7 +288,7 @@ pub const ChordNode = struct {
         // Post chord_node_join event
         self.postP2PEvent(lua_events.EventPayload{
             .chord_node_join = .{
-                .node_id = self.own_id,
+                .node_id = ring.idToBytes(self.own_id),
                 .host = self.own_host,
                 .port = self.own_port,
             },
@@ -999,10 +1006,12 @@ pub const ChordNode = struct {
             ring.idToHex(result.successor.id), result.successor.port, result.successor.tcp_port,
         });
         // Post successor change event
+        var zero_id: [20]u8 = undefined;
+        @memset(&zero_id, 0);
         self.postP2PEvent(lua_events.EventPayload{
             .chord_successor_change = .{
-                .old_successor_id = if (self.routing.successor) |old| old.id else [20]u8{0} ** 20,
-                .new_successor_id = result.successor.id,
+                .old_successor_id = if (self.routing.successor) |old| ring.idToBytes(old.id) else zero_id,
+                .new_successor_id = ring.idToBytes(result.successor.id),
             },
         });
         return true;
@@ -1033,8 +1042,8 @@ pub const ChordNode = struct {
                 // Post successor change event
                 self.postP2PEvent(lua_events.EventPayload{
                     .chord_successor_change = .{
-                        .old_successor_id = succ.id,
-                        .new_successor_id = alt.id,
+                        .old_successor_id = ring.idToBytes(succ.id),
+                        .new_successor_id = ring.idToBytes(alt.id),
                     },
                 });
             } else if (self.tryBootstrapFallback()) {
@@ -1057,8 +1066,8 @@ pub const ChordNode = struct {
                         // Post successor change event
                         self.postP2PEvent(lua_events.EventPayload{
                             .chord_successor_change = .{
-                                .old_successor_id = succ.id,
-                                .new_successor_id = pred_id,
+                                .old_successor_id = ring.idToBytes(succ.id),
+                                .new_successor_id = ring.idToBytes(pred_id),
                             },
                         });
                     } else if (ring.between(pred_id, self.own_id, succ.id)) {
@@ -1067,8 +1076,8 @@ pub const ChordNode = struct {
                         // Post successor change event
                         self.postP2PEvent(lua_events.EventPayload{
                             .chord_successor_change = .{
-                                .old_successor_id = succ.id,
-                                .new_successor_id = pred_id,
+                                .old_successor_id = ring.idToBytes(succ.id),
+                                .new_successor_id = ring.idToBytes(pred_id),
                             },
                         });
                     }

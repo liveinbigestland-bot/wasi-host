@@ -38,7 +38,9 @@ pub fn build(b: *std.Build) void {
         .strip = optimize != .Debug,
     });
     exe.linkLibC();
-    exe.linkSystemLibrary("ws2_32"); // Socket functions for UDP
+    if (host_target.result.os.tag == .windows) {
+        exe.linkSystemLibrary("ws2_32"); // UDP sockets（Winsock，仅 Windows 需要）
+    }
 
     // Link wasm3 static library (built from wasm3/build.zig)
     const wasm3_lib = b.addStaticLibrary(.{
@@ -47,6 +49,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm3_lib.root_module.addCMacro("d_m3HasWASI", "");
+    // ARM 的 LLVM 后端无法满足 wasm3 解释器分发处的 musttail 要求
+    // （ICE: failed to perform tail call elimination），禁用 tail call
+    if (host_target.result.cpu.arch == .arm) {
+        wasm3_lib.root_module.addCMacro("M3_HAS_TAIL_CALL", "0");
+    }
     wasm3_lib.addIncludePath(b.path("wasm3/source"));
     wasm3_lib.addCSourceFiles(.{
         .root = b.path("wasm3/source"),
@@ -72,6 +79,9 @@ pub fn build(b: *std.Build) void {
     });
     wasm3_lib.linkLibC();
     exe.linkLibrary(wasm3_lib);
+    // 显式暴露 wasm3 头文件给 main.zig 的 @cImport（不依赖 linkLibrary 的传递暂存，
+    // 其暂存目录可能在构建其他目标（如 test）时被缓存清理清空）
+    exe.addIncludePath(b.path("wasm3/source"));
 
     // 检测是否本机编译（不是交叉编译）
     const native_target = b.resolveTargetQuery(.{});
@@ -101,20 +111,26 @@ pub fn build(b: *std.Build) void {
         std.debug.print("[build] Target OS: {s}, Arch: {s}\n", .{ @tagName(target_os), @tagName(target_arch) });
 
         // 根据平台选择 Lua 库
-        if (target_os == .linux and target_arch == .x86_64) {
-            // Linux x86_64 - 使用系统库
+        if (building_natively and target_os == .linux) {
+            // 本机 Linux - 动态链接系统 lua5.4
             exe.linkSystemLibrary("lua5.4");
-            std.debug.print("[build] Linking system lua5.4 (Linux x86_64)\n", .{});
-        } else if (target_os == .linux and target_arch == .arm) {
-            // Linux ARM - 使用系统库
-            exe.linkSystemLibrary("lua5.4");
-            std.debug.print("[build] Linking system lua5.4 (Linux ARM)\n", .{});
-        } else {
-            // Windows / 其他平台 - 使用本地静态库 lua-libs/liblua54.a
+            std.debug.print("[build] Linking system lua5.4 (native Linux)\n", .{});
+        } else if (target_os == .windows) {
+            // Windows - lua-libs 下预构建库
             exe.addLibraryPath(.{ .cwd_relative = "lua-libs" });
             exe.linkSystemLibrary("lua54");
             exe.addIncludePath(.{ .cwd_relative = "lua-libs/include" });
-            std.debug.print("[build] Linking local liblua54.a (Windows)\n", .{});
+            std.debug.print("[build] Linking prebuilt lua54 (Windows)\n", .{});
+        } else {
+            // 交叉编译到 Linux - 使用随仓库分发的静态 liblua 归档
+            const archive = switch (target_arch) {
+                .x86_64 => "liblua54-x86_64-linux.a",
+                .arm => "liblua54-arm.a",
+                else => @panic("该交叉目标无预构建 liblua，请先构建静态归档"),
+            };
+            exe.addObjectFile(.{ .cwd_relative = b.fmt("lua-libs/{s}", .{archive}) });
+            exe.addIncludePath(.{ .cwd_relative = "lua-libs/include" });
+            std.debug.print("[build] Linking prebuilt static {s} (cross)\n", .{archive});
         }
     } else {
         std.debug.print("[build] Lua disabled\n", .{});

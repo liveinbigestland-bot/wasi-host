@@ -28,7 +28,8 @@ pub const LuaStateManager = struct {
     event_queue: events.EventQueue,
     allocator: std.mem.Allocator,
     callbacks: std.StringHashMap(lua.LuaState),
-    next_plugin_handle: std.atomic.Value(u64),
+    // 32 位原子计数器（32 位目标不支持 64 位原子操作），使用处拓宽为 u64 句柄
+    next_plugin_handle: std.atomic.Value(u32),
     connection_plugins: std.AutoHashMap(u64, std.ArrayList(u64)), // connection_id -> list of plugin_handles
 
     // Error handling
@@ -57,7 +58,7 @@ pub const LuaStateManager = struct {
             .event_queue = events.EventQueue.init(allocator),
             .allocator = allocator,
             .callbacks = std.StringHashMap(lua.LuaState).init(allocator),
-            .next_plugin_handle = std.atomic.Value(u64).init(1),
+            .next_plugin_handle = std.atomic.Value(u32).init(1),
             .error_callback = null,
             .error_stack_depth = 100,
             .execution_timeout_ns = 30 * std.time.ns_per_s,
@@ -434,18 +435,16 @@ pub const LuaStateManager = struct {
         }
     }
 
-    pub fn generatePluginHandle(self: *LuaStateManager, connection_id: ?u64) u64 {
-        const handle = self.next_plugin_handle.fetchAdd(1, .monotonic);
+    pub fn generatePluginHandle(self: *LuaStateManager, connection_id: ?u64) !u64 {
+        const handle: u64 = @intCast(self.next_plugin_handle.fetchAdd(1, .monotonic));
 
         if (connection_id) |cid| {
-            const plugins = self.connection_plugins.get(cid) orelse {
-                // Create new plugin list for this connection
-                var list = std.ArrayList(u64).init(self.allocator);
-                try list.append(handle);
-                try self.connection_plugins.put(cid, &list);
-                return;
-            };
-            try plugins.append(handle);
+            // 按 connection_id 归类插件句柄（ArrayList 按值存入 HashMap）
+            const entry = try self.connection_plugins.getOrPut(cid);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = std.ArrayList(u64).init(self.allocator);
+            }
+            try entry.value_ptr.append(handle);
         }
 
         return handle;
