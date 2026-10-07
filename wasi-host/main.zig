@@ -367,6 +367,28 @@ fn pluginControlHandler(
     params: std.json.Value,
     arena: std.mem.Allocator,
 ) ?[]u8 {
+    // 节点状态查询（不依赖 plugin manager）
+    if (std.mem.eql(u8, action, "node_status")) {
+        const chord = g_chord orelse {
+            return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "chord unavailable" }, .{}) catch null;
+        };
+        const nid_hex = arena.dupe(u8, &chord_ring.idToHex(chord.own_id)) catch return null;
+        const succ = chord.routing.successor;
+        const pred = chord.routing.predecessor;
+        const succ_hex = if (succ) |s| (arena.dupe(u8, &chord_ring.idToHex(s.id)) catch return null) else "";
+        const pred_hex = if (pred) |p| (arena.dupe(u8, &chord_ring.idToHex(p.id)) catch return null) else "";
+        const succ_addr = if (succ) |s| (std.fmt.allocPrint(arena, "{s}:{d}", .{ s.host, s.port }) catch return null) else "";
+        const pred_addr = if (pred) |p| (std.fmt.allocPrint(arena, "{s}:{d}", .{ p.host, p.port }) catch return null) else "";
+        return std.json.stringifyAlloc(arena, .{
+            .ok = true,
+            .node_id = nid_hex,
+            .successor_id = succ_hex,
+            .successor_addr = succ_addr,
+            .predecessor_id = pred_hex,
+            .predecessor_addr = pred_addr,
+        }, .{}) catch null;
+    }
+
     const pm = g_plugin_manager orelse {
         return std.json.stringifyAlloc(arena, .{ .ok = false, .@"error" = "plugin manager unavailable" }, .{}) catch null;
     };

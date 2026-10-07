@@ -50,6 +50,22 @@ pub const HealthStatus = enum(u8) {
     unknown = 5,
 };
 
+/// 控制通道 node_status 响应
+const NodeStatusResp = struct {
+    ok: bool = false,
+    node_id: []const u8 = "",
+    successor_id: []const u8 = "",
+    successor_addr: []const u8 = "",
+    predecessor_id: ?[]const u8 = null,
+    predecessor_addr: ?[]const u8 = null,
+};
+
+/// 将 host 拷贝到固定缓冲（避免引用已释放的 JSON 解析内存）
+fn copyHost(buf: *[64]u8, host: []const u8) void {
+    const n = @min(host.len, 63);
+    @memcpy(buf[0..n], host[0..n]);
+}
+
 pub const Monitor = struct {
     alloc: std.mem.Allocator,
     config: config_mod.DaemonConfig,
@@ -62,6 +78,9 @@ pub const Monitor = struct {
     bootstrap_host: []const u8 = "",
     bootstrap_port: u16 = 0,
     my_id_override: ?NodeId = null, // 如果 ping 无法获取，可以手动设置
+    // node_status 查询结果的固定存储缓冲（host 切片指向这里，避免悬垂）
+    succ_addr_buf: [64]u8 = undefined,
+    pred_addr_buf: [64]u8 = undefined,
 
     pub fn init(alloc: std.mem.Allocator, cfg: config_mod.DaemonConfig) !Monitor {
         var monitor = Monitor{
@@ -129,6 +148,11 @@ pub const Monitor = struct {
             return;
         }
 
+        // 1.5 通过控制通道查询节点真实状态（node_id/后继/前驱）
+        self.queryNodeStatus(local_port) catch |err| {
+            std.debug.print("[monitor] 节点状态查询失败: {}\n", .{err});
+        };
+
         // 2. 检查是否孤立
         if (self.node_status.isolated) {
             self.health = .isolated;
@@ -191,6 +215,78 @@ pub const Monitor = struct {
         self.node_status.alive = true;
         self.node_status.isolated = false;
         self.node_status.isolated = false;
+    }
+
+    /// 通过控制通道查询节点真实状态（node_status action）
+    fn queryNodeStatus(self: *Monitor, local_port: u16) !void {
+        if (builtin.os.tag != .linux) return error.NotSupported;
+        const fd = self.udp_fd;
+        if (fd < 0) return error.SocketNotInitialized;
+
+        var msg_buf: [512]u8 = undefined;
+        const msg = if (self.config.control_token) |tok|
+            try std.fmt.bufPrint(&msg_buf, "{{\"control\":{{\"node_status\":{{}}}},\"token\":\"{s}\"}}", .{tok})
+        else
+            try std.fmt.bufPrint(&msg_buf, "{{\"control\":{{\"node_status\":{{}}}}}}", .{});
+
+        var target = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, local_port),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+            .zero = .{0} ** 8,
+        };
+        const sent = try posix.sendto(fd, msg, 0, @as(*const posix.sockaddr, @ptrCast(&target)), @sizeOf(posix.sockaddr.in));
+        if (sent != msg.len) return error.SendFailed;
+
+        var src_addr: posix.sockaddr = undefined;
+        var src_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const n = try posix.recvfrom(fd, &self.recv_buf, 0, &src_addr, &src_len);
+
+        const parsed = std.json.parseFromSlice(NodeStatusResp, self.alloc, self.recv_buf[0..n], .{
+            .ignore_unknown_fields = true,
+        }) catch return error.InvalidResponse;
+        defer parsed.deinit();
+        const r = parsed.value;
+        if (!r.ok or r.node_id.len < 40) return error.InvalidResponse;
+
+        const nid = dht.idFromHex(r.node_id) catch return error.InvalidResponse;
+        self.node_status.node_id = nid;
+
+        if (r.successor_id.len >= 40) {
+            if (dht.idFromHex(r.successor_id)) |sid| {
+                self.node_status.successor_id = sid;
+                if (r.successor_addr.len > 0) {
+                    if (std.mem.lastIndexOfScalar(u8, r.successor_addr, ':')) |ci| {
+                        const host = r.successor_addr[0..ci];
+                        const port = std.fmt.parseInt(u16, r.successor_addr[ci + 1 ..], 10) catch 0;
+                        copyHost(&self.succ_addr_buf, host);
+                        self.node_status.successor_host = self.succ_addr_buf[0..host.len];
+                        self.node_status.successor_port = port;
+                    }
+                }
+                // 后继为自身 = 孤立节点
+                self.node_status.isolated = (sid == nid);
+            } else |_| {}
+        } else {
+            self.node_status.isolated = true;
+        }
+
+        if (r.predecessor_id) |phex| {
+            if (phex.len >= 40) {
+                if (dht.idFromHex(phex)) |pid| {
+                    self.node_status.pred_id = pid;
+                    if (r.predecessor_addr) |pa| {
+                        if (std.mem.lastIndexOfScalar(u8, pa, ':')) |ci| {
+                            const host = pa[0..ci];
+                            const port = std.fmt.parseInt(u16, pa[ci + 1 ..], 10) catch 0;
+                            copyHost(&self.pred_addr_buf, host);
+                            self.node_status.pred_host = self.pred_addr_buf[0..host.len];
+                            self.node_status.pred_port = port;
+                        }
+                    }
+                } else |_| {}
+            }
+        }
     }
 
     /// 独立环查询：向 bootstrap 查询本节点的正确后继和前驱
