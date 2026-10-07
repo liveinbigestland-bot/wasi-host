@@ -247,7 +247,11 @@ pub const ChordNode = struct {
         // 单地址也走 bootstrap 模块（获得快速探测 + 重试能力）
         const result = try client.findSuccessor(self.own_id, &[_]types.NodeAddr{bootstrap}, .{});
 
-        const succ = result.successor;
+        var succ = result.successor;
+        if (succ.id == self.own_id) {
+            // 自环：引导节点路由表残留指向我们（重启场景），查询其真实身份
+            succ = self.resolveBootstrapIdentity(bootstrap, bootstrap);
+        }
         std.debug.print("[chord] 后继节点: id={s} addr={s}:{d} tcp={d}\n", .{
             ring.idToHex(succ.id), succ.host, succ.port, succ.tcp_port,
         });
@@ -257,29 +261,174 @@ pub const ChordNode = struct {
         if (self.routing.successor) |s| {
             // finger[0] 必然指向 successor
             self.routing.fingers[0].node = s;
-            // 对于 i=1..15，如果 finger[i].start 落在 (own_id, successor.id] 区间，直接填充
-            var i: u8 = 1;
-            while (i < 16 and i < ring.M) : (i += 1) {
-                const start = ring.fingerStart(self.own_id, i);
-                if (ring.betweenLeftInclusive(start, self.own_id, s.id)) {
-                    self.routing.fingers[i].node = s;
-                } else {
-                    // 超出 successor 区间：向 successor 发送 find_successor 查询
-                    const f_resp = self.sendAndWait(Message{ .find_successor = .{ .target = start } }, .find_successor_resp, s, 3000) catch |err| {
-                        std.debug.print("[chord] join: finger[{d}] 查询失败: {}\n", .{ i, err });
-                        continue;
-                    };
-                    switch (f_resp) {
-                        .find_successor_resp => |fb| {
-                            const f_node = NodeAddr{ .id = fb.node_id, .host = fb.node_addr, .port = fb.node_port, .tcp_port = fb.node_tcp_port };
-                            self.routing.fingers[i].node = f_node;
-                        },
-                        else => {},
-                    }
+            self.quickFillFingers(s);
+        }
+    }
+
+    /// 多引导节点加入（跨环融合）。
+    ///
+    /// 顺序向每个 bootstrap 发 find_successor(own_id)（响应槽为单槽，不能并发；
+    /// 超时放宽以覆盖经加密中继绕回的响应）：
+    /// - 首个成功响应：按 Chord 语义设为后继 + finger 快速填充；
+    /// - 其余成功响应：不覆盖后继，向学到的节点主动 notify。对方下一轮
+    ///   stabilize 会沿 notify 反向学习，跨环节点经若干轮 stabilize 收敛为单环。
+    pub fn joinMulti(self: *ChordNode, bootstraps: []const types.NodeAddr) !void {
+        if (bootstraps.len == 0) return;
+
+        const probe_timeout_ms: u64 = 6000;
+        var joined = false;
+
+        for (bootstraps) |raw_boot| {
+            // 公网 bootstrap 配置中只有 host:port（id=0），而 relay 按 NodeID 路由，
+            // 必须先经直连 UDP 解析真实身份（顺带拿到 tcp_port），否则中继必失败。
+            var boot = raw_boot;
+            if (boot.id == 0 and !isPrivateIP(boot.host)) {
+                boot = self.resolveIdentityDirectUdp(raw_boot, 2500) orelse {
+                    std.debug.print("[chord] joinMulti: 引导 {s}:{d} 身份解析失败（直连UDP），跳过\n", .{ raw_boot.host, raw_boot.port });
+                    continue;
+                };
+                std.debug.print("[chord] joinMulti: 解析引导身份 {s} ({s}:{d})\n", .{
+                    ring.idToHex(boot.id), boot.host, boot.port,
+                });
+            }
+            // 探测 + 重试：relay 会话在启动/重连窗口可能短暂不可用，
+            // 一次失败不应永久放弃该引导节点。
+            var learned: ?NodeAddr = null;
+            for (0..3) |attempt| {
+                if (attempt > 0) std.time.sleep(@as(u64, 600) * std.time.ns_per_ms);
+                const resp = self.sendAndWait(
+                    Message{ .find_successor = .{ .target = self.own_id } },
+                    .find_successor_resp,
+                    boot,
+                    probe_timeout_ms,
+                ) catch continue;
+                learned = switch (resp) {
+                    .find_successor_resp => |body| .{
+                        .id = body.node_id,
+                        .host = body.node_addr,
+                        .port = body.node_port,
+                        .tcp_port = body.node_tcp_port,
+                    },
+                    else => null,
+                };
+                if (learned != null) break;
+            }
+
+            const raw = learned orelse {
+                std.debug.print("[chord] joinMulti: 引导 {s}:{d} 多次探测均失败\n", .{ boot.host, boot.port });
+                continue;
+            };
+            var learned_node = raw;
+
+            if (!joined) {
+                joined = true;
+                if (learned_node.id == self.own_id) {
+                    // 自环：对方路由表残留指向我们，查询引导节点真实身份打破循环
+                    learned_node = self.resolveBootstrapIdentity(boot, boot);
+                }
+                self.routing.setSuccessor(learned_node);
+                self.routing.fingers[0].node = learned_node;
+                self.quickFillFingers(learned_node);
+                std.debug.print("[chord] joinMulti: 后继={s} (via {s}:{d})\n", .{
+                    ring.idToHex(learned_node.id), learned_node.host, learned_node.port,
+                });
+            } else {
+                std.debug.print("[chord] joinMulti: 学习到跨环节点 {s} (via {s}:{d})\n", .{
+                    ring.idToHex(learned_node.id), boot.host, boot.port,
+                });
+            }
+
+            // greet：让对方环立即感知我们（失败无害，stabilize/fallback 会继续修复）
+            self.greetNode(learned_node);
+        }
+
+        if (!joined) {
+            std.debug.print("[chord] joinMulti: 所有 {d} 个引导节点均失败，保持孤立\n", .{bootstraps.len});
+            return error.AllBootstrapFailed;
+        }
+    }
+
+    /// 查询引导节点真实身份（自环打破用）。失败时返回 fallback。
+    fn resolveBootstrapIdentity(self: *ChordNode, boot: NodeAddr, fallback: NodeAddr) NodeAddr {
+        return self.resolveIdentityDirectUdp(boot, 2500) orelse fallback;
+    }
+
+    /// 经直连 UDP 查询节点身份（绕过 transport_mode 与 relay：
+    /// relay 按 NodeID 路由，id 未知时无法走中继，只能先用 UDP 换取身份）。
+    fn resolveIdentityDirectUdp(self: *ChordNode, boot: NodeAddr, wait_ms: u64) ?NodeAddr {
+        const addr = std.net.Address.parseIp(boot.host, boot.port) catch return null;
+        const data = (Message{ .get_identity = {} }).encode(self.alloc) catch return null;
+        defer self.alloc.free(data);
+        self.socket.sendTo(addr, data) catch return null;
+
+        const deadline = timestamp() + @as(i64, @intCast(wait_ms));
+        while (timestamp() < deadline) {
+            var buf: [65535]u8 = undefined;
+            const result = self.socket.recvFrom(&buf) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.time.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return null,
+            };
+            const resp = Message.decode(buf[0..result.n], self.msg_arena.allocator()) catch continue;
+            switch (resp) {
+                .identity_resp => |body| return NodeAddr{
+                    .id = body.node_id,
+                    .host = body.node_addr,
+                    .port = body.node_port,
+                    .tcp_port = body.node_tcp_port,
+                },
+                else => self.handleMessage(resp, result.addr),
+            }
+        }
+        return null;
+    }
+
+    /// 利用后继批量填充初始 finger：start 落在 (own, succ] 区间的条目直接指向 succ；
+    /// 其余向后继发 find_successor 查询。
+    fn quickFillFingers(self: *ChordNode, succ: NodeAddr) void {
+        var i: u8 = 1;
+        while (i < 16 and i < ring.M) : (i += 1) {
+            const start = ring.fingerStart(self.own_id, i);
+            if (ring.betweenLeftInclusive(start, self.own_id, succ.id)) {
+                self.routing.fingers[i].node = succ;
+            } else {
+                const f_resp = self.sendAndWait(
+                    Message{ .find_successor = .{ .target = start } },
+                    .find_successor_resp,
+                    succ,
+                    3000,
+                ) catch continue;
+                switch (f_resp) {
+                    .find_successor_resp => |fb| {
+                        self.routing.fingers[i].node = .{
+                            .id = fb.node_id,
+                            .host = fb.node_addr,
+                            .port = fb.node_port,
+                            .tcp_port = fb.node_tcp_port,
+                        };
+                    },
+                    else => {},
                 }
             }
-            std.debug.print("[chord] join: 快速填充了 {d} 个 finger 条目\n", .{i});
         }
+        std.debug.print("[chord] join: 快速填充了 {d} 个 finger 条目\n", .{i});
+    }
+
+    /// 主动向节点发 notify（joinMulti 的跨环 greet 用）
+    fn greetNode(self: *ChordNode, node: NodeAddr) void {
+        if (node.id == self.own_id) return;
+        _ = self.sendAndWait(Message{ .notify = .{
+            .node_id = self.own_id,
+            .node_addr = self.own_host,
+            .node_port = self.own_port,
+            .node_tcp_port = self.advertiseTcpPort(),
+        } }, .notify_ok, node, 5000) catch |err| {
+            std.debug.print("[chord] joinMulti: greet → {s} 失败: {}\n", .{ ring.idToHex(node.id), err });
+            return;
+        };
+        std.debug.print("[chord] joinMulti: greet → {s} 成功\n", .{ring.idToHex(node.id)});
     }
 
     /// 事件循环主循环（单次迭代，供外部定时调用）
@@ -435,12 +584,36 @@ pub const ChordNode = struct {
             },
             .find_successor => |body| {
                 std.debug.print("[chord] find_successor from {} (port={d})\n", .{ from, @as(u16, from.in.sa.port) });
-                const succ = self.routing.findSuccessor(body.target);
+                const answer = self.routing.findSuccessor(body.target);
+                // 标准 Chord 递归解析：target ∈ (本节点, 后继] 才由后继直接应答；
+                // 否则转发给本地估算的最近前驱继续解析。纯本地查表在 finger 表
+                // 未收敛时会误答（遍历停滞、环无法闭合）。
+                const can_direct = if (self.routing.successor) |s|
+                    (s.id != self.own_id and ring.between(body.target, self.own_id, s.id))
+                else
+                    false;
+                if (!can_direct and answer.id != self.own_id) {
+                    if (self.sendAndWait(
+                        Message{ .find_successor = .{ .target = body.target } },
+                        .find_successor_resp,
+                        answer,
+                        6000,
+                    )) |fwd_resp| {
+                        switch (fwd_resp) {
+                            .find_successor_resp => |fb| {
+                                self.reply(from, Message{ .find_successor_resp = fb }) catch {};
+                                return;
+                            },
+                            else => {},
+                        }
+                    } else |_| {}
+                    // 转发失败：退回本地估算
+                }
                 self.reply(from, Message{ .find_successor_resp = .{
-                    .node_id = succ.id,
-                    .node_addr = succ.host,
-                    .node_port = succ.port,
-                    .node_tcp_port = succ.tcp_port,
+                    .node_id = answer.id,
+                    .node_addr = answer.host,
+                    .node_port = answer.port,
+                    .node_tcp_port = answer.tcp_port,
                 } }) catch {};
             },
             .get_predecessor => {
@@ -463,6 +636,16 @@ pub const ChordNode = struct {
                 if (self.routing.predecessor != null and !std.meta.eql(self.routing.predecessor, old_pred)) {
                     std.debug.print("[chord] 前驱更新为 {s}:{d}\n", .{ candidate.host, candidate.port });
                 }
+                // 即时入环：孤立节点（自指后继）收到他人 notify，立即设为后继，
+                // 不等下一轮 stabilize（外网节点 stabilize 间隔长，可省一个完整周期）
+                if (self.routing.successor) |s| {
+                    if (s.id == self.own_id and candidate.id != self.own_id) {
+                        self.routing.setSuccessor(candidate);
+                        std.debug.print("[chord] notify: 孤立节点即时入环，后继={s}\n", .{ring.idToHex(candidate.id)});
+                    }
+                }
+                // 记住见过面的节点：加入备份后继，供故障恢复 revive/alternative 拉回
+                if (candidate.id != self.own_id) self.routing.addBackupSuccessor(candidate);
                 self.reply(from, Message{ .notify_ok = {} }) catch {};
             },
             .get_identity => {
@@ -1119,7 +1302,7 @@ pub const ChordNode = struct {
                     if (succ.id == self.own_id and pred_id != self.own_id) {
                         self.routing.setSuccessor(pred_addr);
                         std.debug.print("[chord] stabilize: 孤立节点检测到新节点，更新后继为 {s}\n", .{ring.idToHex(pred_id)});
-                    } else if (ring.between(pred_id, self.own_id, succ.id)) {
+                    } else if (pred_id != self.own_id and ring.between(pred_id, self.own_id, succ.id)) {
                         self.routing.setSuccessor(pred_addr);
                         std.debug.print("[chord] stabilize: 更新后继为 {s}\n", .{ring.idToHex(pred_id)});
                     }
@@ -1139,8 +1322,10 @@ pub const ChordNode = struct {
             }
         }
 
-        // 通知后继
+        // 通知后继（孤立自指后继不通知自己：self-notify 会把前驱毒化为自身，
+        // 形成 between(own,own,own) 恒真的自环死锁，且 bootstrap 为空时无法自愈）
         const current_succ = self.routing.successor orelse return;
+        if (current_succ.id == self.own_id) return;
         _ = self.sendAndWait(Message{ .notify = .{
             .node_id = self.own_id,
             .node_addr = self.own_host,
@@ -1170,6 +1355,58 @@ pub const ChordNode = struct {
                 else => {},
             }
         }
+
+        // 备份后继活性复检：离线后恢复的节点经此被环内节点主动找回。
+        // （bootstrap 为空的节点返回后自身无法发起 join，只能由在环节点拉回。）
+        self.reviveBackups();
+    }
+
+    /// 复检备份后继与 finger 表：离线后恢复的节点经此被环内节点主动找回。
+    /// （bootstrap 为空的节点返回后自身无法发起 join，只能由在环节点拉回。）
+    fn reviveBackups(self: *ChordNode) void {
+        const cur_succ = self.routing.successor orelse return;
+        if (cur_succ.id == self.own_id) return; // 孤立：无正确区间可判断
+        // 候选：备份后继 + finger 表条目（去重，跳过自身/当前后继）
+        var seen: [19]u160 = undefined;
+        var seen_len: usize = 0;
+        var finger_pings: usize = 0;
+        const candidates = self.routing.allReachableSuccessors();
+        for (candidates) |maybe_bak| {
+            const bak = maybe_bak orelse continue;
+            if (self.tryReviveOne(bak, cur_succ)) return;
+            seen[seen_len] = bak.id;
+            seen_len += 1;
+        }
+        for (self.routing.fingers) |finger| {
+            const node = finger.node orelse continue;
+            var dup = false;
+            for (seen[0..seen_len]) |sid| {
+                if (sid == node.id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            if (self.tryReviveOne(node, cur_succ)) return;
+            finger_pings += 1;
+            if (finger_pings >= 8) break; // 每轮限量，避免大环下扫描过久
+            if (seen_len < seen.len) {
+                seen[seen_len] = node.id;
+                seen_len += 1;
+            }
+        }
+    }
+
+    /// ping 单个候选：存活且按 ID 序应位于本节点与当前后继之间的，提升回后继。
+    fn tryReviveOne(self: *ChordNode, bak: NodeAddr, cur_succ: NodeAddr) bool {
+        if (bak.id == self.own_id or bak.id == cur_succ.id) return false;
+        _ = self.sendAndWait(Message{ .ping = {} }, .pong, bak, 1500) catch return false;
+        if (ring.between(bak.id, self.own_id, cur_succ.id)) {
+            self.routing.setSuccessor(bak);
+            std.debug.print("[chord] revive: 节点 {s} 存活且位置正确，提升为后继\n", .{ring.idToHex(bak.id)});
+            return true; // 一轮只提升一个，其余下轮处理
+        }
+        return false;
     }
 
     /// 迭代查找 key_id 的负责节点：从本地估计出发，逐跳逼近，

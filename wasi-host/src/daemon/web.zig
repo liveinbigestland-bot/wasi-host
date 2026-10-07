@@ -347,9 +347,10 @@ pub const WebServer = struct {
         if (self.backend.monitor) |mon| {
             const res = mon.ringWalk(self.backend.node_udp_port, self.alloc, 32);
             defer if (res.nodes.len > 0) self.alloc.free(res.nodes);
-            try w.print("{{\n\"count\": {d},\n\"closed\": {},\n\"error\": \"{s}\",\n\"nodes\": [\n", .{
+            try w.print("{{\n\"count\": {d},\n\"closed\": {},\n\"stalled\": {},\n\"error\": \"{s}\",\n\"nodes\": [\n", .{
                 res.nodes.len,
                 res.closed,
+                res.stalled,
                 res.err orelse "",
             });
             for (res.nodes, 0..) |n, idx| {
@@ -361,7 +362,7 @@ pub const WebServer = struct {
             }
             try w.writeAll("]\n}\n");
         } else {
-            try w.writeAll("{\"count\":0,\"closed\":false,\"error\":\"monitor unavailable\",\"nodes\":[]}\n");
+            try w.writeAll("{\"count\":0,\"closed\":false,\"stalled\":false,\"error\":\"monitor unavailable\",\"nodes\":[]}\n");
         }
         try buildJsonResponse(response, buf.items);
     }

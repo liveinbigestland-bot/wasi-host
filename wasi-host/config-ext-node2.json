@@ -12,6 +12,7 @@
     "main_node_port": 20909,
     "report_interval_ms": 30000,
     "check_interval_ms": 30000,
+    "lookup_timeout_ms": 10000,
     "auto_recovery": true,
     "resource_monitor": true,
     "collect_interval_ms": 60000,
@@ -23,7 +24,7 @@
         "transport_mode": "udp",
         "bootstrap": [],
         "key_file": "p2p_key_ext2.bin",
-        "stabilize_interval_ms": 30000,
+        "stabilize_interval_ms": 8000,
         "run_duration_s": 31536000,
         "encrypted_relay": {
             "enabled": true,

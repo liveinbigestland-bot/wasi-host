@@ -67,6 +67,8 @@ const MAX_BUF: usize = 65536;
 pub const RelayConfig = struct {
     /// 监听地址
     listen_host: []const u8 = "0.0.0.0",
+    /// listen_host 为配置文件 dup 的堆内存时持有，用于释放
+    listen_host_owned: ?[]u8 = null,
     /// 监听端口（UDP + TCP 复用）
     listen_port: u16 = 20809,
 
@@ -272,7 +274,7 @@ pub const RelayServer = struct {
                 var resp: [32]u8 = undefined;
                 @memcpy(&resp, &challenge);
                 self.sendControlUDP(from_addr, CTRL_CHALLENGE, &resp);
-                std.debug.print("[relay2] 挑战发送 node={x}\n", .{ node_id });
+                std.debug.print("[relay2] 挑战发送 node={x}\n", .{node_id});
             },
             CTRL_AUTH => {
                 // [NodeID 20][signature 64]
@@ -294,7 +296,7 @@ pub const RelayServer = struct {
                 // 验证签名
                 const valid = Auth.verifySignature(session.public_key, &challenge, signature);
                 if (!valid) {
-                    std.debug.print("[relay2] 鉴权失败 node={x}\n", .{ node_id });
+                    std.debug.print("[relay2] 鉴权失败 node={x}\n", .{node_id});
                     self.sendControlUDP(from_addr, CTRL_AUTH_FAIL, &.{});
                     return;
                 }
@@ -302,7 +304,7 @@ pub const RelayServer = struct {
                 // 激活会话
                 self.registry.activate(node_id) catch {};
                 self.sendControlUDP(from_addr, CTRL_AUTH_OK, &.{});
-                std.debug.print("[relay2] 鉴权成功 node={x}\n", .{ node_id });
+                std.debug.print("[relay2] 鉴权成功 node={x}\n", .{node_id});
             },
             CTRL_PING => {
                 // [NodeID 20]
@@ -442,7 +444,7 @@ pub const RelayServer = struct {
 
         const valid = Auth.verifySignature(pubkey, &sess_challenge, auth_sig);
         if (!valid) {
-            std.debug.print("[relay2/tcp] TCP 鉴权失败 node={x}\n", .{ node_id });
+            std.debug.print("[relay2/tcp] TCP 鉴权失败 node={x}\n", .{node_id});
             self.sendTCPControl(fd, CTRL_AUTH_FAIL, &.{});
             self.registry.unregister(node_id);
             return;
@@ -450,7 +452,7 @@ pub const RelayServer = struct {
 
         self.registry.activate(node_id) catch {};
         self.sendTCPControl(fd, CTRL_AUTH_OK, &.{});
-        std.debug.print("[relay2/tcp] TCP 鉴权成功 node={x}\n", .{ node_id });
+        std.debug.print("[relay2/tcp] TCP 鉴权成功 node={x}\n", .{node_id});
 
         // 第三步：进入数据转发循环（接收 → 查表 → 转发）
         // 使用本地心跳跟踪，避免持有 *Session 带来的 use-after-free 竞争
@@ -507,7 +509,7 @@ pub const RelayServer = struct {
         }
 
         // 清理
-        std.debug.print("[relay2/tcp] 连接断开 node={x}\n", .{ node_id });
+        std.debug.print("[relay2/tcp] 连接断开 node={x}\n", .{node_id});
         self.registry.unregisterIfFdMatches(node_id, fd);
     }
 
@@ -572,7 +574,10 @@ fn loadConfigFromFile(alloc: std.mem.Allocator, path: []const u8) !RelayConfig {
 
     var config = RelayConfig{};
 
-    if (root.object.get("listen_host")) |v| config.listen_host = try alloc.dupe(u8, v.string);
+    if (root.object.get("listen_host")) |v| {
+        config.listen_host_owned = try alloc.dupe(u8, v.string);
+        config.listen_host = config.listen_host_owned.?;
+    }
     if (root.object.get("listen_port")) |v| config.listen_port = @intCast(v.integer);
     if (root.object.get("max_sessions")) |v| config.max_sessions = @intCast(v.integer);
     if (root.object.get("heartbeat_timeout_ms")) |v| config.heartbeat_timeout_ms = @intCast(v.integer);
@@ -617,6 +622,8 @@ pub fn main() !void {
             return;
         }
     }
+
+    defer if (config.listen_host_owned) |h| alloc.free(h);
 
     var server = try RelayServer.init(alloc, config);
     defer server.deinit();
@@ -864,7 +871,7 @@ test "7.4 integration: dual node E2E relay via UDP" {
     auth_buf[1] = 0x03;
     @memcpy(auth_buf[2..22], &node_a);
     const sig_a_bytes = sig_a.toBytes();
-@memcpy(auth_buf[22..86], &sig_a_bytes);
+    @memcpy(auth_buf[22..86], &sig_a_bytes);
     _ = try std.posix.sendto(fd_a, &auth_buf, 0, &relay_addr.any, relay_addr.getOsSockLen());
 
     std.time.sleep(50 * std.time.ns_per_ms);

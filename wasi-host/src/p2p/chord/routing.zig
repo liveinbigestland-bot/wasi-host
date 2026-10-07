@@ -87,13 +87,10 @@ pub const Routing = struct {
 
     /// 通知：对方告知可能是我们的前驱
     pub fn notifyCandidate(self: *Routing, candidate: NodeAddr) void {
-        // 自通知不应该覆盖已有真实前驱
-        if (candidate.id == self.own_id) {
-            if (self.predecessor == null) {
-                self.predecessor = candidate;
-            }
-            return;
-        }
+        // 自通知不可能来自真实前驱（孤立节点 stabilize 曾给自己发 notify），
+        // 一旦把前驱毒化为自身，下一轮 stabilize 的 between(own,own,own) 恒真
+        // 会把后继也锁死为自身，形成无法自愈的自环。直接忽略。
+        if (candidate.id == self.own_id) return;
         if (self.predecessor == null or self.predecessor.?.id == self.own_id) {
             self.predecessor = candidate;
         } else {

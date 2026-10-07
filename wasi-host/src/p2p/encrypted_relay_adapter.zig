@@ -62,6 +62,15 @@ pub const EncryptedRelayAdapter = struct {
     /// 所有中继已轮完仍不可用
     relays_exhausted: bool = false,
 
+    /// 连接建立互斥锁：reader 断线重连与 sendRequest 的 ensureConnected
+    /// 会并发 connectTo+register，导致同 NodeID 双连接在服务器端互相踢
+    connect_mutex: std.Thread.Mutex = .{},
+
+    /// 请求串行化锁：整条中继连接只有一个 pending 响应槽且无请求关联 ID，
+    /// 并发 sendRequest 会互相偷响应（ProxyWrongType）或吞掉对方响应。
+    /// 串行化后，挂起期内的入站帧只需区分「我的响应」与「他人请求」。
+    request_mutex: std.Thread.Mutex = .{},
+
     read_buf: [65536]u8,
 
     /// �?reader 共享响应�?�?无锁，仅两个原子 bool
@@ -112,8 +121,12 @@ pub const EncryptedRelayAdapter = struct {
         self.consecutive_failures = 0;
     }
 
-    /// 同步发送请求并等待响应 �?不读�?fd，由 readerLoop 负责填充响应
+    /// 同步发送请求并等待响应 — 不读取 fd，由 readerLoop 负责填充响应
     pub fn sendRequest(self: *EncryptedRelayAdapter, target_id: [20]u8, data: []const u8, resp_buf: []u8, timeout_ms: u64) !usize {
+        // 串行化整个请求/响应周期（见 request_mutex 注释）
+        self.request_mutex.lock();
+        defer self.request_mutex.unlock();
+
         try self.ensureConnected();
 
         // 注册等待 �?readerLoop 会将下一�?CMD_DATA 存入 pending
@@ -151,6 +164,11 @@ pub const EncryptedRelayAdapter = struct {
     fn readerLoopFn(adapter: *EncryptedRelayAdapter) void {
         var buf: [65536]u8 = undefined;
         var consecutive_fails: u32 = 0;
+        var last_read_ms = std.time.milliTimestamp();
+
+        // 僵死判定：此时长内未收到任何入站字节（PONG / 服务器 PING / 数据），
+        // 说明 NAT 映射可能已静默失效（对端 RST 送不进来），主动断开重连。
+        const dead_peer_ms: i64 = 10_000;
 
         while (true) {
             if (adapter.relays_exhausted) {
@@ -162,9 +180,14 @@ pub const EncryptedRelayAdapter = struct {
 
             const n = posix.read(adapter.client.fd, &buf) catch |err| {
                 if (err == error.WouldBlock or err == error.Timeout) {
-                    consecutive_fails = 0;
+                    const now = std.time.milliTimestamp();
                     adapter.client.sendPing() catch {};
-                    continue;
+                    if (now - last_read_ms <= dead_peer_ms) {
+                        consecutive_fails = 0;
+                        continue;
+                    }
+                    log.warn("[encrypted_relay/reader] {}ms 无任何入站，判定连接僵死（NAT 静默失效），强制重连", .{now - last_read_ms});
+                    // 落入下方断线重连流程
                 }
 
                 // 连接断开 �?指数退避重�?
@@ -195,11 +218,11 @@ pub const EncryptedRelayAdapter = struct {
 
                 if (adapter.relays_exhausted) return;
 
-                adapter.client.connectTo(adapter.relay_index) catch continue;
-                adapter.client.register() catch continue;
-                adapter.connected = true;
-                consecutive_fails = 0;
-                log.info("[encrypted_relay/reader] 重连成功", .{});
+                if (adapter.readerConnectLocked()) {
+                    consecutive_fails = 0;
+                    last_read_ms = std.time.milliTimestamp();
+                    log.info("[encrypted_relay/reader] 重连成功", .{});
+                }
                 continue;
             };
             if (n == 0) {
@@ -220,14 +243,15 @@ pub const EncryptedRelayAdapter = struct {
 
                 const backoff_ms = @min(@as(u64, 1000) * (@as(u64, 1) << @min(consecutive_fails, 6)), 60000);
                 std.time.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
-                adapter.client.connectTo(adapter.relay_index) catch continue;
-                adapter.client.register() catch continue;
-                adapter.connected = true;
-                consecutive_fails = 0;
+                if (adapter.readerConnectLocked()) {
+                    consecutive_fails = 0;
+                    last_read_ms = std.time.milliTimestamp();
+                }
                 continue;
             }
 
             consecutive_fails = 0;
+            last_read_ms = std.time.milliTimestamp();
 
             // PING/PONG 控制消息
             if (buf[0] == relay_client.CMD_CTRL) {
@@ -241,11 +265,20 @@ pub const EncryptedRelayAdapter = struct {
             if (buf[0] != relay_client.CMD_DATA) continue;
 
             // sendRequest 挂起�?�?存为响应
+            if (n <= 21) continue;
+
+            // sendRequest 挂起中：只有「响应类型」的帧才填入 pending 槽。
+            // 请求类型（notify/ping/find_successor 等）是其他节点的入站消息，
+            // 必须照常注入本地 Chord 节点——曾因一律当作响应吞掉，
+            // 导致 greet notify 在对端 stabilize 请求挂起期间被静默丢弃。
             if (adapter.pending.active) {
-                if (n > 21) {
-                    adapter.pending.len = n - 21;
-                    @memcpy(adapter.pending.data[0..adapter.pending.len], buf[21..n]);
+                const payload = buf[21..n];
+                if (isChordResponseType(payload)) {
+                    adapter.pending.len = payload.len;
+                    @memcpy(adapter.pending.data[0..payload.len], payload);
                     adapter.pending.ready = true;
+                } else {
+                    adapter.injectFromRelay(buf[1..21], payload);
                 }
                 continue;
             }
@@ -283,14 +316,77 @@ pub const EncryptedRelayAdapter = struct {
         }
     }
 
-    fn ensureConnected(self: *EncryptedRelayAdapter) !void {
-        if (!self.connected) {
-            if (self.relays_exhausted) return error.NotConnected;
-            try self.client.connectTo(self.relay_index);
-            try self.client.register();
-            self.connected = true;
-            self.consecutive_failures = 0;
+    /// 将中继转发的入站帧经本地 UDP 注入 Chord 节点，并同步等待 Chord 的
+    /// 响应回写中继（保持既有行为；注入期间 reader 阻塞是已知限制）。
+    fn injectFromRelay(adapter: *EncryptedRelayAdapter, sender_id: []const u8, payload: []const u8) void {
+        const tmp_udp = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP) catch return;
+        defer posix.close(tmp_udp);
+
+        const tmp_bind = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+        posix.bind(tmp_udp, &tmp_bind.any, tmp_bind.getOsSockLen()) catch return;
+
+        const target_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, adapter.config.listen_port);
+        _ = posix.sendto(tmp_udp, payload, 0, &target_addr.any, target_addr.getOsSockLen()) catch return;
+
+        var resp_buf: [65536]u8 = undefined;
+        var poll_fds = [_]posix.pollfd{.{ .fd = tmp_udp, .events = posix.POLL.IN, .revents = 0 }};
+        const rc = posix.poll(&poll_fds, 5000) catch 0;
+        if (rc > 0 and poll_fds[0].revents & posix.POLL.IN != 0) {
+            var resp_addr: std.net.Address = undefined;
+            var resp_addr_len: posix.socklen_t = @sizeOf(std.net.Address);
+            const resp_n = posix.recvfrom(tmp_udp, &resp_buf, 0, &resp_addr.any, &resp_addr_len) catch return;
+            if (resp_n > 0) {
+                var frame: [1 + 20 + 65536]u8 = undefined;
+                frame[0] = relay_client.CMD_DATA;
+                @memcpy(frame[1..21], sender_id);
+                @memcpy(frame[21..][0..resp_n], resp_buf[0..resp_n]);
+                _ = posix.write(adapter.client.fd, frame[0 .. 21 + resp_n]) catch {};
+            }
         }
+    }
+
+    /// 判断中继帧负载（Chord 消息，JSON 编码 {"<type>":...}）是否为响应类型。
+    /// 用于挂起请求期间区分「我的响应」与「他人入站请求」。
+    fn isChordResponseType(payload: []const u8) bool {
+        if (payload.len < 3 or payload[0] != '{') return false;
+        // 跳过 "{" 与首个键名的开头引号
+        var i: usize = 1;
+        while (i < payload.len and (payload[i] == ' ' or payload[i] == '"')) : (i += 1) {}
+        const resp_names = [_][]const u8{
+            "pong",          "find_successor_resp", "get_predecessor_resp",
+            "notify_ok",     "ping_resp",           "dht_put_resp",
+            "dht_get_resp",  "dht_delete_resp",     "dht_replicate_resp",
+            "identity_resp", "relay_service_resp",
+        };
+        for (resp_names) |nm| {
+            // 尾部引号检查避免前缀误判（如 notify vs notify_ok、dht_get vs dht_get_resp）
+            if (i + nm.len < payload.len and std.mem.eql(u8, payload[i .. i + nm.len], nm) and payload[i + nm.len] == '"') return true;
+        }
+        return false;
+    }
+
+    /// reader 持锁建立连接（与 ensureConnected 互斥）。
+    /// 返回 true = 已连接（含其他线程抢先建好的情况）
+    fn readerConnectLocked(adapter: *EncryptedRelayAdapter) bool {
+        adapter.connect_mutex.lock();
+        defer adapter.connect_mutex.unlock();
+        if (adapter.connected) return true;
+        adapter.client.connectTo(adapter.relay_index) catch return false;
+        adapter.client.register() catch return false;
+        adapter.connected = true;
+        return true;
+    }
+
+    fn ensureConnected(self: *EncryptedRelayAdapter) !void {
+        if (self.connected) return;
+        self.connect_mutex.lock();
+        defer self.connect_mutex.unlock();
+        if (self.connected) return; // 已被 reader/其他线程重连
+        if (self.relays_exhausted) return error.NotConnected;
+        try self.client.connectTo(self.relay_index);
+        try self.client.register();
+        self.connected = true;
+        self.consecutive_failures = 0;
     }
 };
 
@@ -312,4 +408,3 @@ fn setRecvTimeout(fd: posix.socket_t, timeout_ms: u64) void {
         @as(u32, @intCast(@sizeOf(posix.timeval))),
     );
 }
-

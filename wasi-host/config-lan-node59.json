@@ -4,7 +4,7 @@
         "listen_host": "0.0.0.0",
         "advertise_host": "192.168.2.57",
         "listen_port": 20808,
-        "bootstrap": [{"host": "192.168.2.210", "port": 20808}],
+        "bootstrap": [{"host": "192.168.2.210", "port": 20808}, {"host": "170.106.170.85", "port": 20808}],
         "key_file": "p2p_key_59.bin",
         "stabilize_interval_ms": 5000,
         "run_duration_s": 86400,

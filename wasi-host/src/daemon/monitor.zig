@@ -77,6 +77,8 @@ pub const RingNodeInfo = struct {
 pub const RingWalkResult = struct {
     nodes: []RingNodeInfo,
     closed: bool,
+    /// 遍历停滞：连续两跳返回同一节点（该节点自指，环断裂/对方孤立）
+    stalled: bool = false,
     err: ?[]const u8 = null,
 };
 
@@ -341,7 +343,9 @@ pub const Monitor = struct {
         var nodes_list = std.ArrayList(RingNodeInfo).init(alloc);
         var target: NodeId = my_id +% 1;
         var closed = false;
+        var stalled = false;
         var err_msg: ?[]const u8 = null;
+        var last_id: ?NodeId = null;
 
         var i: usize = 0;
         while (i < max_nodes) : (i += 1) {
@@ -368,11 +372,21 @@ pub const Monitor = struct {
                 closed = true; // 环闭合
                 break;
             }
+            // 停滞保护：连续两跳拿到同一节点 = 该节点自指（孤立/环断裂），
+            // target 无法推进，避免 32 次重复的无效遍历
+            if (last_id) |prev| {
+                if (prev == r.id) {
+                    stalled = true;
+                    break;
+                }
+            }
+            last_id = r.id;
             target = r.id +% 1;
         }
         return .{
             .nodes = nodes_list.toOwnedSlice() catch &.{},
             .closed = closed,
+            .stalled = stalled,
             .err = err_msg,
         };
     }

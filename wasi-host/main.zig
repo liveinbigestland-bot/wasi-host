@@ -1308,16 +1308,14 @@ pub fn main() !void {
                 }
             }
 
-            // Bootstrap 加入网络（遍历所有地址，任一成功即可）
-            if (cfg.bootstrap.len > 0) {
+            // Bootstrap 加入网络：多引导节点学习（跨环融合）
+            if (boot_addrs.len > 0) {
                 for (boot_addrs) |boot_addr| {
-                    std.debug.print("[chord] Bootstrap 连接: {s}:{d}\n", .{ boot_addr.host, boot_addr.port });
-                    chord.join(boot_addr) catch |err| {
-                        std.debug.print("[chord] Bootstrap {s}:{d} 失败: {}\n", .{ boot_addr.host, boot_addr.port, err });
-                        continue;
-                    };
-                    break; // 任一成功就退出循环
+                    std.debug.print("[chord] Bootstrap 节点: {s}:{d}\n", .{ boot_addr.host, boot_addr.port });
                 }
+                chord.joinMulti(boot_addrs) catch |err| {
+                    std.debug.print("[chord] Bootstrap 全部失败: {}\n", .{err});
+                };
             } else {
                 std.debug.print("[chord] 无 Bootstrap 配置, 作为孤立节点\n", .{});
             }

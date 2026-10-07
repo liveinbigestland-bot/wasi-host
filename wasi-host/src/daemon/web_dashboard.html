@@ -165,8 +165,13 @@ async function fetchRing() {
       status.textContent = '';
       return;
     }
-    status.textContent = data.closed ? '（环已闭合）' : '（环未闭合）';
-    status.style.color = data.closed ? '#3fb950' : '#d29922';
+    if (data.stalled) {
+      status.textContent = '（遍历停滞：某节点自指，环可能断裂）';
+      status.style.color = '#f85149';
+    } else {
+      status.textContent = data.closed ? '（环已闭合）' : '（环未闭合）';
+      status.style.color = data.closed ? '#3fb950' : '#d29922';
+    }
     tbody.innerHTML = '';
     for (let i = 0; i < data.nodes.length; i++) {
       const n = data.nodes[i];
