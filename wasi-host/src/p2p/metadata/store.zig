@@ -116,8 +116,10 @@ pub const KVStore = struct {
         const version = self.next_version;
         self.next_version += 1;
 
-        // 如果已存在，释放旧内存
-        if (self.map.getPtr(key)) |old| {
+        // 如果已存在，先从 map 移除该键（map 键 = 旧 entry.key，必须先摘除再释放，
+        // 否则 map 内部键悬垂，后续 put 探测 memcmp UB、save 序列化崩溃）
+        if (self.map.fetchRemove(key)) |kv| {
+            var old = kv.value;
             old.deinit(self.alloc);
         }
 
