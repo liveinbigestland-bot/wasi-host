@@ -66,6 +66,20 @@ fn copyHost(buf: *[64]u8, host: []const u8) void {
     @memcpy(buf[0..n], host[0..n]);
 }
 
+/// 环视图节点信息（值语义，无堆引用）
+pub const RingNodeInfo = struct {
+    id_hex: [40]u8 = undefined,
+    addr: [64]u8 = undefined,
+    addr_len: usize = 0,
+};
+
+/// ringWalk 结果
+pub const RingWalkResult = struct {
+    nodes: []RingNodeInfo,
+    closed: bool,
+    err: ?[]const u8 = null,
+};
+
 pub const Monitor = struct {
     alloc: std.mem.Allocator,
     config: config_mod.DaemonConfig,
@@ -287,6 +301,80 @@ pub const Monitor = struct {
                 } else |_| {}
             }
         }
+    }
+
+    /// 解析 find_successor 响应 JSON（node_id 为 u160 十进制数字字面量）
+    fn parseFsResp(alloc: std.mem.Allocator, resp: []const u8) !struct { id: NodeId, info: RingNodeInfo } {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp, .{});
+        defer parsed.deinit();
+        const body = (parsed.value.object.get("find_successor_resp") orelse return error.NoBody).object;
+        const nid_v = body.get("node_id") orelse return error.NoId;
+        const nid: NodeId = switch (nid_v) {
+            .number_string => |s| try std.fmt.parseInt(NodeId, s, 10),
+            .integer => |i| blk: {
+                if (i < 0) return error.NegativeId;
+                break :blk @intCast(i);
+            },
+            else => return error.BadIdType,
+        };
+        var info = RingNodeInfo{};
+        info.id_hex = dht.idToHex(nid);
+        if (body.get("node_addr")) |a| {
+            if (a == .string) {
+                const port: u16 = if (body.get("node_port")) |p| switch (p) {
+                    .integer => |x| if (x > 0 and x < 65536) @as(u16, @intCast(x)) else 0,
+                    else => 0,
+                } else 0;
+                const s = std.fmt.bufPrint(&info.addr, "{s}:{d}", .{ a.string, port }) catch "";
+                info.addr_len = s.len;
+            }
+        }
+        return .{ .id = nid, .info = info };
+    }
+
+    /// 通过本机节点 find_successor 遍历整个环（loopback UDP，供 /api/ring 使用）
+    pub fn ringWalk(self: *Monitor, node_udp_port: u16, alloc: std.mem.Allocator, max_nodes: usize) RingWalkResult {
+        const my_id = self.node_status.node_id;
+        if (builtin.os.tag != .linux or self.udp_fd < 0 or my_id == 0) {
+            return .{ .nodes = &.{}, .closed = false, .err = "monitor unavailable" };
+        }
+        var nodes_list = std.ArrayList(RingNodeInfo).init(alloc);
+        var target: NodeId = my_id +% 1;
+        var closed = false;
+        var err_msg: ?[]const u8 = null;
+
+        var i: usize = 0;
+        while (i < max_nodes) : (i += 1) {
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "{{\"find_successor\":{{\"target\":{d}}}}}", .{target}) catch break;
+            var resp_buf: [4096]u8 = undefined;
+            const n = self.udpSendAndWait("127.0.0.1", node_udp_port, msg, &resp_buf, self.config.lookup_timeout_ms) catch |e| {
+                err_msg = @errorName(e);
+                break;
+            };
+            if (n == 0) {
+                err_msg = "timeout";
+                break;
+            }
+            const r = parseFsResp(alloc, resp_buf[0..n]) catch |e| {
+                err_msg = @errorName(e);
+                break;
+            };
+            nodes_list.append(r.info) catch {
+                err_msg = "oom";
+                break;
+            };
+            if (r.id == my_id) {
+                closed = true; // 环闭合
+                break;
+            }
+            target = r.id +% 1;
+        }
+        return .{
+            .nodes = nodes_list.toOwnedSlice() catch &.{},
+            .closed = closed,
+            .err = err_msg,
+        };
     }
 
     /// 独立环查询：向 bootstrap 查询本节点的正确后继和前驱

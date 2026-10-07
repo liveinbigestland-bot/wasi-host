@@ -1,5 +1,5 @@
-/// wasi-hostd �?守护进程入口
-/// 进程监管 + 健康检�?+ 资源监控 + 自恢�?+ 管理接口 + 上报
+/// wasi-hostd �?守护进程入口
+/// 进程监管 + 健康检�?+ 资源监控 + 自恢�?+ 管理接口 + 上报
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -17,7 +17,7 @@ const logmgr_mod = @import("logmgr.zig");
 const controller_mod = @import("controller.zig");
 const web_mod = @import("web.zig");
 
-/// 编译时版本（�?build.zig 注入�?
+/// 编译时版本（�?build.zig 注入�?
 const build_options = @import("build_options");
 const VERSION = build_options.version;
 
@@ -67,11 +67,11 @@ pub fn main() !void {
         }
     }
     if (wasi_host_port == 0) {
-        std.debug.print("[main] 警告: 无法从配置中获取 p2p.listen_port，使用默认�?20808\n", .{});
+        std.debug.print("[main] 警告: 无法从配置中获取 p2p.listen_port，使用默认�?20808\n", .{});
         wasi_host_port = 20808;
     }
 
-    // ── 状态管�?──
+    // ── 状态管�?──
     var supervisor = supervisor_mod.Supervisor.init(alloc, config, args[1], &.{});
     var monitor = try monitor_mod.Monitor.init(alloc, config);
     defer monitor.deinit();
@@ -79,9 +79,9 @@ pub fn main() !void {
     var healer = healer_mod.Healer.init(alloc, config);
     var logmgr = logmgr_mod.LogManager.init(alloc, config);
 
-    // ── 提取 wasi-host 路径和参�?──
-    // 配置文件路径同时也是 wasi-host 的配置路�?
-    // 默认 wasi-host 二进制在同一目录�?PATH �?
+    // ── 提取 wasi-host 路径和参�?──
+    // 配置文件路径同时也是 wasi-host 的配置路�?
+    // 默认 wasi-host 二进制在同一目录�?PATH �?
     const wasi_host_path = if (args.len > 2) args[2] else "wasi-host";
     var wasi_host_args = std.ArrayList([]const u8).init(alloc);
     defer wasi_host_args.deinit();
@@ -91,24 +91,26 @@ pub fn main() !void {
     supervisor.wasi_host_path = wasi_host_path;
     supervisor.wasi_host_args = wasi_host_args.items;
 
-    // ── 控制器（主节点模式下启用�?──
+    // ── 控制器（主节点模式下启用�?──
     var controller = controller_mod.Controller.init(alloc, config, VERSION);
-    controller.binary_path = wasi_host_path; // 提供同路径二进制供下�?
+    controller.binary_path = wasi_host_path; // 提供同路径二进制供下�?
     if (config.controller_enable) {
         controller.start() catch |err| {
-            std.debug.print("[main] 控制器启动失�? {}\n", .{err});
+            std.debug.print("[main] 控制器启动失�? {}\n", .{err});
         };
     }
 
-    // ── Web API 服务器（主节点模式下启用�?──
+    // ── Web API 服务器（主节点模式下启用�?──
     var web_server = web_mod.WebServer.init(alloc, web_mod.Backend{
         .controller = &controller,
         .config = &config,
         .version = VERSION,
+        .monitor = &monitor,
+        .node_udp_port = wasi_host_port,
     });
     if (config.web_api_enable) {
         web_server.start() catch |err| {
-            std.debug.print("[main] Web API 服务器启动失�? {}\n", .{err});
+            std.debug.print("[main] Web API 服务器启动失�? {}\n", .{err});
         };
     }
 
@@ -126,10 +128,10 @@ pub fn main() !void {
     var api_server = api_mod.ApiServer.init(alloc, api_backend);
     var reporter = reporter_mod.Reporter.init(alloc, config, &supervisor, &monitor, &resmon, &healer, &api_server, VERSION);
 
-    // ── 启动 API 服务�?──
+    // ── 启动 API 服务�?──
     if (config.enable) {
         api_server.start() catch |err| {
-            std.debug.print("[main] API 服务器启动失�? {}\n", .{err});
+            std.debug.print("[main] API 服务器启动失�? {}\n", .{err});
         };
     }
     defer api_server.stop();
@@ -142,9 +144,9 @@ pub fn main() !void {
         };
     }
 
-    // ── 主循�?──
+    // ── 主循�?──
     const start_time_ms: u64 = @as(u64, @intCast(time.timestamp())) * 1000;
-    var last_check_time_ms: u64 = start_time_ms; // 首次延迟 check_interval_ms，等子进程就�?
+    var last_check_time_ms: u64 = start_time_ms; // 首次延迟 check_interval_ms，等子进程就�?
     var last_report_time_ms: u64 = 0;
     var last_collect_time_ms: u64 = 0;
     var last_log_check: i64 = 0;
@@ -164,20 +166,20 @@ pub fn main() !void {
             };
         }
 
-        // 2. 健康检�?
+        // 2. 健康检�?
         // [DBG] step=2
         if (config.check_interval_ms > 0 and now_ms - last_check_time_ms >= config.check_interval_ms) {
             last_check_time_ms = now_ms;
             monitor.check(api_backend.local_port) catch |err| {
-                std.debug.print("[main] 健康检查失�? {}\n", .{err});
+                std.debug.print("[main] 健康检查失�? {}\n", .{err});
             };
 
-            // 自恢�?
+            // 自恢�?
             if (config.auto_recovery) {
                 const health = monitor.getHealth();
                 const mismatches = monitor.consecutive_mismatches;
                 _ = healer.heal(health, mismatches, &supervisor) catch |err| {
-                    std.debug.print("[main] 自恢复失�? {}\n", .{err});
+                    std.debug.print("[main] 自恢复失�? {}\n", .{err});
                 };
             }
         }
@@ -189,7 +191,7 @@ pub fn main() !void {
             resmon.collect(supervisor.status.pid);
         }
 
-        // 4. 控制器连接处理（仅主节点）—�?必须在上报之前处理，避免自连死锁
+        // 4. 控制器连接处理（仅主节点）—�?必须在上报之前处理，避免自连死锁
         // [DBG] step=4
         controller.acceptAndHandle();
 
@@ -203,7 +205,7 @@ pub fn main() !void {
             };
         }
 
-        // 6. 日志轮转检�?
+        // 6. 日志轮转检�?
         // [DBG] step=6
         if (now - last_log_check >= 60) {
             last_log_check = now;
@@ -218,7 +220,7 @@ pub fn main() !void {
         // [DBG] step=7b
         web_server.acceptAndHandle();
 
-        // 8. 睡眠一小段时间，避免忙�?
+        // 8. 睡眠一小段时间，避免忙�?
         // [DBG] step=8
         time.sleep(100 * time.ns_per_ms);
     }
@@ -228,7 +230,7 @@ pub fn main() !void {
     controller.deinit();
     if (config.supervise) {
         supervisor.stopChild();
-        // 等待子进程退�?
+        // 等待子进程退�?
         if (builtin.os.tag == .linux and supervisor.status.pid > 0) {
             _ = posix.waitpid(supervisor.status.pid, 0);
         }

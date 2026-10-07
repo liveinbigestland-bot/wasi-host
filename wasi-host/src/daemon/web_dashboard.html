@@ -62,6 +62,20 @@ tr:hover { background: #1c2128; }
   </tbody>
 </table>
 
+<h2>DHT 环视图 <span id="ring-status" style="font-size:12px;color:#8b949e;"></span></h2>
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>节点 ID</th>
+      <th>地址</th>
+    </tr>
+  </thead>
+  <tbody id="ring-tbody">
+    <tr><td colspan="3" class="loading">加载中...</td></tr>
+  </tbody>
+</table>
+
 <div id="node-detail" style="display:none; margin-top:20px;">
   <h2>节点详情 <span id="detail-id-label" style="font-family:monospace;color:#7ee787;"></span></h2>
   <pre id="detail-content" style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:12px;overflow-x:auto;max-height:400px;"></pre>
@@ -140,9 +154,41 @@ async function showNode(id) {
   }
 }
 
+async function fetchRing() {
+  const tbody = document.getElementById('ring-tbody');
+  const status = document.getElementById('ring-status');
+  try {
+    const resp = await fetch('/api/ring');
+    const data = await resp.json();
+    if (!data.nodes || data.nodes.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" class="loading">环视图不可用' + (data.error ? ': ' + data.error : '') + '</td></tr>';
+      status.textContent = '';
+      return;
+    }
+    status.textContent = data.closed ? '（环已闭合）' : '（环未闭合）';
+    status.style.color = data.closed ? '#3fb950' : '#d29922';
+    tbody.innerHTML = '';
+    for (let i = 0; i < data.nodes.length; i++) {
+      const n = data.nodes[i];
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${i + 1}</td>
+        <td class="id-hex">${n.id.substring(0, 8)}...${n.id.substring(32)}</td>
+        <td class="version">${n.addr || '-'}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="3" class="error">环视图获取失败</td></tr>';
+    status.textContent = '';
+  }
+}
+
 // Auto refresh every 5 seconds
 autoRefresh = setInterval(fetchData, 5000);
 fetchData();
+setInterval(fetchRing, 5000);
+fetchRing();
 </script>
 </body>
 </html>

@@ -15,6 +15,7 @@ const time = std.time;
 
 const config_mod = @import("config.zig");
 const controller_mod = @import("controller.zig");
+const monitor_mod = @import("monitor.zig");
 const dht = @import("dht_types.zig");
 
 /// Web 服务器可访问的后端
@@ -22,6 +23,10 @@ pub const Backend = struct {
     controller: *controller_mod.Controller,
     config: *const config_mod.DaemonConfig,
     version: []const u8,
+    /// 本机节点监视器（DHT 环视图查询；null = 环视图不可用）
+    monitor: ?*monitor_mod.Monitor = null,
+    /// 本机节点 chord UDP 端口（环视图 loopback 查询）
+    node_udp_port: u16 = 20808,
 };
 
 /// Web API 服务器
@@ -149,6 +154,10 @@ pub const WebServer = struct {
         // GET /api/health → 控制节点健康
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/health")) {
             return self.handleApiHealth(response);
+        }
+        // GET /api/ring → DHT 环视图（find_successor 环遍历）
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/ring")) {
+            return self.handleApiRing(response);
         }
         // POST /api/task/<hex-id> → 下发任务
         if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, path, "/api/task/")) {
@@ -325,6 +334,35 @@ pub const WebServer = struct {
         try w.print("\"uptime\": {d}\n", .{time.timestamp()});
         try w.writeAll("}\n");
 
+        try buildJsonResponse(response, buf.items);
+    }
+
+    // ─── GET /api/ring ───────────────────────────────────────
+
+    fn handleApiRing(self: *WebServer, response: *std.ArrayList(u8)) !void {
+        var buf = std.ArrayList(u8).init(self.alloc);
+        defer buf.deinit();
+        var w = buf.writer();
+
+        if (self.backend.monitor) |mon| {
+            const res = mon.ringWalk(self.backend.node_udp_port, self.alloc, 32);
+            defer if (res.nodes.len > 0) self.alloc.free(res.nodes);
+            try w.print("{{\n\"count\": {d},\n\"closed\": {},\n\"error\": \"{s}\",\n\"nodes\": [\n", .{
+                res.nodes.len,
+                res.closed,
+                res.err orelse "",
+            });
+            for (res.nodes, 0..) |n, idx| {
+                try w.print("  {{\"id\": \"{s}\", \"addr\": \"{s}\"}}{s}\n", .{
+                    n.id_hex,
+                    n.addr[0..n.addr_len],
+                    if (idx + 1 < res.nodes.len) "," else "",
+                });
+            }
+            try w.writeAll("]\n}\n");
+        } else {
+            try w.writeAll("{\"count\":0,\"closed\":false,\"error\":\"monitor unavailable\",\"nodes\":[]}\n");
+        }
         try buildJsonResponse(response, buf.items);
     }
 
