@@ -8,7 +8,7 @@
 | **node59** | 192.168.2.57:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
 | **node60** | 192.168.2.58:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
 | **ext** | ssh-metaai.alwaysdata.net:20808 | metaai / 1qaz@WSXasdfasdf | x86_64 | 外网加入节点 (UDP inbound blocked, TCP direct port 8400) |
-| **外2** | 170.106.170.85:20808 | ubuntu / A?G|4Ed7a#3sHPb | x86_64 Ubuntu 24.04 | 公网主控/种子节点 + 加密中继 (20808/udp + 20809 relay 对外；无 8444/8356/WSS) |
+| **外2** | 170.106.170.85:20808 | ubuntu / A?G|4Ed7a#3sHPb | x86_64 Ubuntu 24.04 | 公网主控/种子节点 + 加密中继 (20808/udp + 20809 relay + 80 监控 web_api；无 8444/8356/WSS) |
 
 ## 构建命令
 
