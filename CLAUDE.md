@@ -8,7 +8,7 @@
 | **node59** | 192.168.2.57:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
 | **node60** | 192.168.2.58:20808 | root / ecoo1234 | armv7l | LAN 加入节点 |
 | **ext** | ssh-metaai.alwaysdata.net:20808 | metaai / 1qaz@WSXasdfasdf | x86_64 | 外网加入节点 (UDP inbound blocked, TCP direct port 8400) |
-| **外2** | 170.106.170.85:20808 | ubuntu / A?G|4Ed7a#3sHPb | x86_64 Ubuntu 24.04 | 独立 VPS (UFW 已开放 20808/udp) |
+| **外2** | 170.106.170.85:20808 | ubuntu / A?G|4Ed7a#3sHPb | x86_64 Ubuntu 24.04 | 公网主控/种子节点 (仅开放 20808/udp；无 8444/8356/WSS) |
 
 ## 构建命令
 
@@ -31,13 +31,13 @@ zig build -Dtarget=x86_64-linux-gnu -p /d/tmp/zig-out-x64 && cp /d/tmp/zig-out-x
 | node59 | config-lan-node59.json | /root/config-lan-node59.json |
 | node60 | config-lan-node60.json | /root/config-lan-node60.json |
 | ext | config-ext-daemon.json | /home/metaai/config-ext-daemon.json |
-| 外2 | config-ext-node2.json | /root/config-ext-node2.json |
+| 外2 | config-ext-node2.json | /home/ubuntu/config-ext-node2.json |
 
 ## 远程路径
 
-- Binary: /root/wasi-host (ARM/外2), /root/wasi-hostd (外2 daemon)
+- Binary: /root/wasi-host (ARM), /home/ubuntu/wasi-host (外2), /home/ubuntu/relay-server (外2 relay)
 - Ext binary: /home/metaai/wasi-host, /home/metaai/wasi-hostd (daemon)
-- Log: /root/test-remote-node{59,60}.log / /root/test-ext-node2.log
+- Log: /root/test-remote-node.log (ARM) / /home/ubuntu/wasi-host.log (外2)
 - Ext log: /home/metaai/wasi-hostd.log
 - 上传中转: /tmp/wasi-host-deploy (SFTP 直接写 /root/ 会失败)
 

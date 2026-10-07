@@ -17,14 +17,14 @@
     "collect_interval_ms": 60000,
     "p2p": {
         "enabled": true,
-        "listen_host": "170.106.170.85",
+        "listen_host": "0.0.0.0",
+        "advertise_host": "170.106.170.85",
         "listen_port": 20808,
-        "transport_mode": "dual",
-        "tcp_port": 8444,
+        "transport_mode": "udp",
         "bootstrap": [],
         "key_file": "p2p_key_ext2.bin",
         "stabilize_interval_ms": 30000,
-        "run_duration_s": 86400,
+        "run_duration_s": 31536000,
         "encrypted_relay": {
             "enabled": true,
             "relays": [{"host": "127.0.0.1", "port": 20809}],
@@ -33,20 +33,7 @@
             "timeout_ms": 5000
         },
         "proxy": {
-            "enabled": true,
-            "mode": "server",
-            "transport": "relay",
-            "listen_port": 8356,
-            "remote_host": "127.0.0.1",
-            "remote_port": 8356,
-            "route_host": "",
-            "route_port": 0,
-            "remote_path": "/chord",
-            "wss_enabled": true,
-            "wss_port": 8443,
-            "wss_path": "/chord",
-            "wss_cert_file": "/home/ubuntu/certs/fullchain.pem",
-            "wss_key_file": "/home/ubuntu/certs/privkey.pem"
+            "enabled": false
         }
     },
     "plugins": []
