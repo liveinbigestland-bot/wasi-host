@@ -646,6 +646,12 @@ pub const ChordNode = struct {
         return addr.in.sa.addr == parsed.in.sa.addr;
     }
 
+    /// 跨网边界判定：自身通告地址为公网、目标为私网地址时，直连必然不可达
+    /// （公网路由无法到达 192.168.x/10.x/172.16-31.x，TCP 会阻塞在 SYN 黑洞上）
+    fn directUnreachable(self: ChordNode, target_host: []const u8) bool {
+        return !isPrivateIP(self.own_host) and isPrivateIP(target_host);
+    }
+
     fn reply(self: *ChordNode, to: std.net.Address, msg: Message) !void {
         if (self.proxy_enabled) {
             // 与 sendAndWait 保持一致的代理路由逻辑
@@ -768,7 +774,8 @@ pub const ChordNode = struct {
         }
 
         // ═══ 2. TCP 直接传输路径（最低延迟，性能最优）═══
-        if (self.transport_mode != .udp and target.tcp_port > 0) {
+        // 跨网边界保护：公网节点发往私网地址必然不可达（SYN 黑洞会阻塞），跳过直连
+        if (self.transport_mode != .udp and target.tcp_port > 0 and !self.directUnreachable(target.host)) {
             const encoded = try msg.encode(self.alloc);
             defer self.alloc.free(encoded);
             var buf: [65536]u8 = undefined;
@@ -792,7 +799,10 @@ pub const ChordNode = struct {
         // ═══ 3. 原生 TCP Relay 路径（适合外网节点间通信）═══
         // Encrypted relay path (ED25519 auth, NodeID routing)
         if (self.encrypted_relay) |client| {
-            if (!isPrivateIP(target.host)) {
+            // 走 relay 的两种情况：
+            //   a) 目标是公网地址（原始逻辑）
+            //   b) 自身通告公网 + 目标私网：跨网边界，直连不可达，按 NodeID 经 relay 转发
+            if (!isPrivateIP(target.host) or self.directUnreachable(target.host)) {
                 const encoded = try msg.encode(self.alloc);
                 defer self.alloc.free(encoded);
                 var buf: [65536]u8 = undefined;
@@ -866,7 +876,8 @@ pub const ChordNode = struct {
         }
 
         // ═══ 3b. TCP 兜底（relay 通道不稳定时，目标支持 TCP 则直接连接）═══
-        if (target.tcp_port > 0) {
+        // 跨网边界保护：公网→私网直连同样跳过
+        if (target.tcp_port > 0 and !self.directUnreachable(target.host)) {
             const encoded = try msg.encode(self.alloc);
             defer self.alloc.free(encoded);
             var buf: [65536]u8 = undefined;
