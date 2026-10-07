@@ -75,12 +75,12 @@ else:
 MACHINES = [
     {
         "name": "外2",
-        "host": "192.140.185.171",
+        "host": "170.106.170.85",
         "port": 22,
-        "user": "root",
-        "password": "aetej1AzIQpE",
-        "log": "/root/test-ext-node2.log",
-        "config": "/root/config-ext-node2.json",
+        "user": "ubuntu",
+        "password": "A?G|4Ed7a#3sHPb",
+        "log": "/home/ubuntu/test-ext-node2.log",
+        "config": "/home/ubuntu/config-ext-node2.json",
     },
     {
         "name": "ext",
@@ -93,21 +93,21 @@ MACHINES = [
     },
     {
         "name": "node59",
-        "host": "192.168.2.59",
+        "host": "192.168.2.57",
         "port": 22,
         "user": "root",
         "password": "ecoo1234",
-        "log": "/root/test-remote-node59.log",
-        "config": "/root/config-remote-node59.json",
+        "log": "/root/test-remote-node.log",
+        "config": "/root/config-lan-node59.json",
     },
     {
         "name": "node60",
-        "host": "192.168.2.60",
+        "host": "192.168.2.58",
         "port": 22,
         "user": "root",
         "password": "ecoo1234",
-        "log": "/root/test-remote-node60.log",
-        "config": "/root/config-remote-node60.json",
+        "log": "/root/test-remote-node.log",
+        "config": "/root/config-lan-node60.json",
     },
 ]
 
@@ -174,7 +174,8 @@ def inspect_local_seed():
                         result["uptime"] = parts[3]
 
             # Check local log for routing state
-            log_paths = ["wasi-host.log", "test-seed.log", "test-ext-node2.log"]
+            # std.debug.print 输出走 stderr，Start-Process 重定向在 .err.log
+            log_paths = ["seed.err.log", "seed.log", "test-seed.log"]
             for lp in log_paths:
                 if os.path.exists(lp):
                     log_content = open(lp, "r", errors="replace").read()
@@ -262,8 +263,10 @@ def inspect_node(machine, quick=False):
                     result["uptime"] = " ".join(parts[3:])
 
         # 3. Routing state from logs
+        # 抓取最近的 printState 状态块（以"本机 ID:"开头，-A6 覆盖前驱/后继/已填充/DHT 行）。
+        # 注意不能 grep 后再 tail —— stabilize 每 30s 打印的"后继=<hex>"会淹没窗口。
         _, stdout, _ = client.exec_command(
-            f"grep -aE '(本机|前驱|后继|已填充|DHT 存储)' {machine['log']} 2>/dev/null | tail -20",
+            f"grep -a -A6 '本机 ID:' {machine['log']} 2>/dev/null | tail -14",
             timeout=5,
         )
         log_state = stdout.read().decode(errors="replace")
@@ -307,6 +310,11 @@ def _parse_log_state(log_content, log_path):
     m = re.search(r"本机 ID:\s*(\S+)", log_content)
     if m:
         state["own_id"] = m.group(1)
+    else:
+        # 回退：孤立节点 self-target notify 行
+        ids = re.findall(r"self-target notify from id=([0-9a-f]{40})", log_content)
+        if ids:
+            state["own_id"] = ids[-1]
 
     # 前驱
     m = re.search(r"前驱:\s+(\S+):(\d+)\s+\(id=(\S+)\)", log_content)
@@ -316,6 +324,11 @@ def _parse_log_state(log_content, log_path):
             "port": int(m.group(2)),
             "id": m.group(3),
         }
+    else:
+        # 回退：稳定环中最后一个 notify 发送者即前驱候选
+        preds = re.findall(r"← notify from \S+ id=([0-9a-f]{40})", log_content)
+        if preds:
+            state["predecessor"] = {"host": "", "port": 0, "id": preds[-1]}
 
     # 后继
     m = re.search(r"后继:\s+(\S+):(\d+)\s+\(id=(\S+)\)", log_content)
@@ -325,6 +338,11 @@ def _parse_log_state(log_content, log_path):
             "port": int(m.group(2)),
             "id": m.group(3),
         }
+    else:
+        # 回退：stabilize 周期行（取最后一次）
+        succs = re.findall(r"stabilize: 后继=([0-9a-f]{40})", log_content)
+        if succs:
+            state["successor"] = {"host": "", "port": 0, "id": succs[-1]}
 
     # Finger 已填充
     m = re.search(r"已填充\s+(\d+)/", log_content)

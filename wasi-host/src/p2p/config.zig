@@ -1,20 +1,22 @@
 /// P2P 网络配置加载
-
 const std = @import("std");
 
 /// 传输模式
 pub const TransportMode = enum(u8) {
-    udp = 0,   // UDP only
-    tcp = 1,   // TCP only
-    dual = 2,  // UDP + TCP
+    udp = 0, // UDP only
+    tcp = 1, // TCP only
+    dual = 2, // UDP + TCP
 };
 
 /// P2P 节点全局配置
 pub const P2PConfig = struct {
     /// 是否启用 P2P 网络
     enabled: bool = false,
-    /// 节点监听地址（对外通告的地址）
+    /// 节点监听地址（绑定地址；影响 socket 接收范围）
     listen_host: []const u8 = "127.0.0.1",
+    /// 对外通告地址（空 = 自动推导：特定 listen_host 直接用；0.0.0.0 用检测到的公网 IP）。
+    /// 用于"绑定 0.0.0.0 以支持 loopback 控制通道，但 LAN 内需通告私有 IP"的场景。
+    advertise_host: []const u8 = "",
     /// 节点监听端口（DHT + 数据传输）
     listen_port: u16 = 20808,
     /// 传输模式

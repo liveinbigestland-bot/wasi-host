@@ -1027,10 +1027,10 @@ pub fn main() !void {
             }
 
             // ── 确定用于 Chord 通告和 relay 注册的地址 ──
-            // 对于 listen_host 为特定 IP（非 0.0.0.0）的节点直接使用 listen_host，
-            // 确保多节点共享同一公网 IP 时 relay 路由键唯一。
-            // 对于 0.0.0.0（如 alwaysdata ext），回退到检测到的公网 IP。
-            const effective_host = if (std.mem.eql(u8, cfg.listen_host, "0.0.0.0"))
+            // 优先级：advertise_host 显式指定 > 特定 listen_host 直接用 > 0.0.0.0 用检测到的公网 IP
+            const effective_host = if (cfg.advertise_host.len > 0)
+                cfg.advertise_host
+            else if (std.mem.eql(u8, cfg.listen_host, "0.0.0.0"))
                 (public_host orelse cfg.listen_host)
             else
                 cfg.listen_host;

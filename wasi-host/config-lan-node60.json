@@ -1,7 +1,8 @@
 {
     "p2p": {
         "enabled": true,
-        "listen_host": "192.168.2.58",
+        "listen_host": "0.0.0.0",
+        "advertise_host": "192.168.2.58",
         "listen_port": 20808,
         "bootstrap": [{"host": "192.168.2.210", "port": 20808}],
         "key_file": "p2p_key_60.bin",
